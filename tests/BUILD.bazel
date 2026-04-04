@@ -1,0 +1,26 @@
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "conftest",
+    srcs = ["conftest.py"],
+    imports = [".."],
+    deps = [
+        "//src/infinite_craft_cli",
+        "@pip//pytest",
+    ],
+)
+
+[py_test(
+    name = test_file.removesuffix(".py"),
+    srcs = [test_file],
+    main = test_file,
+    imports = [".."],
+    deps = [
+        ":conftest",
+        "//src/infinite_craft_cli",
+        "@pip//pytest",
+        "@pip//pytest_asyncio",
+    ],
+) for test_file in glob(
+    ["test_*.py"],
+)]

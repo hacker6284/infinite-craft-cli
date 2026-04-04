@@ -1,5 +1,12 @@
 # infinite-craft-cli
 
+[![PyPI](https://img.shields.io/pypi/v/infinite-craft-cli)](https://pypi.org/project/infinite-craft-cli/)
+[![Downloads](https://img.shields.io/pypi/dm/infinite-craft-cli)](https://pypi.org/project/infinite-craft-cli/)
+[![License](https://img.shields.io/badge/License-MIT-red?labelColor=black)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.10+-blue)](https://python.org)
+[![Tests](https://github.com/hacker6284/infinite-craft-cli/actions/workflows/test.yml/badge.svg)](https://github.com/hacker6284/infinite-craft-cli/actions/workflows/test.yml)
+[![Publish](https://github.com/hacker6284/infinite-craft-cli/actions/workflows/publish.yml/badge.svg)](https://github.com/hacker6284/infinite-craft-cli/actions/workflows/publish.yml)
+
 Interactive CLI for [Infinite Craft](https://neal.fun/infinite-craft/) — combine elements from the terminal.
 
 Built on top of [infinite-craft](https://github.com/sqdnoises/infinite-craft) by [@sqdnoises](https://github.com/sqdnoises).
