@@ -5,7 +5,7 @@ import sys
 import pytest
 from unittest.mock import patch, AsyncMock, MagicMock
 
-from tests.conftest import MockElement, make_mock_game
+from tests.conftest import MockElement, make_mock_storage, make_mock_client
 
 # Run with pytest when invoked directly by Bazel
 if __name__ == "__main__":
@@ -29,124 +29,134 @@ def clear_caches():
 
 
 class TestCachedPair:
-    def test_calls_game_pair(self):
+    def test_calls_client_pair(self):
         from infinite_craft_cli.cli import _cached_pair
-        game = make_mock_game()
+        client = make_mock_client()
+        storage = make_mock_storage()
         result_elem = MockElement("Steam", "💨")
-        game.pair.return_value = result_elem
+        client.pair.return_value = result_elem
         a = MockElement("Water", "💧")
         b = MockElement("Fire", "🔥")
         with patch("infinite_craft_cli.cli._record_recipe"):
-            result = run_async(_cached_pair(game, a, b))
+            result = run_async(_cached_pair(client, storage, a, b))
         assert result.name == "Steam"
-        game.pair.assert_called_once()
+        client.pair.assert_called_once()
 
     def test_caches_result(self):
         from infinite_craft_cli.cli import _cached_pair
-        game = make_mock_game()
+        client = make_mock_client()
+        storage = make_mock_storage()
         result_elem = MockElement("Steam", "💨")
-        game.pair.return_value = result_elem
+        client.pair.return_value = result_elem
         a = MockElement("Water", "💧")
         b = MockElement("Fire", "🔥")
         with patch("infinite_craft_cli.cli._record_recipe"):
-            run_async(_cached_pair(game, a, b))
-            run_async(_cached_pair(game, a, b))
+            run_async(_cached_pair(client, storage, a, b))
+            run_async(_cached_pair(client, storage, a, b))
         # Only called once due to cache
-        game.pair.assert_called_once()
+        client.pair.assert_called_once()
 
     def test_cache_key_is_sorted(self):
         from infinite_craft_cli.cli import _cached_pair
-        game = make_mock_game()
+        client = make_mock_client()
+        storage = make_mock_storage()
         result_elem = MockElement("Steam", "💨")
-        game.pair.return_value = result_elem
+        client.pair.return_value = result_elem
         a = MockElement("Water", "💧")
         b = MockElement("Fire", "🔥")
         with patch("infinite_craft_cli.cli._record_recipe"):
-            run_async(_cached_pair(game, a, b))
+            run_async(_cached_pair(client, storage, a, b))
             # Reversed order should hit cache
-            run_async(_cached_pair(game, b, a))
-        game.pair.assert_called_once()
+            run_async(_cached_pair(client, storage, b, a))
+        client.pair.assert_called_once()
 
     def test_records_recipe_on_success(self):
         from infinite_craft_cli.cli import _cached_pair
-        game = make_mock_game()
+        client = make_mock_client()
+        storage = make_mock_storage()
         result_elem = MockElement("Steam", "💨")
-        game.pair.return_value = result_elem
+        client.pair.return_value = result_elem
         a = MockElement("Water", "💧")
         b = MockElement("Fire", "🔥")
         with patch("infinite_craft_cli.cli._record_recipe") as mock_record:
-            run_async(_cached_pair(game, a, b))
+            run_async(_cached_pair(client, storage, a, b))
         mock_record.assert_called_once_with("Steam", "Water", "Fire")
 
     def test_no_recipe_on_none_result(self):
         from infinite_craft_cli.cli import _cached_pair
-        game = make_mock_game()
+        client = make_mock_client()
+        storage = make_mock_storage()
         result_elem = MockElement("", "")
         result_elem.name = None
-        game.pair.return_value = result_elem
+        client.pair.return_value = result_elem
         a = MockElement("Water", "💧")
         b = MockElement("Water", "💧")
         with patch("infinite_craft_cli.cli._record_recipe") as mock_record:
-            run_async(_cached_pair(game, a, b))
+            run_async(_cached_pair(client, storage, a, b))
         mock_record.assert_not_called()
 
 
 class TestDoCombine:
     def test_successful_combine(self):
         from infinite_craft_cli.cli import do_combine
-        game = make_mock_game()
+        client = make_mock_client()
+        storage = make_mock_storage()
         result_elem = MockElement("Steam", "💨")
-        game.pair.return_value = result_elem
+        client.pair.return_value = result_elem
         with patch("infinite_craft_cli.cli._record_recipe"):
             with patch("sys.stdout") as mock_stdout:
                 mock_stdout.isatty.return_value = False
-                result = run_async(do_combine(game, "Water", "Fire"))
+                result = run_async(do_combine(client, storage, "Water", "Fire"))
         assert "Steam" in result
         assert "=" in result
 
     def test_api_error(self):
         from infinite_craft_cli.cli import do_combine
-        game = make_mock_game()
-        game.pair.side_effect = Exception("API down")
+        client = make_mock_client()
+        storage = make_mock_storage()
+        client.pair.side_effect = Exception("API down")
         with patch("sys.stdout") as mock_stdout:
             mock_stdout.isatty.return_value = False
-            result = run_async(do_combine(game, "Water", "Fire"))
+            result = run_async(do_combine(client, storage, "Water", "Fire"))
         assert "Error" in result
 
     def test_updates_history(self):
         from infinite_craft_cli.cli import do_combine, _history
-        game = make_mock_game()
+        client = make_mock_client()
+        storage = make_mock_storage()
         result_elem = MockElement("Steam", "💨")
-        game.pair.return_value = result_elem
+        client.pair.return_value = result_elem
         with patch("infinite_craft_cli.cli._record_recipe"):
             with patch("sys.stdout") as mock_stdout:
                 mock_stdout.isatty.return_value = False
-                run_async(do_combine(game, "Water", "Fire"))
+                run_async(do_combine(client, storage, "Water", "Fire"))
         assert len(_history) == 1
         assert _history[0] == ("Water", "Fire", "Steam")
 
     def test_updates_discoveries(self):
         from infinite_craft_cli.cli import do_combine
-        game = make_mock_game()
+        client = make_mock_client()
+        storage = make_mock_storage()
         result_elem = MockElement("Steam", "💨")
-        game.pair.return_value = result_elem
+        client.pair.return_value = result_elem
         with patch("infinite_craft_cli.cli._record_recipe"):
             with patch("sys.stdout") as mock_stdout:
                 mock_stdout.isatty.return_value = False
-                run_async(do_combine(game, "Water", "Fire"))
-        # Both inputs should be updated in discoveries
-        assert game._update_discoveries.call_count == 2
+                run_async(do_combine(client, storage, "Water", "Fire"))
+        # Both inputs should be added to storage
+        assert storage.add.call_count == 2
 
     def test_nothing_result_no_discovery_update(self):
         from infinite_craft_cli.cli import do_combine
-        game = make_mock_game()
+        client = make_mock_client()
+        storage = make_mock_storage()
         result_elem = MagicMock()
         result_elem.name = None
-        game.pair.return_value = result_elem
+        client.pair.return_value = result_elem
         with patch("sys.stdout") as mock_stdout:
             mock_stdout.isatty.return_value = False
-            run_async(do_combine(game, "Water", "Water"))
-        game._update_discoveries.assert_not_called()
+            run_async(do_combine(client, storage, "Water", "Water"))
+        storage.add.assert_not_called()
 
 
 class TestDoHistory:

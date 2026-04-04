@@ -7,13 +7,19 @@ import fnmatch
 import gzip
 import json
 import os
-import readline  # noqa: F401 — enables arrow keys, history in input()
 import signal
 import sys
 import time
-import urllib.request
 
-from infinitecraft import InfiniteCraft, Element
+try:
+    import readline  # noqa: F401 — enables arrow keys, history in input()
+except ImportError:
+    pass  # readline not available on Windows
+
+from infinite_craft_cli.element import Element
+from infinite_craft_cli.client import InfiniteCraftClient, fetch_json, clear_fetch_cache
+from infinite_craft_cli.storage import DiscoveryStorage
+from infinite_craft_cli import __version__
 
 from infinite_craft_cli.data import DISCOVERIES_PATH, RECIPES_PATH, EXPORT_PATH
 
@@ -90,15 +96,15 @@ def format_result(first_name: str, second_name: str, result) -> str:
 # ---------------------------------------------------------------------------
 # Core operations
 # ---------------------------------------------------------------------------
-def _resolve_element(game, name: str):
+def _resolve_element(storage, name: str):
     """Look up an element by name in discoveries; fall back to bare Element."""
-    found = game.get_discovery(name)
+    found = storage.get_by_name(name)
     if found is not None:
         return found
     # Also try title-cased version
     title = name.strip().title()
     if title != name:
-        found = game.get_discovery(title)
+        found = storage.get_by_name(title)
         if found is not None:
             return found
     return Element(name=name.strip().title())
@@ -108,29 +114,36 @@ def _resolve_element(game, name: str):
 _pair_cache: dict[tuple[str, str], Element] = {}
 
 
-async def _cached_pair(game, a, b):
-    """Wrapper around game.pair that caches results by sorted element names."""
+async def _cached_pair(client, storage, a, b):
+    """Wrapper around client.pair that caches results by sorted element names."""
     key = tuple(sorted([a.name, b.name]))
     if key in _pair_cache:
         return _pair_cache[key]
-    result = await game.pair(a, b)
+    for attempt in range(3):
+        try:
+            result = await client.pair(a.name, b.name)
+            break
+        except Exception:
+            if attempt == 2:
+                raise
+            await asyncio.sleep(2 ** attempt)
     _pair_cache[key] = result
     if result.name is not None:
         _record_recipe(result.name, a.name, b.name)
     return result
 
 
-async def do_combine(game, first_name: str, second_name: str) -> str:
-    first = _resolve_element(game, first_name)
-    second = _resolve_element(game, second_name)
+async def do_combine(client, storage, first_name: str, second_name: str) -> str:
+    first = _resolve_element(storage, first_name)
+    second = _resolve_element(storage, second_name)
     try:
-        result = await _cached_pair(game, first, second)
+        result = await _cached_pair(client, storage, first, second)
     except Exception as e:
         return _color(f"  Error: {e}", RED)
     # If the pairing succeeded, ensure both inputs are in discoveries too
     if result.name is not None:
         for elem in (first, second):
-            game._update_discoveries(
+            storage.add(
                 name=elem.name, emoji=elem.emoji, is_first_discovery=False
             )
     result_display = result.name if result.name else "Nothing"
@@ -138,14 +151,14 @@ async def do_combine(game, first_name: str, second_name: str) -> str:
     return format_result(str(first), str(second), result)
 
 
-def _match_elements(game, query: str) -> list:
+def _match_elements(storage, query: str) -> list:
     """Return discovered elements matching a query.
 
     Supports wildcards (* and ?) via fnmatch when present,
     otherwise falls back to substring matching.
     Prefix with ^ to limit to first discoveries only.
     """
-    discoveries = game.get_discoveries()
+    discoveries = storage.get_all()
     q = query.strip()
     only_new = q.startswith("^")
     if only_new:
@@ -160,22 +173,22 @@ def _match_elements(game, query: str) -> list:
     return matches
 
 
-def do_search(game, query: str) -> str:
-    matches = _match_elements(game, query)
+def do_search(storage, query: str) -> str:
+    matches = _match_elements(storage, query)
     if not matches:
         return "  No matches found."
     return "\n".join(f"  {format_element(e)}" for e in matches)
 
 
-def do_recipe(game, name: str) -> str:
+def do_recipe(storage, name: str) -> str:
     """Show shortest recipe tree for an element via BFS on local recipes."""
     recipes = _load_recipes()
     target = name.strip()
 
     # Find exact match in discoveries
-    elem = game.get_discovery(target)
+    elem = storage.get_by_name(target)
     if elem is None:
-        elem = game.get_discovery(target.title())
+        elem = storage.get_by_name(target.title())
     if elem is None:
         return f"  {target} not found in discoveries."
     target = elem.name
@@ -237,9 +250,9 @@ def do_recipe(game, name: str) -> str:
 
     lines = [f"  Recipe for {_color(target, BOLD)} ({len(steps)} steps):"]
     for a, b, r in steps:
-        a_elem = game.get_discovery(a)
-        b_elem = game.get_discovery(b)
-        r_elem = game.get_discovery(r)
+        a_elem = storage.get_by_name(a)
+        b_elem = storage.get_by_name(b)
+        r_elem = storage.get_by_name(r)
         a_str = str(a_elem) if a_elem else a
         b_str = str(b_elem) if b_elem else b
         r_str = format_element(r_elem) if r_elem else r
@@ -247,8 +260,8 @@ def do_recipe(game, name: str) -> str:
     return "\n".join(lines)
 
 
-def do_list(game) -> str:
-    discoveries = game.get_discoveries()
+def do_list(storage) -> str:
+    discoveries = storage.get_all()
     header = f"  Discovered {len(discoveries)} elements:"
     lines = [f"  {format_element(e)}" for e in discoveries]
     return header + "\n" + "\n".join(lines)
@@ -263,10 +276,10 @@ def do_history() -> str:
     return "\n".join(lines)
 
 
-async def do_crawl(game, first_name: str, second_name: str):
+async def do_crawl(client, storage, first_name: str, second_name: str):
     """Combine two elements, then iteratively combine results with all inputs until nothing new."""
-    first = _resolve_element(game, first_name)
-    second = _resolve_element(game, second_name)
+    first = _resolve_element(storage, first_name)
+    second = _resolve_element(storage, second_name)
     pool = {first.name: first, second.name: second}
     tried = set()
     generation = 0
@@ -293,7 +306,7 @@ async def do_crawl(game, first_name: str, second_name: str):
 
         # Snapshot pool names before running pairs
         before = set(pool.keys())
-        await _combine_pairs(game, new_pairs)
+        await _combine_pairs(client, storage, new_pairs)
 
         # Check pair cache for new elements produced this generation
         new_elements = []
@@ -319,13 +332,13 @@ async def do_crawl(game, first_name: str, second_name: str):
         print(f"    {pool[name]}")
 
 
-async def do_exhaust(game, name: str):
+async def do_exhaust(client, storage, name: str):
     """Combine an element with every discovered element."""
-    target = _resolve_element(game, name)
-    others = list(game.get_discoveries())
+    target = _resolve_element(storage, name)
+    others = list(storage.get_all())
     pairs = [(target, o) for o in others if o.name != target.name]
     print(f"  Combining {_color(str(target), BOLD)} with {len(pairs)} elements...")
-    await _confirm_and_run_pairs(game, pairs)
+    await _confirm_and_run_pairs(client, storage, pairs)
 
 
 _BULK_WARN_THRESHOLD = 200
@@ -334,7 +347,7 @@ _BULK_WARN_THRESHOLD = 200
 _cancelled = False
 
 
-async def _combine_pairs(game, pairs: list[tuple]):
+async def _combine_pairs(client, storage, pairs: list[tuple]):
     """Combine a list of (element, element) pairs with light parallelism."""
     global _cancelled
     _cancelled = False
@@ -346,24 +359,23 @@ async def _combine_pairs(game, pairs: list[tuple]):
         _cancelled = True
 
     # Install SIGINT handler that sets flag instead of raising
-    import signal
     try:
         original_handler = loop.add_signal_handler(signal.SIGINT, on_sigint)
     except NotImplementedError:
-        pass  # Windows
+        signal.signal(signal.SIGINT, lambda *_: on_sigint())
 
     total = len(pairs)
     new_count = 0
     nothing_count = 0
     done_count = 0
-    known_names = {e.name for e in game.get_discoveries()}
+    known_names = {e.name for e in storage.get_all()}
     sem = asyncio.Semaphore(API_CONCURRENCY)
     lock = asyncio.Lock()
 
     async def process(a, b):
         nonlocal new_count, nothing_count, done_count
         try:
-            result = await _cached_pair(game, a, b)
+            result = await _cached_pair(client, storage, a, b)
         except Exception as e:
             done_count += 1
             print(f"  [{done_count}/{total}] {a} + {b} = {_color(f'Error: {e}', RED)}")
@@ -371,7 +383,7 @@ async def _combine_pairs(game, pairs: list[tuple]):
         done_count += 1
         if result.name is not None:
             for elem in (a, b):
-                game._update_discoveries(
+                storage.add(
                     name=elem.name, emoji=elem.emoji, is_first_discovery=False
                 )
         result_display = result.name if result.name else "Nothing"
@@ -405,7 +417,7 @@ async def _combine_pairs(game, pairs: list[tuple]):
         print(f"\n  Done. {_color(str(new_count), GREEN)} new, {nothing_count} nothing, {total} tried.")
 
 
-async def _confirm_and_run_pairs(game, pairs: list[tuple]):
+async def _confirm_and_run_pairs(client, storage, pairs: list[tuple]):
     """Warn if too many pairs, then run them."""
     if len(pairs) > _BULK_WARN_THRESHOLD:
         print(f"\n  {_color(f'Warning: this will make {len(pairs)} API requests.', YELLOW)}")
@@ -418,12 +430,12 @@ async def _confirm_and_run_pairs(game, pairs: list[tuple]):
             print("  Cancelled.")
             return
     print()
-    await _combine_pairs(game, pairs)
+    await _combine_pairs(client, storage, pairs)
 
 
-async def do_permute(game, query: str):
+async def do_permute(client, storage, query: str):
     """Combine every pair of elements matching the query with each other."""
-    matches = _match_elements(game, query)
+    matches = _match_elements(storage, query)
     if not matches:
         print("  No elements match that query.")
         return
@@ -436,13 +448,13 @@ async def do_permute(game, query: str):
     print(f"  {n} elements match, {len(pairs)} unique pairs:")
     for m in matches:
         print(f"    {format_element(m)}")
-    await _confirm_and_run_pairs(game, pairs)
+    await _confirm_and_run_pairs(client, storage, pairs)
 
 
-async def do_cross(game, left_query: str, right_query: str):
+async def do_cross(client, storage, left_query: str, right_query: str):
     """Cross-combine all elements matching left_query with all matching right_query."""
-    left = _match_elements(game, left_query)
-    right = _match_elements(game, right_query)
+    left = _match_elements(storage, left_query)
+    right = _match_elements(storage, right_query)
     if not left:
         print(f"  No elements match: {left_query}")
         return
@@ -469,40 +481,18 @@ async def do_cross(game, left_query: str, right_query: str):
     print(f"  Left ({len(left)}): {', '.join(str(e) for e in left[:10])}{'...' if len(left) > 10 else ''}")
     print(f"  Right ({len(right)}): {', '.join(str(e) for e in right[:10])}{'...' if len(right) > 10 else ''}")
     print(f"  {len(pairs)} unique pairs")
-    await _confirm_and_run_pairs(game, pairs)
+    await _confirm_and_run_pairs(client, storage, pairs)
 
 
 # ---------------------------------------------------------------------------
 # Infinibrowser integration
 # ---------------------------------------------------------------------------
 _IB_BASE = "https://infinibrowser.wiki/api"
-_IB_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-          "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-
-
-_ib_cache: dict[str, dict | None] = {}
-
-
-def _ib_request(path: str, params: dict) -> dict | None:
-    """Raw Infinibrowser fetch with caching. Returns parsed JSON or None on error."""
-    qs = "&".join(f"{k}={urllib.request.quote(str(v))}" for k, v in params.items())
-    cache_key = f"{path}?{qs}"
-    if cache_key in _ib_cache:
-        return _ib_cache[cache_key]
-    url = f"{_IB_BASE}/{path}?{qs}"
-    req = urllib.request.Request(url, headers={"User-Agent": _IB_UA})
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            result = json.loads(resp.read())
-    except Exception:
-        return None  # don't cache errors
-    _ib_cache[cache_key] = result
-    return result
 
 
 def _ib_fetch(path: str, params: dict) -> dict | None:
-    """Fetch from the Infinibrowser API. Prints errors."""
-    result = _ib_request(path, params)
+    """Fetch from the Infinibrowser API. Prints errors on failure."""
+    result = fetch_json(f"{_IB_BASE}/{path}", params=params)
     if result is None:
         print(f"  {_color('Infinibrowser request failed', RED)}")
     return result
@@ -510,20 +500,10 @@ def _ib_fetch(path: str, params: dict) -> dict | None:
 
 def _ib_fetch_quiet(path: str, params: dict) -> dict | None:
     """Fetch from the Infinibrowser API. Silent on errors."""
-    return _ib_request(path, params)
+    return fetch_json(f"{_IB_BASE}/{path}", params=params)
 
 
-def _refresh_discoveries(game):
-    """Reload in-memory discoveries from disk."""
-    raw = game._get_raw_discoveries()
-    game._discoveries = [
-        Element(name=d["name"], emoji=d.get("emoji"), is_first_discovery=d.get("is_first_discovery"))
-        for d in raw
-    ]
-    game.discoveries = game._discoveries.copy()
-
-
-def _import_from_infinibrowser(game, name: str) -> str:
+def _import_from_infinibrowser(storage, name: str) -> str:
     """Look up an element on Infinibrowser, show its lineage, and import into discoveries."""
     data = _ib_fetch("item", {"id": name})
     if data is None:
@@ -552,16 +532,16 @@ def _import_from_infinibrowser(game, name: str) -> str:
         _record_recipe(r_name, a_name, b_name)
         for elem_name, elem_emoji in [(a_name, a_emoji), (b_name, b_emoji), (r_name, r_emoji)]:
             if elem_name not in imported:
-                game._update_discoveries(
+                storage.add(
                     name=elem_name, emoji=elem_emoji, is_first_discovery=False
                 )
                 imported.add(elem_name)
 
-    _refresh_discoveries(game)
+    storage.reload()
     return f"  Imported {_color(str(len(imported)), GREEN)} elements into discoveries."
 
 
-def _import_from_save(game, path: str) -> str:
+def _import_from_save(storage, path: str) -> str:
     """Import elements and recipes from an .ic save file into discoveries."""
     try:
         with gzip.open(path, "rt", encoding="utf-8") as f:
@@ -582,7 +562,7 @@ def _import_from_save(game, path: str) -> str:
         name = item["text"]
         emoji = item.get("emoji", "")
         is_discovery = item.get("discovery", False)
-        result = game._update_discoveries(
+        result = storage.add(
             name=name, emoji=emoji, is_first_discovery=is_discovery
         )
         if result is not None:
@@ -595,31 +575,31 @@ def _import_from_save(game, path: str) -> str:
                 _record_recipe(name, a_name, b_name)
                 recipe_count += 1
 
-    _refresh_discoveries(game)
+    storage.reload()
     total = len(items)
     return (f"  Loaded {_color(str(total), GREEN)} elements "
             f"({imported_count} new) with {recipe_count} recipes from {_color(path, BOLD)}")
 
 
-def do_import(game, arg: str) -> str:
+def do_import(storage, arg: str) -> str:
     """Import from Infinibrowser (element name) or .ic save file (path)."""
     if arg.endswith(".ic") or os.path.sep in arg:
-        return _import_from_save(game, arg)
-    return _import_from_infinibrowser(game, arg)
+        return _import_from_save(storage, arg)
+    return _import_from_infinibrowser(storage, arg)
 
 
 _BASE_ELEMENTS = {"Water", "Fire", "Wind", "Earth"}
 
 
-def _fill_missing_recipes(game):
+def _fill_missing_recipes(storage):
     """Fetch lineages from Infinibrowser for elements missing recipes.
 
     When a lineage is fetched, its intermediate elements get recipes too,
     so we re-check the missing set after each fetch to skip already-filled items.
     """
     recipes = _load_recipes()
-    name_set = {e.name for e in game.get_discoveries()}
-    missing = {e.name for e in game.get_discoveries()
+    name_set = {e.name for e in storage.get_all()}
+    missing = {e.name for e in storage.get_all()
                if e.name not in _BASE_ELEMENTS and e.name not in recipes}
     if not missing:
         print("  All elements have recipes.")
@@ -658,7 +638,7 @@ def _fill_missing_recipes(game):
                 _record_recipe(r_name, a_name, b_name)
                 for elem_name, elem_emoji in [(a_name, a_emoji), (b_name, b_emoji), (r_name, r_emoji)]:
                     if elem_name not in name_set:
-                        game._update_discoveries(
+                        storage.add(
                             name=elem_name, emoji=elem_emoji, is_first_discovery=False
                         )
                         name_set.add(elem_name)
@@ -666,7 +646,7 @@ def _fill_missing_recipes(game):
             time.sleep(0.5)  # rate limit Infinibrowser
     except KeyboardInterrupt:
         print(f"\n  Stopped early.")
-    _refresh_discoveries(game)
+    storage.reload()
     print(f"\n  Fetched {fetched} lineages, {skipped} already filled by prior lineages.", end="")
     if failed:
         print(f" {_color(str(len(failed)), YELLOW)} not found on Infinibrowser.")
@@ -674,10 +654,10 @@ def _fill_missing_recipes(game):
         print()
 
 
-def do_unfilled(game) -> str:
+def do_unfilled(storage) -> str:
     """List elements that have no recipes (excluding base elements)."""
     recipes = _load_recipes()
-    discoveries = game.get_discoveries()
+    discoveries = storage.get_all()
     missing = [e for e in discoveries if e.name not in _BASE_ELEMENTS and e.name not in recipes]
     if not missing:
         return "  All elements have recipes."
@@ -687,14 +667,14 @@ def do_unfilled(game) -> str:
     return "\n".join(lines)
 
 
-def do_export(game, path: str = EXPORT_PATH) -> str:
+def do_export(storage, path: str = EXPORT_PATH) -> str:
     """Export discoveries to an Infinite Craft .ic save file.
 
     Only includes elements that have recipes or are base elements.
     Use /fill first to fetch missing recipes from Infinibrowser.
     """
     recipes = _load_recipes()
-    discoveries = game.get_discoveries()
+    discoveries = storage.get_all()
 
     # Build export, only including elements that have recipes or are base
     name_to_id = {}
@@ -770,10 +750,11 @@ async def interactive_mode():
     print(_color("=== Infinite Craft CLI ===", BOLD + CYAN))
     print()
 
-    async with InfiniteCraft(discoveries_storage=DISCOVERIES_PATH, api_rate_limit=API_RATE_LIMIT) as game:
-        starters = "  ".join(str(e) for e in game.discoveries[:4])
+    storage = DiscoveryStorage(DISCOVERIES_PATH)
+    async with InfiniteCraftClient(rate_limit=API_RATE_LIMIT) as client:
+        starters = "  ".join(str(e) for e in storage.get_all()[:4])
         print(f"  Starting elements: {starters}")
-        total = len(game.get_discoveries())
+        total = len(storage.get_all())
         print(f"  Discovered: {_color(str(total), GREEN)} elements")
         print(f"  Type {_color('/help', YELLOW)} for commands\n")
 
@@ -797,40 +778,40 @@ async def interactive_mode():
                 if not query:
                     print("  Usage: /search <query>")
                 else:
-                    print(do_search(game, query))
+                    print(do_search(storage, query))
             elif line.startswith("/recipe"):
                 name = line[len("/recipe"):].strip()
                 if not name:
                     print("  Usage: /recipe <element>")
                 else:
-                    print(do_recipe(game, name))
+                    print(do_recipe(storage, name))
             elif line == "/list":
-                print(do_list(game))
+                print(do_list(storage))
             elif line.startswith("/permute"):
                 query = line[len("/permute"):].strip()
                 if not query:
                     print("  Usage: /permute <query>")
                 else:
-                    await do_permute(game, query)
+                    await do_permute(client, storage, query)
             elif line.startswith("/import"):
                 name = line[len("/import"):].strip()
                 if not name:
                     print("  Usage: /import <element>")
                 else:
-                    print(do_import(game, name))
+                    print(do_import(storage, name))
             elif line.startswith("/unfilled"):
-                print(do_unfilled(game))
+                print(do_unfilled(storage))
             elif line.startswith("/fill"):
-                _fill_missing_recipes(game)
+                _fill_missing_recipes(storage)
             elif line.startswith("/export"):
                 path = line[len("/export"):].strip() or EXPORT_PATH
-                print(do_export(game, path))
+                print(do_export(storage, path))
             elif line.startswith("/exhaust"):
                 name = line[len("/exhaust"):].strip()
                 if not name:
                     print("  Usage: /exhaust <element>")
                 else:
-                    await do_exhaust(game, name)
+                    await do_exhaust(client, storage, name)
             elif line.startswith("/crawl"):
                 rest = line[len("/crawl"):].strip()
                 if "+" not in rest:
@@ -841,7 +822,7 @@ async def interactive_mode():
                     if not first or not second:
                         print("  Usage: /crawl <element> + <element>")
                     else:
-                        await do_crawl(game, first, second)
+                        await do_crawl(client, storage, first, second)
             elif line == "/history":
                 print(do_history())
             elif "++" in line:
@@ -851,7 +832,7 @@ async def interactive_mode():
                 if not first or not second:
                     print("  Usage: <element> ++ <element>")
                 else:
-                    await do_crawl(game, first, second)
+                    await do_crawl(client, storage, first, second)
             elif "+|" in line:
                 # element + | query
                 parts = line.split("+|", 1)
@@ -860,14 +841,14 @@ async def interactive_mode():
                 if not name or not query:
                     print("  Usage: <element> + | <query>")
                 else:
-                    target = _resolve_element(game, name)
-                    others = _match_elements(game, query)
+                    target = _resolve_element(storage, name)
+                    others = _match_elements(storage, query)
                     if not others:
                         print(f"  No elements match: {query}")
                     else:
                         pairs = [(target, o) for o in others if o.name != target.name]
                         print(f"  Combining {_color(str(target), BOLD)} with {len(pairs)} elements matching {_color(query, YELLOW)}...")
-                        await _confirm_and_run_pairs(game, pairs)
+                        await _confirm_and_run_pairs(client, storage, pairs)
             elif " * " in line:
                 # query * query
                 parts = line.split(" * ", 1)
@@ -876,7 +857,7 @@ async def interactive_mode():
                 if not left_q or not right_q:
                     print("  Usage: <query> * <query>")
                 else:
-                    await do_cross(game, left_q, right_q)
+                    await do_cross(client, storage, left_q, right_q)
             elif "+" in line:
                 parts = line.split("+", 1)
                 first = parts[0].strip()
@@ -884,7 +865,7 @@ async def interactive_mode():
                 if not first or not second:
                     print("  Usage: <element> + <element>")
                 else:
-                    print(await do_combine(game, first, second))
+                    print(await do_combine(client, storage, first, second))
             else:
                 print(f"  Unknown input. Type {_color('/help', YELLOW)} for commands.")
 
@@ -893,13 +874,40 @@ async def interactive_mode():
 # Non-interactive CLI
 # ---------------------------------------------------------------------------
 async def noninteractive_mode(args):
-    async with InfiniteCraft(discoveries_storage=DISCOVERIES_PATH, api_rate_limit=API_RATE_LIMIT) as game:
-        if args.command == "combine":
-            print(await do_combine(game, args.first, args.second))
-        elif args.command == "search":
-            print(do_search(game, args.query))
+    # Commands that only need storage (no API)
+    storage_only_commands = {"search", "list", "recipe", "unfilled", "export", "fill", "import_cmd"}
+
+    if args.command in storage_only_commands:
+        storage = DiscoveryStorage(DISCOVERIES_PATH)
+        if args.command == "search":
+            print(do_search(storage, args.query))
         elif args.command == "list":
-            print(do_list(game))
+            print(do_list(storage))
+        elif args.command == "recipe":
+            print(do_recipe(storage, args.name))
+        elif args.command == "unfilled":
+            print(do_unfilled(storage))
+        elif args.command == "export":
+            path = args.path if args.path else EXPORT_PATH
+            print(do_export(storage, path))
+        elif args.command == "fill":
+            _fill_missing_recipes(storage)
+        elif args.command == "import_cmd":
+            print(do_import(storage, args.source))
+    else:
+        # Commands that need the API client
+        storage = DiscoveryStorage(DISCOVERIES_PATH)
+        async with InfiniteCraftClient(rate_limit=API_RATE_LIMIT) as client:
+            if args.command == "combine":
+                print(await do_combine(client, storage, args.first, args.second))
+            elif args.command == "exhaust":
+                await do_exhaust(client, storage, args.name)
+            elif args.command == "crawl":
+                await do_crawl(client, storage, args.first, args.second)
+            elif args.command == "permute":
+                await do_permute(client, storage, args.query)
+            elif args.command == "cross":
+                await do_cross(client, storage, args.left, args.right)
 
 
 # ---------------------------------------------------------------------------
@@ -907,6 +915,7 @@ async def noninteractive_mode(args):
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description="Infinite Craft CLI")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     subparsers = parser.add_subparsers(dest="command")
 
     combine_p = subparsers.add_parser("combine", help="Combine two elements")
@@ -917,6 +926,34 @@ def main():
     search_p.add_argument("query", help="Search substring")
 
     subparsers.add_parser("list", help="List all discovered elements")
+
+    recipe_p = subparsers.add_parser("recipe", help="Show shortest recipe from base elements")
+    recipe_p.add_argument("name", help="Element name")
+
+    import_p = subparsers.add_parser("import", help="Import from Infinibrowser or .ic save file")
+    import_p.add_argument("source", help="Element name or path to .ic file")
+    import_p.set_defaults(command="import_cmd")
+
+    export_p = subparsers.add_parser("export", help="Export discoveries as .ic save file")
+    export_p.add_argument("path", nargs="?", default=None, help="Output path (optional)")
+
+    subparsers.add_parser("fill", help="Fetch missing recipes from Infinibrowser")
+
+    subparsers.add_parser("unfilled", help="List elements without recipes")
+
+    exhaust_p = subparsers.add_parser("exhaust", help="Combine element with all discoveries")
+    exhaust_p.add_argument("name", help="Element name")
+
+    crawl_p = subparsers.add_parser("crawl", help="Combine two elements and crawl")
+    crawl_p.add_argument("first", help="First element name")
+    crawl_p.add_argument("second", help="Second element name")
+
+    permute_p = subparsers.add_parser("permute", help="Combine all matching elements with each other")
+    permute_p.add_argument("query", help="Search query")
+
+    cross_p = subparsers.add_parser("cross", help="Cross-combine matches from two queries")
+    cross_p.add_argument("left", help="Left search query")
+    cross_p.add_argument("right", help="Right search query")
 
     args = parser.parse_args()
 

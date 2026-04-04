@@ -6,6 +6,6 @@ py_library(
     imports = [".."],
     visibility = ["//visibility:public"],
     deps = [
-        "@pip//infinite_craft",
+        "@pip//curl_cffi",
     ],
 )

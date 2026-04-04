@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, AsyncMock
 
 
 class MockElement:
-    """Lightweight mock for infinitecraft.Element."""
+    """Lightweight mock for Element."""
 
     def __init__(self, name, emoji="", is_first_discovery=False):
         self.name = name
@@ -27,8 +27,8 @@ class MockElement:
         return hash(self.name)
 
 
-def make_mock_game(discoveries=None):
-    """Create a mock InfiniteCraft game object."""
+def make_mock_storage(discoveries=None):
+    """Create a mock DiscoveryStorage object."""
     if discoveries is None:
         discoveries = [
             MockElement("Water", "💧"),
@@ -37,36 +37,49 @@ def make_mock_game(discoveries=None):
             MockElement("Earth", "🌍"),
         ]
 
-    game = MagicMock()
-    game.discoveries = list(discoveries)
-    game.get_discoveries.return_value = list(discoveries)
+    storage = MagicMock()
+    storage.get_all.return_value = list(discoveries)
 
-    def get_discovery(name):
+    def get_by_name(name):
         for e in discoveries:
             if e.name == name:
                 return e
         return None
 
-    game.get_discovery.side_effect = get_discovery
-    game.pair = AsyncMock()
-    game._update_discoveries = MagicMock()
-    game._get_raw_discoveries.return_value = [
-        {"name": e.name, "emoji": e.emoji, "is_first_discovery": e.is_first_discovery}
-        for e in discoveries
-    ]
+    storage.get_by_name.side_effect = get_by_name
+    storage.add.return_value = None
+    storage.reload.return_value = None
 
-    return game
+    return storage
+
+
+def make_mock_client():
+    """Create a mock InfiniteCraftClient object."""
+    client = AsyncMock()
+    client.pair = AsyncMock()
+    return client
+
+
+# Keep for backwards compat
+def make_mock_game(discoveries=None):
+    """Deprecated: use make_mock_storage() and make_mock_client() instead."""
+    return make_mock_storage(discoveries)
 
 
 @pytest.fixture
-def mock_game():
-    return make_mock_game()
+def mock_storage():
+    return make_mock_storage()
 
 
 @pytest.fixture
-def mock_game_with_extras():
-    """Game with more discoveries for testing search/match."""
-    return make_mock_game([
+def mock_client():
+    return make_mock_client()
+
+
+@pytest.fixture
+def mock_storage_with_extras():
+    """Storage with more discoveries for testing search/match."""
+    return make_mock_storage([
         MockElement("Water", "💧"),
         MockElement("Fire", "🔥"),
         MockElement("Wind", "🌬️"),

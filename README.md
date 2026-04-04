@@ -9,7 +9,7 @@
 
 Interactive CLI for [Infinite Craft](https://neal.fun/infinite-craft/) — combine elements from the terminal.
 
-Built on top of [infinite-craft](https://github.com/sqdnoises/infinite-craft) by [@sqdnoises](https://github.com/sqdnoises).
+Originally built on [infinite-craft](https://github.com/sqdnoises/infinite-craft) by [@sqdnoises](https://github.com/sqdnoises). As of v1.0, uses [curl_cffi](https://github.com/lexiforest/curl_cffi) directly.
 
 ## Installation
 
@@ -39,10 +39,22 @@ craft> /help
 
 ### Non-interactive mode
 
+All commands are available as subcommands:
+
 ```bash
 infinite-craft combine "Water" "Fire"
 infinite-craft search "steam"
 infinite-craft list
+infinite-craft recipe "Steam"
+infinite-craft import "Steam"
+infinite-craft export
+infinite-craft fill
+infinite-craft unfilled
+infinite-craft exhaust "Water"
+infinite-craft crawl "Water" "Fire"
+infinite-craft permute "w*"
+infinite-craft cross "fire*" "water*"
+infinite-craft --version
 ```
 
 ## Commands
@@ -74,6 +86,18 @@ Discoveries and recipes are stored in `~/.infinite-craft-cli/`:
 - `discoveries.json` -- all discovered elements
 - `recipes.json` -- known element combinations
 - `export.ic` -- default export location
+
+## Development
+
+Run unit tests:
+```bash
+bazel test //tests/...
+```
+
+Run integration tests (hits the real API):
+```bash
+bazel test //tests:test_integration --test_env=INTEGRATION_TESTS=1
+```
 
 ## License
 

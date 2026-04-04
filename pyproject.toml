@@ -4,20 +4,20 @@ build-backend = "hatchling.build"
 
 [project]
 name = "infinite-craft-cli"
-version = "0.1.0"
+version = "1.0.0"
 description = "Interactive CLI for Infinite Craft — combine elements from the terminal"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 keywords = ["infinite-craft", "cli", "game"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
     "Topic :: Games/Entertainment",
     "Programming Language :: Python :: 3",
 ]
 dependencies = [
-    "infinite-craft",
+    "curl-cffi>=0.15",
 ]
 
 [project.urls]

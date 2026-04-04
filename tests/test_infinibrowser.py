@@ -1,4 +1,4 @@
-"""Tests for Infinibrowser integration: _ib_request, _ib_fetch, _ib_fetch_quiet."""
+"""Tests for fetch_json (shared HTTP helper) and Infinibrowser wrappers."""
 
 import json
 import sys
@@ -11,90 +11,100 @@ if __name__ == "__main__":
 
 
 @pytest.fixture(autouse=True)
-def clear_ib_cache():
-    import infinite_craft_cli.cli as cli
-    cli._ib_cache.clear()
+def clear_cache():
+    from infinite_craft_cli.client import clear_fetch_cache
+    clear_fetch_cache()
     yield
-    cli._ib_cache.clear()
+    clear_fetch_cache()
 
 
-class TestIbRequest:
+class TestFetchJson:
     def test_successful_request(self):
-        from infinite_craft_cli.cli import _ib_request
-        mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps({"text": "Water"}).encode()
-        mock_response.__enter__ = MagicMock(return_value=mock_response)
-        mock_response.__exit__ = MagicMock(return_value=False)
-        with patch("urllib.request.urlopen", return_value=mock_response):
-            result = _ib_request("item", {"id": "Water"})
+        from infinite_craft_cli.client import fetch_json
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"text": "Water"}
+        mock_session = MagicMock()
+        mock_session.get.return_value = mock_resp
+        with patch("infinite_craft_cli.client._get_sync_session", return_value=mock_session):
+            result = fetch_json("https://example.com/api", {"id": "Water"})
         assert result == {"text": "Water"}
 
     def test_caches_result(self):
-        from infinite_craft_cli.cli import _ib_request
-        mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps({"text": "Water"}).encode()
-        mock_response.__enter__ = MagicMock(return_value=mock_response)
-        mock_response.__exit__ = MagicMock(return_value=False)
-        with patch("urllib.request.urlopen", return_value=mock_response) as mock_urlopen:
-            _ib_request("item", {"id": "Water"})
-            _ib_request("item", {"id": "Water"})
-        mock_urlopen.assert_called_once()
+        from infinite_craft_cli.client import fetch_json
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"text": "Water"}
+        mock_session = MagicMock()
+        mock_session.get.return_value = mock_resp
+        with patch("infinite_craft_cli.client._get_sync_session", return_value=mock_session):
+            fetch_json("https://example.com/api", {"id": "Water"})
+            fetch_json("https://example.com/api", {"id": "Water"})
+        mock_session.get.assert_called_once()
+
+    def test_different_params_not_cached(self):
+        from infinite_craft_cli.client import fetch_json
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {}
+        mock_session = MagicMock()
+        mock_session.get.return_value = mock_resp
+        with patch("infinite_craft_cli.client._get_sync_session", return_value=mock_session):
+            fetch_json("https://example.com/api", {"id": "Water"})
+            fetch_json("https://example.com/api", {"id": "Fire"})
+        assert mock_session.get.call_count == 2
 
     def test_error_returns_none(self):
-        from infinite_craft_cli.cli import _ib_request
-        with patch("urllib.request.urlopen", side_effect=Exception("timeout")):
-            result = _ib_request("item", {"id": "Water"})
+        from infinite_craft_cli.client import fetch_json
+        mock_session = MagicMock()
+        mock_session.get.side_effect = Exception("timeout")
+        with patch("infinite_craft_cli.client._get_sync_session", return_value=mock_session):
+            result = fetch_json("https://example.com/api", {"id": "Water"})
         assert result is None
 
     def test_error_not_cached(self):
-        from infinite_craft_cli.cli import _ib_request
-        with patch("urllib.request.urlopen", side_effect=Exception("timeout")):
-            _ib_request("item", {"id": "Fail"})
+        from infinite_craft_cli.client import fetch_json
+        mock_session = MagicMock()
+        mock_session.get.side_effect = Exception("timeout")
+        with patch("infinite_craft_cli.client._get_sync_session", return_value=mock_session):
+            fetch_json("https://example.com/fail", {"id": "Fail"})
         # Second call should try again
-        mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps({"text": "Fail"}).encode()
-        mock_response.__enter__ = MagicMock(return_value=mock_response)
-        mock_response.__exit__ = MagicMock(return_value=False)
-        with patch("urllib.request.urlopen", return_value=mock_response) as mock_urlopen:
-            result = _ib_request("item", {"id": "Fail"})
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"text": "Fail"}
+        mock_session2 = MagicMock()
+        mock_session2.get.return_value = mock_resp
+        with patch("infinite_craft_cli.client._get_sync_session", return_value=mock_session2):
+            result = fetch_json("https://example.com/fail", {"id": "Fail"})
         assert result is not None
-        mock_urlopen.assert_called_once()
 
-    def test_url_construction(self):
-        from infinite_craft_cli.cli import _ib_request, _IB_BASE
-        mock_response = MagicMock()
-        mock_response.read.return_value = b"{}"
-        mock_response.__enter__ = MagicMock(return_value=mock_response)
-        mock_response.__exit__ = MagicMock(return_value=False)
-        with patch("urllib.request.urlopen", return_value=mock_response) as mock_urlopen:
-            _ib_request("recipe", {"id": "Steam Engine"})
-        call_args = mock_urlopen.call_args
-        req = call_args[0][0]
-        assert "recipe" in req.full_url
-        assert "Steam" in req.full_url
+    def test_no_params(self):
+        from infinite_craft_cli.client import fetch_json
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_session = MagicMock()
+        mock_session.get.return_value = mock_resp
+        with patch("infinite_craft_cli.client._get_sync_session", return_value=mock_session):
+            result = fetch_json("https://example.com/health")
+        assert result == {"ok": True}
 
-    def test_user_agent_header(self):
-        from infinite_craft_cli.cli import _ib_request, _IB_UA
-        mock_response = MagicMock()
-        mock_response.read.return_value = b"{}"
-        mock_response.__enter__ = MagicMock(return_value=mock_response)
-        mock_response.__exit__ = MagicMock(return_value=False)
-        with patch("urllib.request.urlopen", return_value=mock_response) as mock_urlopen:
-            _ib_request("item", {"id": "Test"})
-        req = mock_urlopen.call_args[0][0]
-        assert req.get_header("User-agent") == _IB_UA
+    def test_passes_timeout(self):
+        from infinite_craft_cli.client import fetch_json
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {}
+        mock_session = MagicMock()
+        mock_session.get.return_value = mock_resp
+        with patch("infinite_craft_cli.client._get_sync_session", return_value=mock_session):
+            fetch_json("https://example.com/api", timeout=30)
+        mock_session.get.assert_called_once_with("https://example.com/api", params=None, timeout=30)
 
 
 class TestIbFetch:
-    def test_success(self, capsys):
+    def test_success(self):
         from infinite_craft_cli.cli import _ib_fetch
-        with patch("infinite_craft_cli.cli._ib_request", return_value={"text": "Water"}):
+        with patch("infinite_craft_cli.cli.fetch_json", return_value={"text": "Water"}):
             result = _ib_fetch("item", {"id": "Water"})
         assert result == {"text": "Water"}
 
     def test_failure_prints_error(self, capsys):
         from infinite_craft_cli.cli import _ib_fetch
-        with patch("infinite_craft_cli.cli._ib_request", return_value=None):
+        with patch("infinite_craft_cli.cli.fetch_json", return_value=None):
             with patch("sys.stdout") as mock_stdout:
                 mock_stdout.isatty.return_value = False
                 result = _ib_fetch("item", {"id": "Water"})
@@ -104,13 +114,13 @@ class TestIbFetch:
 class TestIbFetchQuiet:
     def test_success(self):
         from infinite_craft_cli.cli import _ib_fetch_quiet
-        with patch("infinite_craft_cli.cli._ib_request", return_value={"text": "Water"}):
+        with patch("infinite_craft_cli.cli.fetch_json", return_value={"text": "Water"}):
             result = _ib_fetch_quiet("item", {"id": "Water"})
         assert result == {"text": "Water"}
 
     def test_failure_silent(self, capsys):
         from infinite_craft_cli.cli import _ib_fetch_quiet
-        with patch("infinite_craft_cli.cli._ib_request", return_value=None):
+        with patch("infinite_craft_cli.cli.fetch_json", return_value=None):
             result = _ib_fetch_quiet("item", {"id": "Water"})
         assert result is None
         captured = capsys.readouterr()

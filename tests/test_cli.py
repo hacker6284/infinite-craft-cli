@@ -5,7 +5,7 @@ import sys
 import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
 
-from tests.conftest import MockElement, make_mock_game
+from tests.conftest import MockElement, make_mock_storage, make_mock_client
 
 # Run with pytest when invoked directly by Bazel
 if __name__ == "__main__":
@@ -46,15 +46,12 @@ class TestArgParsing:
                 main()
         mock_run.assert_called_once()
 
-
-def _mock_ic_context(game):
-    """Create a mock InfiniteCraft async context manager."""
-    mock_ctx = AsyncMock()
-    mock_ctx.__aenter__.return_value = game
-    mock_ctx.__aexit__.return_value = False
-    mock_ic = MagicMock()
-    mock_ic.return_value = mock_ctx
-    return mock_ic
+    def test_version_flag(self):
+        from infinite_craft_cli.cli import main
+        with patch("sys.argv", ["infinite-craft", "--version"]):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+        assert exc_info.value.code == 0
 
 
 class TestNonInteractiveMode:
@@ -64,14 +61,25 @@ class TestNonInteractiveMode:
         args.command = "combine"
         args.first = "Water"
         args.second = "Fire"
-        game = make_mock_game()
+        client = make_mock_client()
+        storage = make_mock_storage()
         result_elem = MockElement("Steam", "💨")
-        game.pair.return_value = result_elem
+        client.pair.return_value = result_elem
 
-        with patch("infinite_craft_cli.cli.InfiniteCraft", _mock_ic_context(game)):
-            with patch("infinite_craft_cli.cli._record_recipe"):
-                with patch("sys.stdout.isatty", return_value=False):
-                    run_async(noninteractive_mode(args))
+        mock_client_cls = MagicMock()
+        mock_client_ctx = AsyncMock()
+        mock_client_ctx.__aenter__.return_value = client
+        mock_client_ctx.__aexit__.return_value = False
+        mock_client_cls.return_value = mock_client_ctx
+
+        mock_storage_cls = MagicMock()
+        mock_storage_cls.return_value = storage
+
+        with patch("infinite_craft_cli.cli.InfiniteCraftClient", mock_client_cls):
+            with patch("infinite_craft_cli.cli.DiscoveryStorage", mock_storage_cls):
+                with patch("infinite_craft_cli.cli._record_recipe"):
+                    with patch("sys.stdout.isatty", return_value=False):
+                        run_async(noninteractive_mode(args))
         captured = capsys.readouterr()
         assert "Steam" in captured.out
 
@@ -80,9 +88,12 @@ class TestNonInteractiveMode:
         args = MagicMock()
         args.command = "search"
         args.query = "water"
-        game = make_mock_game()
+        storage = make_mock_storage()
 
-        with patch("infinite_craft_cli.cli.InfiniteCraft", _mock_ic_context(game)):
+        mock_storage_cls = MagicMock()
+        mock_storage_cls.return_value = storage
+
+        with patch("infinite_craft_cli.cli.DiscoveryStorage", mock_storage_cls):
             with patch("sys.stdout.isatty", return_value=False):
                 run_async(noninteractive_mode(args))
         captured = capsys.readouterr()
@@ -92,9 +103,12 @@ class TestNonInteractiveMode:
         from infinite_craft_cli.cli import noninteractive_mode
         args = MagicMock()
         args.command = "list"
-        game = make_mock_game()
+        storage = make_mock_storage()
 
-        with patch("infinite_craft_cli.cli.InfiniteCraft", _mock_ic_context(game)):
+        mock_storage_cls = MagicMock()
+        mock_storage_cls.return_value = storage
+
+        with patch("infinite_craft_cli.cli.DiscoveryStorage", mock_storage_cls):
             with patch("sys.stdout.isatty", return_value=False):
                 run_async(noninteractive_mode(args))
         captured = capsys.readouterr()

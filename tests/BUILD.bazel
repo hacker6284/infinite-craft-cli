@@ -23,4 +23,19 @@ py_library(
     ],
 ) for test_file in glob(
     ["test_*.py"],
+    exclude = ["test_integration.py"],
 )]
+
+py_test(
+    name = "test_integration",
+    srcs = ["test_integration.py"],
+    main = "test_integration.py",
+    imports = [".."],
+    tags = ["manual"],
+    deps = [
+        ":conftest",
+        "//src/infinite_craft_cli",
+        "@pip//pytest",
+        "@pip//curl_cffi",
+    ],
+)

@@ -6,7 +6,7 @@ import sys
 import pytest
 from unittest.mock import patch, mock_open
 
-from tests.conftest import MockElement, make_mock_game
+from tests.conftest import MockElement, make_mock_storage
 
 # Run with pytest when invoked directly by Bazel
 if __name__ == "__main__":
@@ -112,32 +112,32 @@ class TestDoRecipe:
 
     def test_base_element(self, tmp_path):
         from infinite_craft_cli.cli import do_recipe
-        game = make_mock_game([MockElement("Water", "💧")])
+        storage = make_mock_storage([MockElement("Water", "💧")])
         path = self._setup_recipes(tmp_path)
         with patch("infinite_craft_cli.cli.RECIPES_PATH", str(path)):
-            result = do_recipe(game, "Water")
+            result = do_recipe(storage, "Water")
         assert "base element" in result
 
     def test_not_found(self, tmp_path):
         from infinite_craft_cli.cli import do_recipe
-        game = make_mock_game()
+        storage = make_mock_storage()
         path = self._setup_recipes(tmp_path)
         with patch("infinite_craft_cli.cli.RECIPES_PATH", str(path)):
-            result = do_recipe(game, "Nonexistent")
+            result = do_recipe(storage, "Nonexistent")
         assert "not found" in result
 
     def test_no_recipe_known(self, tmp_path):
         from infinite_craft_cli.cli import do_recipe
-        game = make_mock_game([MockElement("Lava", "🌋")])
+        storage = make_mock_storage([MockElement("Lava", "🌋")])
         path = tmp_path / "recipes.json"
         path.write_text("{}")
         with patch("infinite_craft_cli.cli.RECIPES_PATH", str(path)):
-            result = do_recipe(game, "Lava")
+            result = do_recipe(storage, "Lava")
         assert "No recipe known" in result
 
     def test_single_step_recipe(self, tmp_path):
         from infinite_craft_cli.cli import do_recipe
-        game = make_mock_game([
+        storage = make_mock_storage([
             MockElement("Water", "💧"),
             MockElement("Fire", "🔥"),
             MockElement("Steam", "💨"),
@@ -146,14 +146,14 @@ class TestDoRecipe:
         with patch("infinite_craft_cli.cli.RECIPES_PATH", str(path)):
             with patch("sys.stdout") as mock_stdout:
                 mock_stdout.isatty.return_value = False
-                result = do_recipe(game, "Steam")
+                result = do_recipe(storage, "Steam")
         assert "1 steps" in result
         assert "Water" in result
         assert "Fire" in result
 
     def test_multi_step_recipe(self, tmp_path):
         from infinite_craft_cli.cli import do_recipe
-        game = make_mock_game([
+        storage = make_mock_storage([
             MockElement("Water", "💧"),
             MockElement("Fire", "🔥"),
             MockElement("Earth", "🌍"),
@@ -164,36 +164,36 @@ class TestDoRecipe:
         with patch("infinite_craft_cli.cli.RECIPES_PATH", str(path)):
             with patch("sys.stdout") as mock_stdout:
                 mock_stdout.isatty.return_value = False
-                result = do_recipe(game, "Mud")
+                result = do_recipe(storage, "Mud")
         assert "2 steps" in result
 
     def test_title_case_lookup(self, tmp_path):
         from infinite_craft_cli.cli import do_recipe
-        game = make_mock_game([MockElement("Steam", "💨")])
+        storage = make_mock_storage([MockElement("Steam", "💨")])
         path = self._setup_recipes(tmp_path)
         with patch("infinite_craft_cli.cli.RECIPES_PATH", str(path)):
             with patch("sys.stdout") as mock_stdout:
                 mock_stdout.isatty.return_value = False
-                result = do_recipe(game, "steam")
+                result = do_recipe(storage, "steam")
         assert "1 steps" in result
 
 
 class TestDoUnfilled:
     def test_all_filled(self, tmp_path):
         from infinite_craft_cli.cli import do_unfilled
-        game = make_mock_game([
+        storage = make_mock_storage([
             MockElement("Water", "💧"),
             MockElement("Steam", "💨"),
         ])
         path = tmp_path / "recipes.json"
         path.write_text(json.dumps({"Steam": [["Fire", "Water"]]}))
         with patch("infinite_craft_cli.cli.RECIPES_PATH", str(path)):
-            result = do_unfilled(game)
+            result = do_unfilled(storage)
         assert "All elements have recipes" in result
 
     def test_some_missing(self, tmp_path):
         from infinite_craft_cli.cli import do_unfilled
-        game = make_mock_game([
+        storage = make_mock_storage([
             MockElement("Water", "💧"),
             MockElement("Steam", "💨"),
             MockElement("Lava", "🌋"),
@@ -203,15 +203,15 @@ class TestDoUnfilled:
         with patch("infinite_craft_cli.cli.RECIPES_PATH", str(path)):
             with patch("sys.stdout") as mock_stdout:
                 mock_stdout.isatty.return_value = False
-                result = do_unfilled(game)
+                result = do_unfilled(storage)
         assert "1 elements without recipes" in result
         assert "Lava" in result
 
     def test_base_elements_excluded(self, tmp_path):
         from infinite_craft_cli.cli import do_unfilled
-        game = make_mock_game()  # only base elements
+        storage = make_mock_storage()  # only base elements
         path = tmp_path / "recipes.json"
         path.write_text("{}")
         with patch("infinite_craft_cli.cli.RECIPES_PATH", str(path)):
-            result = do_unfilled(game)
+            result = do_unfilled(storage)
         assert "All elements have recipes" in result

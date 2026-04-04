@@ -1,6 +1,6 @@
 module(
     name = "infinite-craft-cli",
-    version = "0.1.0",
+    version = "1.0.0",
 )
 
 bazel_dep(name = "rules_python", version = "1.7.0")
