@@ -4,7 +4,14 @@ import os
 
 
 def get_data_dir() -> str:
-    """Return the path to ~/.infinite-craft-cli/, creating it if needed."""
+    """Return the data directory path, creating it if needed.
+
+    Respects INFINITE_CRAFT_DATA env var, otherwise defaults to ~/.infinite-craft-cli/.
+    """
+    override = os.environ.get("INFINITE_CRAFT_DATA")
+    if override:
+        os.makedirs(override, exist_ok=True)
+        return override
     data_dir = os.path.join(os.path.expanduser("~"), ".infinite-craft-cli")
     os.makedirs(data_dir, exist_ok=True)
     return data_dir

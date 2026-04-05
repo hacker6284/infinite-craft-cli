@@ -108,3 +108,48 @@ class TestReload:
         storage.reload()
         assert len(storage.get_all()) == 5
         assert storage.get_by_name("External") is not None
+
+
+class TestConcurrency:
+    def test_add_rereads_from_disk(self, tmp_path):
+        """add() should pick up external changes before checking for duplicates."""
+        path = tmp_path / "d.json"
+        storage = DiscoveryStorage(str(path))
+        assert len(storage.get_all()) == 4
+
+        # Another process adds an element directly to the file
+        data = json.loads(path.read_text())
+        data.append({"name": "Steam", "emoji": "💨", "is_first_discovery": False})
+        path.write_text(json.dumps(data))
+
+        # Our storage doesn't know about Steam yet in memory,
+        # but add() should re-read and detect the duplicate
+        result = storage.add(name="Steam", emoji="💨", is_first_discovery=False)
+        assert result is None  # duplicate detected after re-read
+        assert len(storage.get_all()) == 5  # has the externally-added Steam
+
+    def test_add_preserves_external_additions(self, tmp_path):
+        """add() should not overwrite elements added by other processes."""
+        path = tmp_path / "d.json"
+        storage = DiscoveryStorage(str(path))
+
+        # Another process adds Steam
+        data = json.loads(path.read_text())
+        data.append({"name": "Steam", "emoji": "💨", "is_first_discovery": False})
+        path.write_text(json.dumps(data))
+
+        # We add Lava — should preserve Steam from disk
+        storage.add(name="Lava", emoji="🌋", is_first_discovery=False)
+        data = json.loads(path.read_text())
+        names = [d["name"] for d in data]
+        assert "Steam" in names
+        assert "Lava" in names
+        assert len(data) == 6  # 4 starters + Steam + Lava
+
+    def test_lock_file_created(self, tmp_path):
+        """A .lock file should be created alongside the data file."""
+        path = tmp_path / "d.json"
+        lock_path = tmp_path / "d.json.lock"
+        DiscoveryStorage(str(path))
+        # Lock file is created during _save/_load
+        assert lock_path.exists()

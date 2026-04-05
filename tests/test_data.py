@@ -54,3 +54,30 @@ def test_all_paths_share_data_dir():
     assert DISCOVERIES_PATH.startswith(data_dir)
     assert RECIPES_PATH.startswith(data_dir)
     assert EXPORT_PATH.startswith(data_dir)
+
+
+def test_env_var_override(tmp_path):
+    from infinite_craft_cli.data import get_data_dir
+    override = str(tmp_path / "custom_data")
+    with patch.dict(os.environ, {"INFINITE_CRAFT_DATA": override}):
+        result = get_data_dir()
+    assert result == override
+    assert os.path.isdir(override)
+
+
+def test_env_var_takes_precedence(tmp_path):
+    from infinite_craft_cli.data import get_data_dir
+    override = str(tmp_path / "override")
+    with patch.dict(os.environ, {"INFINITE_CRAFT_DATA": override}):
+        result = get_data_dir()
+    assert ".infinite-craft-cli" not in result
+    assert result == override
+
+
+def test_no_env_var_uses_default():
+    from infinite_craft_cli.data import get_data_dir
+    with patch.dict(os.environ, {}, clear=False):
+        if "INFINITE_CRAFT_DATA" in os.environ:
+            del os.environ["INFINITE_CRAFT_DATA"]
+        result = get_data_dir()
+    assert ".infinite-craft-cli" in result

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "infinite-craft-cli"
-version = "1.0.0"
+version = "1.1.0"
 description = "Interactive CLI for Infinite Craft — combine elements from the terminal"
 readme = "README.md"
 license = "MIT"
