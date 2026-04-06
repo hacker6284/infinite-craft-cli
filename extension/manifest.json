@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Infinite Craft Trainer",
+  "version": "1.0.0",
+  "description": "CLI overlay for neal.fun Infinite Craft — combine, search, recipe, exhaust, crawl, and more.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://neal.fun/infinite-craft/*"],
+      "js": ["loader.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["trainer.js"],
+      "matches": ["https://neal.fun/*"]
+    }
+  ]
+}
