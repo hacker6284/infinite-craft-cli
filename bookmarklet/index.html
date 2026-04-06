@@ -13,6 +13,8 @@
   .card { background: #1a1a2e; border-radius: 12px; padding: 24px 28px; max-width: 640px; width: 100%; margin-bottom: 24px; }
   .card h2 { color: #00bcd4; margin-bottom: 12px; font-size: 1.1em; }
   .card p { line-height: 1.6; margin-bottom: 12px; }
+  .bookmarklet-link { display: inline-block; background: #0f3460; color: #ffeb3b; padding: 12px 24px; border-radius: 8px; text-decoration: none; font-weight: bold; font-size: 1.1em; cursor: grab; transition: background 0.2s; }
+  .bookmarklet-link:hover { background: #1a4a80; }
   .steps { list-style: none; counter-reset: step; }
   .steps li { counter-increment: step; padding: 6px 0; padding-left: 28px; position: relative; }
   .steps li::before { content: counter(step); position: absolute; left: 0; background: #0f3460; color: #00bcd4; width: 20px; height: 20px; border-radius: 50%; text-align: center; font-size: 12px; line-height: 20px; }
@@ -41,65 +43,54 @@
 <div class="card">
   <h2>Install</h2>
 
-  <p style="margin-bottom:12px">Copy the bookmarklet code below, then follow the instructions for your browser.</p>
-
-  <div class="code-box" id="bookmarklet-code">javascript:void(document.head.appendChild(Object.assign(document.createElement('script'),{src:'https://hacker6284.github.io/infinite-craft-cli/bookmarklet/trainer.js'})))</div>
-  <p style="text-align:center;margin-bottom:16px">
-    <button class="copy-btn" id="copy-btn" style="position:static;padding:8px 20px;font-size:14px;border-radius:6px" onclick="copyCode()">Copy to Clipboard</button>
-  </p>
-
   <div class="tab-bar">
-    <div class="tab active" onclick="switchTab('chrome')">Chrome / Edge</div>
-    <div class="tab" onclick="switchTab('safari')">Safari</div>
-    <div class="tab" onclick="switchTab('firefox')">Firefox</div>
+    <div class="tab active" onclick="switchTab('drag')">Drag to Install</div>
+    <div class="tab" onclick="switchTab('manual')">Manual Install</div>
   </div>
 
-  <div class="tab-content active" id="tab-chrome">
-    <ol class="steps">
-      <li>Press <code>Ctrl+D</code> (or <code>Cmd+D</code> on Mac) to bookmark this page</li>
-      <li>Open the Bookmark Manager (<code>Ctrl+Shift+O</code> / <code>Cmd+Shift+O</code>)</li>
-      <li>Find the bookmark you just created, right-click it, and choose <strong>Edit</strong></li>
-      <li>Replace the URL with the bookmarklet code copied above</li>
-      <li>Rename it to <strong>IC Trainer</strong> and save</li>
-      <li>Go to <a href="https://neal.fun/infinite-craft/" target="_blank">neal.fun/infinite-craft</a> and click the bookmark</li>
-    </ol>
+  <div class="tab-content active" id="tab-drag">
+    <p>Drag this button to your bookmarks bar:</p>
+    <p style="text-align:center;margin:16px 0">
+      <a class="bookmarklet-link" id="bookmarklet-link" href="#">Loading...</a>
+    </p>
+    <p style="color:#888;font-size:0.85em">If dragging doesn't work in your browser, use the Manual Install tab.</p>
   </div>
 
-  <div class="tab-content" id="tab-safari">
+  <div class="tab-content" id="tab-manual">
+    <p style="margin-bottom:12px">
+      <button class="copy-btn" id="copy-btn" style="position:static;padding:8px 20px;font-size:14px;border-radius:6px">Copy Bookmarklet Code</button>
+    </p>
     <ol class="steps">
-      <li>Press <code>Cmd+D</code> to bookmark this page</li>
-      <li>Open the sidebar (<code>Cmd+Shift+L</code>) or go to <strong>Bookmarks &gt; Edit Bookmarks</strong></li>
-      <li>Find the bookmark, right-click and choose <strong>Edit Address</strong></li>
-      <li>Replace the URL with the bookmarklet code copied above</li>
+      <li>Click the button above to copy the bookmarklet code</li>
+      <li>Create a new bookmark in your browser (bookmark this page, or add any page)</li>
+      <li>Edit the bookmark and replace the URL with the copied code</li>
       <li>Rename it to <strong>IC Trainer</strong></li>
       <li>Go to <a href="https://neal.fun/infinite-craft/" target="_blank">neal.fun/infinite-craft</a> and click the bookmark</li>
     </ol>
   </div>
 
-  <div class="tab-content" id="tab-firefox">
-    <ol class="steps">
-      <li>Press <code>Ctrl+D</code> (or <code>Cmd+D</code> on Mac) to bookmark this page</li>
-      <li>Open the Library (<code>Ctrl+Shift+O</code> / <code>Cmd+Shift+O</code>)</li>
-      <li>Find the bookmark, select it, and edit the <strong>URL</strong> field at the bottom</li>
-      <li>Replace the URL with the bookmarklet code copied above</li>
-      <li>Rename it to <strong>IC Trainer</strong></li>
-      <li>Go to <a href="https://neal.fun/infinite-craft/" target="_blank">neal.fun/infinite-craft</a> and click the bookmark</li>
-    </ol>
-  </div>
-
-  <div class="note">Your discoveries are saved to the game's own localStorage, so they persist and show up when you refresh.</div>
+  <div class="note">Your discoveries are saved to the game's IndexedDB, so they persist and show up when you refresh.</div>
 </div>
 
 <script>
-function copyCode() {
-  const code = document.getElementById('bookmarklet-code').textContent;
-  navigator.clipboard.writeText(code).then(() => {
-    const btn = document.getElementById('copy-btn');
-    btn.textContent = 'Copied!';
-    btn.classList.add('copied');
-    setTimeout(() => { btn.textContent = 'Copy to Clipboard'; btn.classList.remove('copied'); }, 2000);
+// Build the inline bookmarklet URL from the minified source
+fetch('trainer.min.js').then(r => r.text()).then(code => {
+  const url = 'javascript:void(' + encodeURIComponent(code) + ')';
+  const link = document.getElementById('bookmarklet-link');
+  link.href = url;
+  link.textContent = 'IC Trainer';
+  link.addEventListener('click', e => e.preventDefault());
+
+  document.getElementById('copy-btn').addEventListener('click', () => {
+    navigator.clipboard.writeText(url).then(() => {
+      const btn = document.getElementById('copy-btn');
+      btn.textContent = 'Copied!';
+      btn.classList.add('copied');
+      setTimeout(() => { btn.textContent = 'Copy Bookmarklet Code'; btn.classList.remove('copied'); }, 2000);
+    });
   });
-}
+});
+
 function switchTab(name) {
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
