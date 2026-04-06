@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Infinite Craft Trainer</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0a1a; color: #e0e0e0; min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 40px 20px; }
+  h1 { font-size: 2em; margin-bottom: 8px; }
+  h1 span { color: #ffeb3b; }
+  .subtitle { color: #888; margin-bottom: 32px; }
+  .card { background: #1a1a2e; border-radius: 12px; padding: 24px 28px; max-width: 640px; width: 100%; margin-bottom: 24px; }
+  .card h2 { color: #00bcd4; margin-bottom: 12px; font-size: 1.1em; }
+  .card p { line-height: 1.6; margin-bottom: 12px; }
+  .steps { list-style: none; counter-reset: step; }
+  .steps li { counter-increment: step; padding: 6px 0; padding-left: 28px; position: relative; }
+  .steps li::before { content: counter(step); position: absolute; left: 0; background: #0f3460; color: #00bcd4; width: 20px; height: 20px; border-radius: 50%; text-align: center; font-size: 12px; line-height: 20px; }
+  code { background: #16213e; padding: 2px 6px; border-radius: 4px; font-family: 'Menlo', 'Consolas', monospace; font-size: 0.9em; color: #00bcd4; }
+  .commands { font-family: 'Menlo', 'Consolas', monospace; font-size: 0.85em; line-height: 1.8; }
+  .commands .cmd { color: #00bcd4; }
+  .commands .desc { color: #888; }
+  a { color: #00bcd4; }
+  .note { background: #16213e; border-left: 3px solid #ffeb3b; padding: 12px 16px; border-radius: 0 8px 8px 0; margin-top: 8px; font-size: 0.9em; color: #ccc; }
+  .code-box { position: relative; background: #16213e; border: 1px solid #0f3460; border-radius: 8px; padding: 12px 14px; font-family: 'Menlo', 'Consolas', monospace; font-size: 0.8em; color: #00bcd4; word-break: break-all; line-height: 1.5; margin: 12px 0; cursor: text; user-select: all; }
+  .copy-btn { position: absolute; top: 6px; right: 6px; background: #0f3460; color: #ffeb3b; border: none; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; font-family: inherit; }
+  .copy-btn:hover { background: #1a4a80; }
+  .copy-btn.copied { background: #4caf50; color: #fff; }
+  .tab-bar { display: flex; gap: 0; margin-bottom: 0; }
+  .tab { padding: 8px 16px; background: #16213e; color: #888; border: 1px solid #0f3460; border-bottom: none; border-radius: 8px 8px 0 0; cursor: pointer; font-size: 0.9em; }
+  .tab.active { background: #1a1a2e; color: #00bcd4; border-bottom: 1px solid #1a1a2e; margin-bottom: -1px; z-index: 1; }
+  .tab-content { border: 1px solid #0f3460; border-radius: 0 8px 8px 8px; padding: 16px; display: none; }
+  .tab-content.active { display: block; }
+</style>
+</head>
+<body>
+
+<h1><span>⚡</span> Infinite Craft Trainer</h1>
+<p class="subtitle">A CLI overlay for <a href="https://neal.fun/infinite-craft/" target="_blank">neal.fun/infinite-craft</a></p>
+
+<div class="card">
+  <h2>Install</h2>
+
+  <p style="margin-bottom:12px">Copy the bookmarklet code below, then follow the instructions for your browser.</p>
+
+  <div class="code-box" id="bookmarklet-code">javascript:void(document.head.appendChild(Object.assign(document.createElement('script'),{src:'https://hacker6284.github.io/infinite-craft-cli/bookmarklet/trainer.js'})))</div>
+  <p style="text-align:center;margin-bottom:16px">
+    <button class="copy-btn" id="copy-btn" style="position:static;padding:8px 20px;font-size:14px;border-radius:6px" onclick="copyCode()">Copy to Clipboard</button>
+  </p>
+
+  <div class="tab-bar">
+    <div class="tab active" onclick="switchTab('chrome')">Chrome / Edge</div>
+    <div class="tab" onclick="switchTab('safari')">Safari</div>
+    <div class="tab" onclick="switchTab('firefox')">Firefox</div>
+  </div>
+
+  <div class="tab-content active" id="tab-chrome">
+    <ol class="steps">
+      <li>Press <code>Ctrl+D</code> (or <code>Cmd+D</code> on Mac) to bookmark this page</li>
+      <li>Open the Bookmark Manager (<code>Ctrl+Shift+O</code> / <code>Cmd+Shift+O</code>)</li>
+      <li>Find the bookmark you just created, right-click it, and choose <strong>Edit</strong></li>
+      <li>Replace the URL with the bookmarklet code copied above</li>
+      <li>Rename it to <strong>IC Trainer</strong> and save</li>
+      <li>Go to <a href="https://neal.fun/infinite-craft/" target="_blank">neal.fun/infinite-craft</a> and click the bookmark</li>
+    </ol>
+  </div>
+
+  <div class="tab-content" id="tab-safari">
+    <ol class="steps">
+      <li>Press <code>Cmd+D</code> to bookmark this page</li>
+      <li>Open the sidebar (<code>Cmd+Shift+L</code>) or go to <strong>Bookmarks &gt; Edit Bookmarks</strong></li>
+      <li>Find the bookmark, right-click and choose <strong>Edit Address</strong></li>
+      <li>Replace the URL with the bookmarklet code copied above</li>
+      <li>Rename it to <strong>IC Trainer</strong></li>
+      <li>Go to <a href="https://neal.fun/infinite-craft/" target="_blank">neal.fun/infinite-craft</a> and click the bookmark</li>
+    </ol>
+  </div>
+
+  <div class="tab-content" id="tab-firefox">
+    <ol class="steps">
+      <li>Press <code>Ctrl+D</code> (or <code>Cmd+D</code> on Mac) to bookmark this page</li>
+      <li>Open the Library (<code>Ctrl+Shift+O</code> / <code>Cmd+Shift+O</code>)</li>
+      <li>Find the bookmark, select it, and edit the <strong>URL</strong> field at the bottom</li>
+      <li>Replace the URL with the bookmarklet code copied above</li>
+      <li>Rename it to <strong>IC Trainer</strong></li>
+      <li>Go to <a href="https://neal.fun/infinite-craft/" target="_blank">neal.fun/infinite-craft</a> and click the bookmark</li>
+    </ol>
+  </div>
+
+  <div class="note">Your discoveries are saved to the game's own localStorage, so they persist and show up when you refresh.</div>
+</div>
+
+<script>
+function copyCode() {
+  const code = document.getElementById('bookmarklet-code').textContent;
+  navigator.clipboard.writeText(code).then(() => {
+    const btn = document.getElementById('copy-btn');
+    btn.textContent = 'Copied!';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = 'Copy to Clipboard'; btn.classList.remove('copied'); }, 2000);
+  });
+}
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  event.target.classList.add('active');
+  document.getElementById('tab-' + name).classList.add('active');
+}
+</script>
+
+<div class="card">
+  <h2>Commands</h2>
+  <div class="commands">
+    <span class="cmd">element + element</span> <span class="desc">— Combine two elements</span><br>
+    <span class="cmd">element ++ element</span> <span class="desc">— Combine &amp; crawl iteratively</span><br>
+    <span class="cmd">element + | query</span> <span class="desc">— Combine with all matching elements</span><br>
+    <span class="cmd">query * query</span> <span class="desc">— Cross-combine two sets of matches</span><br>
+    <span class="cmd">/search query</span> <span class="desc">— Search discoveries (* ? wildcards, ^ for first discoveries)</span><br>
+    <span class="cmd">/recipe element</span> <span class="desc">— Show shortest recipe from base elements</span><br>
+    <span class="cmd">/list</span> <span class="desc">— List all discovered elements</span><br>
+    <span class="cmd">/exhaust element</span> <span class="desc">— Combine element with everything</span><br>
+    <span class="cmd">/crawl el + el</span> <span class="desc">— Same as ++ (alternate syntax)</span><br>
+    <span class="cmd">/permute query</span> <span class="desc">— Combine all matching elements with each other</span><br>
+    <span class="cmd">/import element</span> <span class="desc">— Import recipe from Infinibrowser</span><br>
+    <span class="cmd">/fill</span> <span class="desc">— Fetch missing recipes from Infinibrowser</span><br>
+    <span class="cmd">/unfilled</span> <span class="desc">— List elements without recipes</span><br>
+    <span class="cmd">/export</span> <span class="desc">— Download discoveries as .ic file</span><br>
+    <span class="cmd">/history</span> <span class="desc">— Show combinations this session</span><br>
+    <span class="cmd">/clear</span> <span class="desc">— Clear the terminal</span><br>
+    <span class="cmd">/help</span> <span class="desc">— Show commands in the trainer</span><br>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Tips</h2>
+  <p>Use <code>Up</code>/<code>Down</code> arrows to scroll through command history.</p>
+  <p>Bulk operations show a <strong>Stop</strong> button. Click it or wait for completion.</p>
+  <p>After combining elements, <strong>refresh the page</strong> to see them in the game's sidebar.</p>
+  <p>For the full desktop CLI with more features, install the <a href="https://github.com/hacker6284/infinite-craft-cli">Python package</a>.</p>
+</div>
+
+</body>
+</html>
