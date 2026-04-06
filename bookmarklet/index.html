@@ -44,49 +44,46 @@
   <h2>Install</h2>
 
   <div class="tab-bar">
-    <div class="tab active" onclick="switchTab('drag')">Drag to Install</div>
-    <div class="tab" onclick="switchTab('manual')">Manual Install</div>
+    <div class="tab active" onclick="switchTab('console')">Quick Start</div>
+    <div class="tab" onclick="switchTab('userscript')">Userscript (Persistent)</div>
   </div>
 
-  <div class="tab-content active" id="tab-drag">
-    <p>Drag this button to your bookmarks bar:</p>
-    <p style="text-align:center;margin:16px 0">
-      <a class="bookmarklet-link" id="bookmarklet-link" href="#">Loading...</a>
-    </p>
-    <p style="color:#888;font-size:0.85em">If dragging doesn't work in your browser, use the Manual Install tab.</p>
-  </div>
-
-  <div class="tab-content" id="tab-manual">
-    <p style="margin-bottom:12px">
-      <button class="copy-btn" id="copy-btn" style="position:static;padding:8px 20px;font-size:14px;border-radius:6px">Copy Bookmarklet Code</button>
-    </p>
+  <div class="tab-content active" id="tab-console">
     <ol class="steps">
-      <li>Click the button above to copy the bookmarklet code</li>
-      <li>Create a new bookmark in your browser (bookmark this page, or add any page)</li>
-      <li>Edit the bookmark and replace the URL with the copied code</li>
-      <li>Rename it to <strong>IC Trainer</strong></li>
-      <li>Go to <a href="https://neal.fun/infinite-craft/" target="_blank">neal.fun/infinite-craft</a> and click the bookmark</li>
+      <li>Go to <a href="https://neal.fun/infinite-craft/" target="_blank">neal.fun/infinite-craft</a></li>
+      <li>Open the browser console:
+        <br><code>Chrome/Edge:</code> <code>Ctrl+Shift+J</code> / <code>Cmd+Option+J</code>
+        <br><code>Firefox:</code> <code>Ctrl+Shift+K</code> / <code>Cmd+Option+K</code>
+        <br><code>Safari:</code> <code>Cmd+Option+C</code> (enable Developer menu in Settings first)
+      </li>
+      <li>Click the button below, then paste into the console and press Enter</li>
     </ol>
+    <p style="text-align:center;margin:16px 0">
+      <button class="bookmarklet-link" id="copy-btn" style="cursor:pointer;border:none;font-family:inherit">Loading...</button>
+    </p>
+    <div class="note">You'll need to paste the code each time you reload the page. For a persistent install, use the Userscript tab.</div>
   </div>
 
-  <div class="note">Your discoveries are saved to the game's IndexedDB, so they persist and show up when you refresh.</div>
+  <div class="tab-content" id="tab-userscript">
+    <p>Install <a href="https://www.tampermonkey.net/" target="_blank">Tampermonkey</a> (Chrome/Edge/Safari) or <a href="https://violentmonkey.github.io/" target="_blank">Violentmonkey</a> (Chrome/Firefox), then click below:</p>
+    <p style="text-align:center;margin:16px 0">
+      <a class="bookmarklet-link" id="userscript-link" href="trainer.user.js" style="text-decoration:none">Install Userscript</a>
+    </p>
+    <div class="note">The userscript runs automatically every time you visit neal.fun/infinite-craft — no pasting required.</div>
+  </div>
+
+  <div class="note" style="margin-top:16px">Your discoveries are saved to the game's IndexedDB, so they persist and show up when you refresh.</div>
 </div>
 
 <script>
-// Build the inline bookmarklet URL from the minified source
 fetch('trainer.min.js').then(r => r.text()).then(code => {
-  const url = 'javascript:void(' + encodeURIComponent(code) + ')';
-  const link = document.getElementById('bookmarklet-link');
-  link.href = url;
-  link.textContent = 'IC Trainer';
-  link.addEventListener('click', e => e.preventDefault());
-
+  document.getElementById('copy-btn').textContent = 'Copy Trainer Code';
   document.getElementById('copy-btn').addEventListener('click', () => {
-    navigator.clipboard.writeText(url).then(() => {
+    navigator.clipboard.writeText(code).then(() => {
       const btn = document.getElementById('copy-btn');
       btn.textContent = 'Copied!';
-      btn.classList.add('copied');
-      setTimeout(() => { btn.textContent = 'Copy Bookmarklet Code'; btn.classList.remove('copied'); }, 2000);
+      btn.style.background = '#4caf50';
+      setTimeout(() => { btn.textContent = 'Copy Trainer Code'; btn.style.background = ''; }, 2000);
     });
   });
 });
