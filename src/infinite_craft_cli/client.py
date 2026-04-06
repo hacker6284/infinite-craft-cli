@@ -46,13 +46,13 @@ def _get_sync_session():
     return _sync_session
 
 
-def fetch_json(url: str, params: dict | None = None, timeout: int = 15) -> dict | None:
+def fetch_json(url: str, params: dict | None = None, timeout: int = 15, use_cache: bool = True) -> dict | None:
     """Sync GET returning parsed JSON, with caching. Returns None on error.
 
     Uses curl_cffi with Chrome impersonation for Cloudflare bypass.
     """
     cache_key = f"{url}?{params}" if params else url
-    if cache_key in _sync_cache:
+    if use_cache and cache_key in _sync_cache:
         return _sync_cache[cache_key]
     try:
         resp = _get_sync_session().get(url, params=params, timeout=timeout)

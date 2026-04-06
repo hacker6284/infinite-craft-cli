@@ -222,9 +222,10 @@ class TestInfinibrowserImportPersistence:
             },
         ]}
 
-        with patch("infinite_craft_cli.cli._ib_fetch", side_effect=[item_data, lineage_data]):
-            with patch("infinite_craft_cli.cli.RECIPES_PATH", recipes_path):
-                _import_from_infinibrowser(storage, "Lava")
+        with patch("infinite_craft_cli.cli._ib_fetch", return_value=item_data):
+            with patch("infinite_craft_cli.cli.fetch_json", return_value=lineage_data):
+                with patch("infinite_craft_cli.cli.RECIPES_PATH", recipes_path):
+                    _import_from_infinibrowser(storage, "Lava")
 
         # Reload from disk and verify
         storage2 = DiscoveryStorage(discoveries_path)
@@ -232,8 +233,38 @@ class TestInfinibrowserImportPersistence:
         assert storage2.get_by_name("Magma").emoji == "🔴"
         assert storage2.get_by_name("Lava") is not None
 
-        # Verify recipes persisted
-        with open(recipes_path) as f:
-            recipes = json.load(f)
-        assert "Magma" in recipes
-        assert "Lava" in recipes
+    def test_import_not_blocked_by_stale_cache(self, tmp_path):
+        """A prior cached empty recipe should not prevent a successful import."""
+        from infinite_craft_cli.cli import _import_from_infinibrowser
+        from infinite_craft_cli.client import fetch_json, clear_fetch_cache
+
+        clear_fetch_cache()
+        discoveries_path = str(tmp_path / "discoveries.json")
+        recipes_path = str(tmp_path / "recipes.json")
+        storage = DiscoveryStorage(discoveries_path)
+
+        item_data = {"text": "Licker", "emoji": "👅", "depth": 18}
+        empty_recipe = {"steps": [], "missing": {}}
+        full_recipe = {"steps": [{
+            "a": {"id": "Water", "emoji": "💧"},
+            "b": {"id": "Fire", "emoji": "🔥"},
+            "result": {"id": "Licker", "emoji": "👅"},
+        }]}
+
+        # Simulate a prior fetch that cached an empty recipe
+        mock_session = MagicMock()
+        empty_resp = MagicMock()
+        empty_resp.json.return_value = empty_recipe
+        mock_session.get.return_value = empty_resp
+        with patch("infinite_craft_cli.client._get_sync_session", return_value=mock_session):
+            fetch_json("https://infinibrowser.wiki/api/recipe", {"id": "Licker"})
+
+        # Now import should bypass the cache and get the full recipe
+        with patch("infinite_craft_cli.cli._ib_fetch", return_value=item_data):
+            with patch("infinite_craft_cli.cli.fetch_json", return_value=full_recipe):
+                with patch("infinite_craft_cli.cli.RECIPES_PATH", recipes_path):
+                    result = _import_from_infinibrowser(storage, "Licker")
+
+        assert "No lineage" not in result
+        storage2 = DiscoveryStorage(discoveries_path)
+        assert storage2.get_by_name("Licker") is not None

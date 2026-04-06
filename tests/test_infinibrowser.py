@@ -94,6 +94,18 @@ class TestFetchJson:
             fetch_json("https://example.com/api", timeout=30)
         mock_session.get.assert_called_once_with("https://example.com/api", params=None, timeout=30)
 
+    def test_use_cache_false_bypasses_cache(self):
+        from infinite_craft_cli.client import fetch_json
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"steps": []}
+        mock_session = MagicMock()
+        mock_session.get.return_value = mock_resp
+        with patch("infinite_craft_cli.client._get_sync_session", return_value=mock_session):
+            fetch_json("https://example.com/api", {"id": "X"})
+            # Second call with use_cache=False should hit the network again
+            fetch_json("https://example.com/api", {"id": "X"}, use_cache=False)
+        assert mock_session.get.call_count == 2
+
 
 class TestIbFetch:
     def test_success(self):

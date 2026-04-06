@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.2.2] - 2026-04-06
+
+### Fixed
+- `/import` no longer fails when a stale cached empty recipe exists from earlier in the session.
+
+### Changed
+- Recipe fetches in `/import` now bypass the sync cache to always get fresh data from Infinibrowser.
+
 ## [1.2.1] - 2026-04-06
 
 ### Fixed
