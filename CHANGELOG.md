@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.2.1] - 2026-04-06
+
+### Fixed
+- Combined elements now persist to discoveries — previously only the inputs were saved, not the result.
+
+### Added
+- 29 new tests (163 → 192 total), including:
+  - E2E regression tests with real storage (combine→persist→reload, export→import round-trip, recipe integration).
+  - Interactive mode command parsing and dispatch tests.
+  - `_fill_missing_recipes()` unit tests.
+  - Retry logic tests for `_cached_pair()`.
+- Strengthened existing test assertions to verify call arguments, not just call counts.
+
 ## [1.2.0] - 2026-04-05
 
 ### Changed

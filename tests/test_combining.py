@@ -3,7 +3,7 @@
 import asyncio
 import sys
 import pytest
-from unittest.mock import patch, AsyncMock, MagicMock
+from unittest.mock import patch, AsyncMock, MagicMock, call
 
 from tests.conftest import MockElement, make_mock_storage, make_mock_client
 
@@ -82,6 +82,30 @@ class TestCachedPair:
             run_async(_cached_pair(client, storage, a, b))
         mock_record.assert_called_once_with("Steam", "Water", "Fire")
 
+    def test_retries_on_failure(self):
+        from infinite_craft_cli.cli import _cached_pair
+        client = make_mock_client()
+        storage = make_mock_storage()
+        result_elem = MockElement("Steam", "💨")
+        client.pair.side_effect = [Exception("fail"), Exception("fail"), result_elem]
+        a = MockElement("Water", "💧")
+        b = MockElement("Fire", "🔥")
+        with patch("infinite_craft_cli.cli._record_recipe"):
+            result = run_async(_cached_pair(client, storage, a, b))
+        assert result.name == "Steam"
+        assert client.pair.call_count == 3
+
+    def test_raises_after_max_retries(self):
+        from infinite_craft_cli.cli import _cached_pair
+        client = make_mock_client()
+        storage = make_mock_storage()
+        client.pair.side_effect = Exception("persistent failure")
+        a = MockElement("Water", "💧")
+        b = MockElement("Fire", "🔥")
+        with pytest.raises(Exception, match="persistent failure"):
+            run_async(_cached_pair(client, storage, a, b))
+        assert client.pair.call_count == 3
+
     def test_no_recipe_on_none_result(self):
         from infinite_craft_cli.cli import _cached_pair
         client = make_mock_client()
@@ -109,6 +133,7 @@ class TestDoCombine:
                 result = run_async(do_combine(client, storage, "Water", "Fire"))
         assert "Steam" in result
         assert "=" in result
+        storage.add.assert_any_call(name='Steam', emoji='💨', is_first_discovery=False)
 
     def test_api_error(self):
         from infinite_craft_cli.cli import do_combine
@@ -143,8 +168,26 @@ class TestDoCombine:
             with patch("sys.stdout") as mock_stdout:
                 mock_stdout.isatty.return_value = False
                 run_async(do_combine(client, storage, "Water", "Fire"))
-        # Both inputs should be added to storage
-        assert storage.add.call_count == 2
+        # Both inputs and the result should be added to storage
+        calls = storage.add.call_args_list
+        assert len(calls) == 3
+        # Inputs
+        assert calls[0] == call(name='Water', emoji='💧', is_first_discovery=False)
+        assert calls[1] == call(name='Fire', emoji='🔥', is_first_discovery=False)
+        # Result
+        assert calls[2] == call(name='Steam', emoji='💨', is_first_discovery=False)
+
+    def test_first_discovery_flag_preserved(self):
+        from infinite_craft_cli.cli import do_combine
+        client = make_mock_client()
+        storage = make_mock_storage()
+        result_elem = MockElement("Unicorn", "🦄", is_first_discovery=True)
+        client.pair.return_value = result_elem
+        with patch("infinite_craft_cli.cli._record_recipe"):
+            with patch("sys.stdout") as mock_stdout:
+                mock_stdout.isatty.return_value = False
+                run_async(do_combine(client, storage, "Water", "Fire"))
+        storage.add.assert_any_call(name='Unicorn', emoji='🦄', is_first_discovery=True)
 
     def test_nothing_result_no_discovery_update(self):
         from infinite_craft_cli.cli import do_combine

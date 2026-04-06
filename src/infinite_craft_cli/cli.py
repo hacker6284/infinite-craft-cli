@@ -140,12 +140,15 @@ async def do_combine(client, storage, first_name: str, second_name: str) -> str:
         result = await _cached_pair(client, storage, first, second)
     except Exception as e:
         return _color(f"  Error: {e}", RED)
-    # If the pairing succeeded, ensure both inputs are in discoveries too
+    # If the pairing succeeded, ensure both inputs and result are in discoveries
     if result.name is not None:
         for elem in (first, second):
             storage.add(
                 name=elem.name, emoji=elem.emoji, is_first_discovery=False
             )
+        storage.add(
+            name=result.name, emoji=result.emoji, is_first_discovery=result.is_first_discovery
+        )
     result_display = result.name if result.name else "Nothing"
     _history.append((first_name.strip(), second_name.strip(), result_display))
     return format_result(str(first), str(second), result)
@@ -386,6 +389,9 @@ async def _combine_pairs(client, storage, pairs: list[tuple]):
                 storage.add(
                     name=elem.name, emoji=elem.emoji, is_first_discovery=False
                 )
+            storage.add(
+                name=result.name, emoji=result.emoji, is_first_discovery=result.is_first_discovery
+            )
         result_display = result.name if result.name else "Nothing"
         _history.append((a.name, b.name, result_display))
         if result.name is None:

@@ -80,6 +80,9 @@ class TestImportFromInfinibrowser:
         assert "3" in result  # 3 elements imported
         mock_record.assert_called_once()
         # All 3 elements should be added to storage
+        storage.add.assert_any_call(name='Water', emoji='💧', is_first_discovery=False)
+        storage.add.assert_any_call(name='Fire', emoji='🔥', is_first_discovery=False)
+        storage.add.assert_any_call(name='Steam', emoji='💨', is_first_discovery=False)
         assert storage.add.call_count == 3
 
 

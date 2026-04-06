@@ -48,6 +48,7 @@ class TestCombinePairs:
             run_async(_combine_pairs(client, storage, [(a, b)]))
         captured = capsys.readouterr()
         assert "Steam" in captured.out
+        storage.add.assert_any_call(name='Steam', emoji='💨', is_first_discovery=False)
 
     def test_error_handling(self, capsys):
         from infinite_craft_cli.cli import _combine_pairs
