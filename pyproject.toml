@@ -24,5 +24,8 @@ dependencies = [
 Homepage = "https://github.com/hacker6284/infinite-craft-cli"
 Repository = "https://github.com/hacker6284/infinite-craft-cli"
 
+[tool.hatch.build.targets.wheel]
+packages = ["src/infinite_craft_cli"]
+
 [project.scripts]
 infinite-craft = "infinite_craft_cli.cli:main"
