@@ -632,6 +632,63 @@
     return count;
   }
 
+  function pickFile(accept) {
+    return new Promise((resolve) => {
+      const input = document.createElement("input");
+      input.type = "file";
+      if (accept) input.accept = accept;
+      input.onchange = () => resolve(input.files[0] || null);
+      input.click();
+    });
+  }
+
+  async function doImportFile() {
+    print("  Select a .ic save file...");
+    const file = await pickFile(".ic");
+    if (!file) { print("  " + yellow("Cancelled.")); return; }
+    print(`  Reading ${bold(esc(file.name))}...`);
+    try {
+      const arrayBuf = await file.arrayBuffer();
+      let json;
+      try {
+        // Try gzip decompression first
+        const stream = new Blob([arrayBuf]).stream().pipeThrough(new DecompressionStream("gzip"));
+        const text = await new Response(stream).text();
+        json = JSON.parse(text);
+      } catch {
+        // Fall back to plain JSON
+        const text = new TextDecoder().decode(arrayBuf);
+        json = JSON.parse(text);
+      }
+      const items = json.items || [];
+      if (!items.length) { print("  No items in save file."); return; }
+      // Build id-to-item lookup from the save file
+      const idToItem = {};
+      for (const item of items) idToItem[item.id] = item;
+      let importedCount = 0, recipeCount = 0;
+      for (const item of items) {
+        const text = item.text;
+        const emoji = item.emoji || "";
+        const discovered = !!(item.discovery || item.discovered);
+        const isNew = addElement(text, emoji, discovered);
+        if (isNew) importedCount++;
+        // Import recipes
+        if (item.recipes) {
+          for (const pair of item.recipes) {
+            if (pair.length === 2 && idToItem[pair[0]] && idToItem[pair[1]]) {
+              recordRecipe(text, idToItem[pair[0]].text, idToItem[pair[1]].text);
+              recipeCount++;
+            }
+          }
+        }
+      }
+      rebuildRecipeIndex();
+      print(`  Loaded ${green(String(items.length))} elements (${importedCount} new) with ${recipeCount} recipes from ${bold(esc(file.name))}.`);
+    } catch (e) {
+      print("  " + red(`Error reading save file: ${e.message}`));
+    }
+  }
+
   async function doImport(name) {
     print(`  Importing ${bold(esc(name))} from Infinibrowser...`);
     try {
@@ -735,6 +792,7 @@
   ${cyan("/crawl el + el")}        Same as ++ (alternate syntax)
   ${cyan("/permute query")}        Combine all matching elements with each other
   ${cyan("/import element")}       Import recipe from Infinibrowser
+  ${cyan("/import")}               Import from .ic save file
   ${cyan("/fill")}                 Fetch missing recipes from Infinibrowser
   ${cyan("/unfilled")}             List elements without recipes
   ${cyan("/export")}               Download discoveries as .ic save file
@@ -766,7 +824,7 @@
           return;
         }
         case "/permute": if (!arg) { print("  Usage: /permute query"); } else { await doPermute(arg); } return;
-        case "/import": if (!arg) { print("  Usage: /import element"); } else { await doImport(arg); } return;
+        case "/import": if (!arg) { await doImportFile(); } else { await doImport(arg); } return;
         case "/fill": await doFill(); return;
         case "/unfilled": doUnfilled(); return;
         case "/export": await doExport(); return;
