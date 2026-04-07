@@ -196,7 +196,15 @@
   }
 
   function addElement(text, emoji, discovered) {
-    if (_nameIndex[text.toLowerCase()]) return false;
+    const existing = _nameIndex[text.toLowerCase()];
+    if (existing) {
+      // Update discovery flag if newly discovered
+      if (discovered && !existing.discovered) {
+        existing.discovered = true;
+        putItem(existing);
+      }
+      return false;
+    }
     const item = { id: _nextId++, saveId: _saveId, text, emoji: emoji || "" };
     if (discovered) item.discovered = true;
     _items.push(item);
