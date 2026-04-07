@@ -19,4 +19,4 @@ jobs:
           repository-cache: true
 
       - name: Run tests
-        run: bazel test //tests/... --test_output=errors
+        run: bazel test //tests/... --test_output=all --verbose_failures

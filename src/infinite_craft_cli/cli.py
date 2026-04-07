@@ -496,9 +496,9 @@ async def do_cross(client, storage, left_query: str, right_query: str):
 _IB_BASE = "https://infinibrowser.wiki/api"
 
 
-def _ib_fetch(path: str, params: dict) -> dict | None:
+def _ib_fetch(path: str, params: dict, use_cache: bool = True) -> dict | None:
     """Fetch from the Infinibrowser API. Prints errors on failure."""
-    result = fetch_json(f"{_IB_BASE}/{path}", params=params)
+    result = fetch_json(f"{_IB_BASE}/{path}", params=params, use_cache=use_cache)
     if result is None:
         print(f"  {_color('Infinibrowser request failed', RED)}")
     return result
@@ -521,9 +521,8 @@ def _import_from_infinibrowser(storage, name: str) -> str:
     depth = data.get("depth", "?")
     print(f"  Found: {emoji} {data['text']}  (depth {depth})")
 
-    lineage = fetch_json(f"{_IB_BASE}/recipe", params={"id": name}, use_cache=False)
+    lineage = _ib_fetch("recipe", {"id": name}, use_cache=False)
     if lineage is None:
-        print(f"  {_color('Infinibrowser request failed', RED)}")
         return ""
     steps = lineage.get("steps", [])
     if not steps:

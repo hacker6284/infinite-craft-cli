@@ -72,12 +72,11 @@ class TestImportFromInfinibrowser:
             "b": {"id": "Fire", "emoji": "🔥"},
             "result": {"id": "Steam", "emoji": "💨"},
         }]}
-        with patch("infinite_craft_cli.cli._ib_fetch", return_value=item_data):
-            with patch("infinite_craft_cli.cli.fetch_json", return_value=lineage_data):
-                with patch("infinite_craft_cli.cli._record_recipe") as mock_record:
-                    with patch("sys.stdout") as mock_stdout:
-                        mock_stdout.isatty.return_value = False
-                        result = _import_from_infinibrowser(storage, "Steam")
+        with patch("infinite_craft_cli.cli._ib_fetch", side_effect=[item_data, lineage_data]):
+            with patch("infinite_craft_cli.cli._record_recipe") as mock_record:
+                with patch("sys.stdout") as mock_stdout:
+                    mock_stdout.isatty.return_value = False
+                    result = _import_from_infinibrowser(storage, "Steam")
         assert "3" in result  # 3 elements imported
         mock_record.assert_called_once()
         # All 3 elements should be added to storage

@@ -222,10 +222,9 @@ class TestInfinibrowserImportPersistence:
             },
         ]}
 
-        with patch("infinite_craft_cli.cli._ib_fetch", return_value=item_data):
-            with patch("infinite_craft_cli.cli.fetch_json", return_value=lineage_data):
-                with patch("infinite_craft_cli.cli.RECIPES_PATH", recipes_path):
-                    _import_from_infinibrowser(storage, "Lava")
+        with patch("infinite_craft_cli.cli._ib_fetch", side_effect=[item_data, lineage_data]):
+            with patch("infinite_craft_cli.cli.RECIPES_PATH", recipes_path):
+                _import_from_infinibrowser(storage, "Lava")
 
         # Reload from disk and verify
         storage2 = DiscoveryStorage(discoveries_path)
@@ -260,10 +259,9 @@ class TestInfinibrowserImportPersistence:
             fetch_json("https://infinibrowser.wiki/api/recipe", {"id": "Licker"})
 
         # Now import should bypass the cache and get the full recipe
-        with patch("infinite_craft_cli.cli._ib_fetch", return_value=item_data):
-            with patch("infinite_craft_cli.cli.fetch_json", return_value=full_recipe):
-                with patch("infinite_craft_cli.cli.RECIPES_PATH", recipes_path):
-                    result = _import_from_infinibrowser(storage, "Licker")
+        with patch("infinite_craft_cli.cli._ib_fetch", side_effect=[item_data, full_recipe]):
+            with patch("infinite_craft_cli.cli.RECIPES_PATH", recipes_path):
+                result = _import_from_infinibrowser(storage, "Licker")
 
         assert "No lineage" not in result
         storage2 = DiscoveryStorage(discoveries_path)
