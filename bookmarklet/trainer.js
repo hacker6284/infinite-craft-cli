@@ -692,7 +692,7 @@
     for (const el of missing) print("  " + formatElement(el));
   }
 
-  function doExport() {
+  async function doExport() {
     const exportItems = _items.map(item => {
       const exportItem = { id: item.id, text: item.text, emoji: item.emoji || "" };
       if (item.discovered) exportItem.discovery = true;
@@ -702,14 +702,16 @@
     const now = Date.now();
     const save = { name: "Trainer Export", version: "1.0", created: now, updated: now, instances: [], items: exportItems };
     const json = JSON.stringify(save);
-    const blob = new Blob([json], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
+    // Gzip compress to match the .ic format the game and Python CLI expect
+    const stream = new Blob([json]).stream().pipeThrough(new CompressionStream("gzip"));
+    const gzipped = await new Response(stream).blob();
+    const url = URL.createObjectURL(gzipped);
     const a = document.createElement("a");
     a.href = url;
     a.download = "infinite-craft-export.ic";
     a.click();
     URL.revokeObjectURL(url);
-    print(`  Exported ${green(String(exportItems.length))} elements.`);
+    print(`  Exported ${green(String(exportItems.length))} elements (gzip compressed).`);
   }
 
   function doHistory() {
@@ -767,7 +769,7 @@
         case "/import": if (!arg) { print("  Usage: /import element"); } else { await doImport(arg); } return;
         case "/fill": await doFill(); return;
         case "/unfilled": doUnfilled(); return;
-        case "/export": doExport(); return;
+        case "/export": await doExport(); return;
         case "/history": doHistory(); return;
         case "/clear": output.innerHTML = ""; return;
         default: print(`  Unknown command: ${esc(cmd)}. Type ${yellow("/help")} for commands.`); return;
