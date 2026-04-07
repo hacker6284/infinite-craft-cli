@@ -695,7 +695,7 @@
   function doExport() {
     const exportItems = _items.map(item => {
       const exportItem = { id: item.id, text: item.text, emoji: item.emoji || "" };
-      if (item.discovered) exportItem.discovery = true;
+      if (item.discovered) { exportItem.discovered = true; exportItem.discovery = true; }
       if (item.recipes && item.recipes.length) exportItem.recipes = item.recipes;
       return exportItem;
     });
