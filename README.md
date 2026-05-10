@@ -6,8 +6,9 @@
 [![Python](https://img.shields.io/badge/Python-3.10+-blue)](https://python.org)
 [![Tests](https://github.com/hacker6284/infinite-craft-cli/actions/workflows/test.yml/badge.svg)](https://github.com/hacker6284/infinite-craft-cli/actions/workflows/test.yml)
 [![Publish](https://github.com/hacker6284/infinite-craft-cli/actions/workflows/publish.yml/badge.svg)](https://github.com/hacker6284/infinite-craft-cli/actions/workflows/publish.yml)
+[![Chrome Web Store](https://img.shields.io/chrome-web-store/v/gaonnldioeddnfopgejohbhoajoagbnd)](https://chromewebstore.google.com/detail/infinite-craft-trainer/gaonnldioeddnfopgejohbhoajoagbnd)
 
-Interactive CLI for [Infinite Craft](https://neal.fun/infinite-craft/) — combine elements from the terminal.
+Interactive CLI for [Infinite Craft](https://neal.fun/infinite-craft/) — combine elements from the terminal. Also available as a [browser extension](https://chromewebstore.google.com/detail/infinite-craft-trainer/gaonnldioeddnfopgejohbhoajoagbnd) and [web trainer](https://hacker6284.github.io/infinite-craft-cli/).
 
 Originally built on [infinite-craft](https://github.com/sqdnoises/infinite-craft) by [@sqdnoises](https://github.com/sqdnoises). As of v1.0, uses [curl_cffi](https://github.com/lexiforest/curl_cffi) directly.
 
@@ -16,6 +17,12 @@ Originally built on [infinite-craft](https://github.com/sqdnoises/infinite-craft
 ```bash
 pip install infinite-craft-cli
 ```
+
+### Browser extension
+
+Install the [Infinite Craft Trainer](https://chromewebstore.google.com/detail/infinite-craft-trainer/gaonnldioeddnfopgejohbhoajoagbnd) from the Chrome Web Store — it loads automatically on neal.fun/infinite-craft. Works in Edge, Brave, and other Chromium browsers.
+
+For other install methods (console snippet, userscript), see the [web trainer page](https://hacker6284.github.io/infinite-craft-cli/).
 
 ## Usage
 
