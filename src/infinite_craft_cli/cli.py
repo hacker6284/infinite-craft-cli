@@ -354,7 +354,7 @@ async def _combine_pairs(client, storage, pairs: list[tuple]):
     """Combine a list of (element, element) pairs with light parallelism."""
     global _cancelled
     _cancelled = False
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     original_handler = None
 
     def on_sigint():

@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.2.5] - 2026-05-18
+
+### Fixed
+- Replaced deprecated `asyncio.get_event_loop()` (inside async context) with `asyncio.get_running_loop()` in bulk pair processing. Avoids future RuntimeError / warnings on newer Python versions.
+
 ## [1.2.4] - 2026-05-18
 
 ### Fixed
