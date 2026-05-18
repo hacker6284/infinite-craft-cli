@@ -22,28 +22,36 @@ class TestArgParsing:
         import argparse
         with patch("sys.argv", ["infinite-craft", "combine", "Water", "Fire"]):
             with patch("asyncio.run") as mock_run:
-                main()
+                with patch("infinite_craft_cli.cli.interactive_mode"):
+                    with patch("infinite_craft_cli.cli.noninteractive_mode"):
+                        main()
         mock_run.assert_called_once()
 
     def test_search_args(self):
         from infinite_craft_cli.cli import main
         with patch("sys.argv", ["infinite-craft", "search", "steam"]):
             with patch("asyncio.run") as mock_run:
-                main()
+                with patch("infinite_craft_cli.cli.interactive_mode"):
+                    with patch("infinite_craft_cli.cli.noninteractive_mode"):
+                        main()
         mock_run.assert_called_once()
 
     def test_list_args(self):
         from infinite_craft_cli.cli import main
         with patch("sys.argv", ["infinite-craft", "list"]):
             with patch("asyncio.run") as mock_run:
-                main()
+                with patch("infinite_craft_cli.cli.interactive_mode"):
+                    with patch("infinite_craft_cli.cli.noninteractive_mode"):
+                        main()
         mock_run.assert_called_once()
 
     def test_no_args_interactive(self):
         from infinite_craft_cli.cli import main
         with patch("sys.argv", ["infinite-craft"]):
             with patch("asyncio.run") as mock_run:
-                main()
+                with patch("infinite_craft_cli.cli.interactive_mode"):
+                    with patch("infinite_craft_cli.cli.noninteractive_mode"):
+                        main()
         mock_run.assert_called_once()
 
     def test_version_flag(self):

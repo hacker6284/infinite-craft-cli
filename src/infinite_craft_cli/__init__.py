@@ -1,3 +1,7 @@
 """Infinite Craft CLI — combine elements from the terminal."""
 
-__version__ = "1.0.0"
+try:
+    from importlib.metadata import version, PackageNotFoundError
+    __version__ = version("infinite-craft-cli")
+except (ImportError, PackageNotFoundError):
+    __version__ = "0.0.0"

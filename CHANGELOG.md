@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.2.3] - 2026-05-18
+
+### Fixed
+- Test collection failures with `pytest` (and `uv run pytest`) in environments that have third-party packages installing a conflicting top-level `tests` package (e.g. g2pkk). Added `tests/__init__.py` so the local test package takes precedence.
+- `--version` flag (and `infinite_craft_cli.__version__`) always reported the stale hardcoded "1.0.0". Now dynamically loads the real version from package metadata so it matches the current git tag / PyPI release.
+
 ## [1.2.2] - 2026-04-06
 
 ### Fixed
