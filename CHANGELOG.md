@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.2.4] - 2026-05-18
+
+### Fixed
+- Race condition in `RateLimiter` when multiple concurrent `acquire()` calls occur (e.g. during `/crawl`, `/exhaust`, bulk combine with `API_CONCURRENCY=2`). Could previously exceed the rate limit and trigger Cloudflare blocks. Now properly serialized with `asyncio.Lock`.
+
 ## [1.2.3] - 2026-05-18
 
 ### Fixed

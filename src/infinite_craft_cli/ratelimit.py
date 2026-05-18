@@ -12,6 +12,7 @@ class RateLimiter:
         self._max = max_requests
         self._window = window_seconds
         self._timestamps: deque[float] = deque()
+        self._lock = asyncio.Lock()
 
     async def acquire(self):
         """Wait until a request slot is available, then record the request."""
@@ -19,16 +20,17 @@ class RateLimiter:
             return
 
         while True:
-            now = time.monotonic()
-            # Evict expired timestamps
-            while self._timestamps and self._timestamps[0] + self._window <= now:
-                self._timestamps.popleft()
+            async with self._lock:
+                now = time.monotonic()
+                # Evict expired timestamps
+                while self._timestamps and self._timestamps[0] + self._window <= now:
+                    self._timestamps.popleft()
 
-            if len(self._timestamps) < self._max:
-                self._timestamps.append(now)
-                return
+                if len(self._timestamps) < self._max:
+                    self._timestamps.append(now)
+                    return
 
-            # Wait until the oldest request expires
-            wait_time = (self._timestamps[0] + self._window) - now
+                # Wait until the oldest request expires
+                wait_time = (self._timestamps[0] + self._window) - now
             if wait_time > 0:
                 await asyncio.sleep(wait_time)
