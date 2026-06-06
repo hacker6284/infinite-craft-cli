@@ -434,7 +434,9 @@
       print("  " + yellow("No recipe known. Try /import or /fill."));
       return;
     }
-    // BFS to find shortest path from base elements
+    // BFS to find shortest path from base elements (or terminal constituents
+    // that have no recipe entry of their own, e.g. leaves from /fill or /import).
+    // NOTE: Keep this logic in sync with bookmarklet/trainer.js (and vice-versa).
     const visited = new Set(BASE_ELEMENTS);
     const layers = [];
     let found = false;
@@ -443,7 +445,11 @@
       for (const [resultName, pairs] of Object.entries(recipeIndex)) {
         if (visited.has(resultName)) continue;
         for (const [a, b] of pairs) {
-          if (visited.has(a) && visited.has(b)) {
+          const aAvail = visited.has(a) || BASE_ELEMENTS.has(a) ||
+                         !(recipeIndex[a] && recipeIndex[a].length);
+          const bAvail = visited.has(b) || BASE_ELEMENTS.has(b) ||
+                         !(recipeIndex[b] && recipeIndex[b].length);
+          if (aAvail && bAvail) {
             layer.push({ result: resultName, a, b });
             break;
           }

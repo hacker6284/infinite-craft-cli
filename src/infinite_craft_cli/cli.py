@@ -199,23 +199,40 @@ def do_recipe(storage, name: str) -> str:
     if target in _BASE_ELEMENTS:
         return f"  {target} is a base element."
 
-    if target not in recipes:
+    if target not in recipes or not recipes.get(target):
         return f"  No recipe known for {target}. Try /fill or /import."
 
     # BFS to find all elements needed, tracking shortest path
     # parent[name] = (a_name, b_name) that produces it
+    # Terminals (elements with no recipe entry or empty recipe list,
+    # introduced by /fill or /import) are treated as additional roots so
+    # that lineages with unmakeable constituents can still be traced.
     parent = {}
     visited = set(_BASE_ELEMENTS)
     found = False
 
+    def _is_available(n: str) -> bool:
+        # A name is available (usable as input without further crafting in
+        # this layer) if already visited, a base, or has no (truthy) recipe
+        # entry. The latter treats both absent keys and empty lists as
+        # terminals (constituents that cannot be made via known recipes).
+        return (
+            n in visited
+            or n in _BASE_ELEMENTS
+            or not recipes.get(n)
+        )
+
     while not found:
-        # Find everything we can make using ONLY previously visited elements
+        # Find everything we can make using previously visited elements
+        # OR terminal constituents (no recipe of their own).
         new_this_layer = {}
         for result_name, pairs in recipes.items():
             if result_name in visited or result_name in new_this_layer:
                 continue
             for pair in pairs:
-                if pair[0] in visited and pair[1] in visited:
+                a_ok = _is_available(pair[0])
+                b_ok = _is_available(pair[1])
+                if a_ok and b_ok:
                     new_this_layer[result_name] = (pair[0], pair[1])
                     if result_name == target:
                         found = True
@@ -230,7 +247,8 @@ def do_recipe(storage, name: str) -> str:
     if not found:
         return f"  Cannot trace full lineage for {target} — missing intermediate recipes."
 
-    # Walk back from target to collect steps in order
+    # Walk back from target to collect steps in order.
+    # Terminals (no parent entry) are treated as resolved leaves with no step.
     steps = []
     to_resolve = [target]
     resolved = set(_BASE_ELEMENTS)
@@ -238,18 +256,25 @@ def do_recipe(storage, name: str) -> str:
         name = to_resolve.pop()
         if name in resolved:
             continue
+        if name not in parent:
+            # Terminal leaf (constituent from /fill or /import with no recipe;
+            # bases are pre-seeded in resolved/visited and never appear in parent).
+            resolved.add(name)
+            continue
         a, b = parent[name]
         # Ensure dependencies are resolved first
-        if a not in resolved:
+        for dep in (a, b):
+            if dep in resolved:
+                continue
+            if dep not in parent and dep not in _BASE_ELEMENTS:
+                resolved.add(dep)  # terminal leaf — no step emitted
+                continue
             to_resolve.append(name)  # re-queue
-            to_resolve.append(a)
-            continue
-        if b not in resolved:
-            to_resolve.append(name)  # re-queue
-            to_resolve.append(b)
-            continue
-        steps.append((a, b, name))
-        resolved.add(name)
+            to_resolve.append(dep)
+            break
+        else:
+            steps.append((a, b, name))
+            resolved.add(name)
 
     lines = [f"  Recipe for {_color(target, BOLD)} ({len(steps)} steps):"]
     for a, b, r in steps:
@@ -676,18 +701,42 @@ def do_unfilled(storage) -> str:
 def do_export(storage, path: str = EXPORT_PATH) -> str:
     """Export discoveries to an Infinite Craft .ic save file.
 
-    Only includes elements that have recipes or are base elements.
-    Use /fill first to fetch missing recipes from Infinibrowser.
+    Includes elements that have recipes, are base elements, or are referenced
+    as constituents by any included recipe (e.g. terminal leaves from /fill
+    or /import lineages). This ensures filled recipes survive export/import.
+    Pure orphans with no recipes and not referenced by any recipe are excluded.
     """
     recipes = _load_recipes()
     discoveries = storage.get_all()
 
-    # Build export, only including elements that have recipes or are base
+    # Include bases + anything that has its own recipes.
+    included = set(_BASE_ELEMENTS)
+    for elem in discoveries:
+        if elem.name in recipes:
+            included.add(elem.name)
+
+    # Close under all ingredients referenced by the recipes of included elems.
+    # This pulls in terminal constituents (no recipe of their own) so that
+    # the pairs using them can be emitted with valid local IDs.
+    changed = True
+    while changed:
+        changed = False
+        for name in list(included):
+            if name in recipes:
+                for a, b in recipes[name]:
+                    if a not in included:
+                        included.add(a)
+                        changed = True
+                    if b not in included:
+                        included.add(b)
+                        changed = True
+
+    # Build export items for the closure
     name_to_id = {}
     items = []
     idx = 0
     for elem in discoveries:
-        if elem.name not in _BASE_ELEMENTS and elem.name not in recipes:
+        if elem.name not in included:
             continue
         name_to_id[elem.name] = idx
         item = {"id": idx, "text": elem.name, "emoji": elem.emoji or ""}
@@ -724,7 +773,7 @@ def do_export(storage, path: str = EXPORT_PATH) -> str:
 
     msg = f"  Exported {_color(str(len(items)), GREEN)} elements to {_color(path, BOLD)}"
     if excluded:
-        msg += f"\n  {_color(str(excluded), YELLOW)} elements excluded (no recipes — use /fill to fetch them)"
+        msg += f"\n  {_color(str(excluded), YELLOW)} elements excluded (no recipes and not referenced by any included recipe — use /fill to fetch them)"
     return msg
 
 

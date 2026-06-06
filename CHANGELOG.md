@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.2.6] - 2026-05-19
+
+### Fixed
+- `/recipe` (and the equivalent in the browser trainers) can now trace lineages fetched by `/fill` / `/import` even when a constituent element has no recipe of its own (terminal leaves from Infinibrowser). The BFS now treats such terminals as additional roots, so "Cannot trace full lineage" is no longer incorrectly emitted for valid filled recipes.
+- `do_export` now includes elements that are referenced by filled recipes (even if they lack their own recipes) so that the recipe pairs survive the export/import round-trip. Pure orphans unrelated to any recipe are still excluded.
+
+### Improved (from code review)
+- Simplified redundant predicate in the internal availability check for recipe constituents and strengthened the "no recipe known" guard for targets with empty recipe lists (for consistency with the JS trainers and the terminal concept).
+- Added a regression test exercising that unresolvable middles (names that have a non-empty recipe entry but lead to dead-ends that are not terminals) still correctly produce "Cannot trace full lineage".
+- Tightened a test assertion, improved comments around terminal handling and base pre-resolution, added cross-file sync notes to the duplicated JS recipe logic, and clarified the excluded-elements message in export to match the updated closure semantics.
+
 ## [1.2.5] - 2026-05-18
 
 ### Fixed

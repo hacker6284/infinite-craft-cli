@@ -205,3 +205,41 @@ class TestDoExport:
         # Recipes should reference local integer IDs, not names
         for pair in steam_item["recipes"]:
             assert all(isinstance(x, int) for x in pair)
+
+    def test_includes_referenced_terminals_for_filled_recipes(self, tmp_path):
+        """Elements referenced by recipes but lacking their own recipes (terminals
+        from /fill or /import) must be included so the using recipes can be emitted.
+        """
+        from infinite_craft_cli.cli import do_export
+        storage = make_mock_storage([
+            MockElement("Water", "💧"),
+            MockElement("Fire", "🔥"),
+            MockElement("Earth", "🌍"),
+            MockElement("Wind", "🌬️"),
+            MockElement("Mystery", "❓"),  # terminal, no recipe
+            MockElement("X", "✨"),
+        ])
+        path = tmp_path / "export.ic"
+        recipes = {"X": [["Mystery", "Water"]]}
+        with patch("infinite_craft_cli.cli.RECIPES_PATH", str(tmp_path / "recipes.json")):
+            (tmp_path / "recipes.json").write_text(json.dumps(recipes))
+            with patch("sys.stdout") as mock_stdout:
+                mock_stdout.isatty.return_value = False
+                result = do_export(storage, str(path))
+        # In this setup there are no pure orphans (Mystery is referenced by a
+        # recipe), so the export should not mention any excluded elements.
+        assert "excluded" not in result.lower()
+        with gzip.open(str(path), "rt") as f:
+            save = json.load(f)
+        names = {i["text"] for i in save["items"]}
+        assert "X" in names
+        assert "Mystery" in names
+        x_item = [i for i in save["items"] if i["text"] == "X"][0]
+        assert "recipes" in x_item
+        assert len(x_item["recipes"]) == 1
+        # ids must be integers and resolve to the right names via the items list
+        id_to_name = {i["id"]: i["text"] for i in save["items"]}
+        for pair in x_item["recipes"]:
+            assert all(isinstance(pid, int) for pid in pair)
+            assert id_to_name[pair[0]] in ("Mystery", "Water")
+            assert id_to_name[pair[1]] in ("Mystery", "Water")
