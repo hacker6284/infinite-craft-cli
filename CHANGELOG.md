@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.2.7] - 2026-06-05
+
+### Fixed
+- Trainer (browser overlay) CLI no longer becomes permanently wedged after `/crawl`, `/exhaust`, `/permute`, `/cross`, `/fill`, or other bulk commands (previously required page refresh to recover commands). The `running` flag and stop button visibility are now guaranteed to reset via `try`/`finally` in `runPairs`, `doCrawl`, and `doFill` on success, error, early return, and cancel paths. Added defensive `.catch()` on `dispatch()` from the keydown handler as last-ditch un-wedge. (bookmarklet/trainer.js + extension/trainer.js; Python CLI unaffected.)
+
 ## [1.2.6] - 2026-05-19
 
 ### Fixed

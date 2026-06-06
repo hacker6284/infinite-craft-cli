@@ -350,32 +350,35 @@
     stopBtn.style.display = "inline";
     let done = 0, newCount = 0, nothingCount = 0, errors = 0;
     const total = pairs.length;
-    for (const [a, b] of pairs) {
-      if (cancelled) { print("  " + yellow("Cancelled.")); break; }
-      try {
-        const result = await apiPair(a.text, b.text);
-        done++;
-        if (result) {
-          const isNew = addElement(result.text, result.emoji, result.discovered);
-          recordRecipe(result.text, a.text, b.text);
-          history.push({ a: a.text, b: b.text, result: result.text });
-          if (isNew) {
-            newCount++;
-            print(`  ${dim(`[${done}/${total}]`)} ${formatResult(a, b, result)} ${green("(new)")}`);
+    try {
+      for (const [a, b] of pairs) {
+        if (cancelled) { print("  " + yellow("Cancelled.")); break; }
+        try {
+          const result = await apiPair(a.text, b.text);
+          done++;
+          if (result) {
+            const isNew = addElement(result.text, result.emoji, result.discovered);
+            recordRecipe(result.text, a.text, b.text);
+            history.push({ a: a.text, b: b.text, result: result.text });
+            if (isNew) {
+              newCount++;
+              print(`  ${dim(`[${done}/${total}]`)} ${formatResult(a, b, result)} ${green("(new)")}`);
+            }
+          } else {
+            nothingCount++;
+            history.push({ a: a.text, b: b.text, result: "Nothing" });
           }
-        } else {
-          nothingCount++;
-          history.push({ a: a.text, b: b.text, result: "Nothing" });
+        } catch (e) {
+          done++;
+          errors++;
         }
-      } catch (e) {
-        done++;
-        errors++;
+        // Yield to UI
+        await new Promise(r => setTimeout(r, 0));
       }
-      // Yield to UI
-      await new Promise(r => setTimeout(r, 0));
+    } finally {
+      stopBtn.style.display = "none";
+      running = false;
     }
-    stopBtn.style.display = "none";
-    running = false;
     print(`  Done: ${green(String(newCount))} new, ${dim(String(nothingCount))} nothing, ${errors ? red(String(errors)) + " errors" : "0 errors"} (${done}/${total})`);
   }
 
@@ -502,66 +505,67 @@
     stopBtn.style.display = "inline";
     print(`  Crawling from ${formatElement(a)} + ${formatElement(b)}...`);
 
-    // Initial combine
-    let pool = new Set();
-    const tried = new Set();
-    const result = await apiPair(a.text, b.text);
-    addElement(a.text, a.emoji, false);
-    addElement(b.text, b.emoji, false);
-    pool.add(a.text);
-    pool.add(b.text);
-    tried.add(pairKey(a.text, b.text));
-    if (result) {
-      const isNew = addElement(result.text, result.emoji, result.discovered);
-      recordRecipe(result.text, a.text, b.text);
-      history.push({ a: a.text, b: b.text, result: result.text });
-      pool.add(result.text);
-      print(`  ${formatResult(a, b, result)}${isNew ? " " + green("(new)") : ""}`);
-    } else {
-      print(formatResult(a, b, null));
+    try {
+      // Initial combine
+      let pool = new Set();
+      const tried = new Set();
+      const result = await apiPair(a.text, b.text);
+      addElement(a.text, a.emoji, false);
+      addElement(b.text, b.emoji, false);
+      pool.add(a.text);
+      pool.add(b.text);
+      tried.add(pairKey(a.text, b.text));
+      if (result) {
+        const isNew = addElement(result.text, result.emoji, result.discovered);
+        recordRecipe(result.text, a.text, b.text);
+        history.push({ a: a.text, b: b.text, result: result.text });
+        pool.add(result.text);
+        print(`  ${formatResult(a, b, result)}${isNew ? " " + green("(new)") : ""}`);
+      } else {
+        print(formatResult(a, b, null));
+        return;
+      }
+
+      let gen = 1;
+      while (!cancelled) {
+        const elements = [...pool].map(n => resolveElement(n));
+        const pairs = [];
+        for (let i = 0; i < elements.length; i++) {
+          for (let j = i; j < elements.length; j++) {
+            const key = pairKey(elements[i].text, elements[j].text);
+            if (!tried.has(key)) { pairs.push([elements[i], elements[j]]); tried.add(key); }
+          }
+        }
+        if (!pairs.length) { print("  " + dim("No more untried pairs.")); break; }
+        print(`  ${dim(`Gen ${gen}:`)} ${pairs.length} pairs to try...`);
+        let newInGen = 0;
+        for (const [pa, pb] of pairs) {
+          if (cancelled) break;
+          try {
+            const r = await apiPair(pa.text, pb.text);
+            if (r) {
+              const isNew = addElement(r.text, r.emoji, r.discovered);
+              recordRecipe(r.text, pa.text, pb.text);
+              history.push({ a: pa.text, b: pb.text, result: r.text });
+              if (isNew && !pool.has(r.text)) {
+                pool.add(r.text);
+                newInGen++;
+                print(`  ${formatResult(pa, pb, r)} ${green("(new)")}`);
+              }
+            }
+          } catch { /* skip */ }
+          await new Promise(r => setTimeout(r, 0));
+        }
+        print(`  ${dim(`Gen ${gen} done:`)} ${green(String(newInGen))} new elements.`);
+        if (newInGen === 0) break;
+        gen++;
+      }
+      if (cancelled) print("  " + yellow("Crawl cancelled."));
+      print(`  Pool size: ${bold(String(pool.size))} elements.`);
+    } finally {
       stopBtn.style.display = "none";
       running = false;
-      return;
     }
-
-    let gen = 1;
-    while (!cancelled) {
-      const elements = [...pool].map(n => resolveElement(n));
-      const pairs = [];
-      for (let i = 0; i < elements.length; i++) {
-        for (let j = i; j < elements.length; j++) {
-          const key = pairKey(elements[i].text, elements[j].text);
-          if (!tried.has(key)) { pairs.push([elements[i], elements[j]]); tried.add(key); }
-        }
-      }
-      if (!pairs.length) { print("  " + dim("No more untried pairs.")); break; }
-      print(`  ${dim(`Gen ${gen}:`)} ${pairs.length} pairs to try...`);
-      let newInGen = 0;
-      for (const [pa, pb] of pairs) {
-        if (cancelled) break;
-        try {
-          const r = await apiPair(pa.text, pb.text);
-          if (r) {
-            const isNew = addElement(r.text, r.emoji, r.discovered);
-            recordRecipe(r.text, pa.text, pb.text);
-            history.push({ a: pa.text, b: pb.text, result: r.text });
-            if (isNew && !pool.has(r.text)) {
-              pool.add(r.text);
-              newInGen++;
-              print(`  ${formatResult(pa, pb, r)} ${green("(new)")}`);
-            }
-          }
-        } catch { /* skip */ }
-        await new Promise(r => setTimeout(r, 0));
-      }
-      print(`  ${dim(`Gen ${gen} done:`)} ${green(String(newInGen))} new elements.`);
-      if (newInGen === 0) break;
-      gen++;
-    }
-    stopBtn.style.display = "none";
-    running = false;
-    if (cancelled) print("  " + yellow("Crawl cancelled."));
-    print(`  Pool size: ${bold(String(pool.size))} elements.`);
   }
 
   async function doPermute(query) {
@@ -722,28 +726,31 @@
     running = true;
     stopBtn.style.display = "inline";
     let filled = 0, errors = 0;
-    for (let i = 0; i < missing.length; i++) {
-      if (cancelled) { print("  " + yellow("Fill cancelled.")); break; }
-      const el = missing[i];
-      try {
-        const recipeResp = await fetchRetry(`https://infinibrowser.wiki/api/recipe?id=${encodeURIComponent(el.text)}`);
-        if (recipeResp.ok) {
-          const data = await recipeResp.json();
-          const steps = data.steps || data.recipe || [];
-          processRecipeSteps(steps);
-          filled++;
-        } else {
-          errors++;
+    try {
+      for (let i = 0; i < missing.length; i++) {
+        if (cancelled) { print("  " + yellow("Fill cancelled.")); break; }
+        const el = missing[i];
+        try {
+          const recipeResp = await fetchRetry(`https://infinibrowser.wiki/api/recipe?id=${encodeURIComponent(el.text)}`);
+          if (recipeResp.ok) {
+            const data = await recipeResp.json();
+            const steps = data.steps || data.recipe || [];
+            processRecipeSteps(steps);
+            filled++;
+          } else {
+            errors++;
+          }
+        } catch { errors++; }
+        if ((i + 1) % 10 === 0 || i === missing.length - 1) {
+          print(`  ${dim(`[${i + 1}/${missing.length}]`)} ${green(String(filled))} filled, ${errors ? red(String(errors)) + " failed" : "0 failed"}`);
         }
-      } catch { errors++; }
-      if ((i + 1) % 10 === 0 || i === missing.length - 1) {
-        print(`  ${dim(`[${i + 1}/${missing.length}]`)} ${green(String(filled))} filled, ${errors ? red(String(errors)) + " failed" : "0 failed"}`);
+        await new Promise(r => setTimeout(r, 500));
       }
-      await new Promise(r => setTimeout(r, 500));
+    } finally {
+      rebuildRecipeIndex();
+      stopBtn.style.display = "none";
+      running = false;
     }
-    rebuildRecipeIndex();
-    stopBtn.style.display = "none";
-    running = false;
     print(`  Done: ${green(String(filled))} filled, ${errors ? red(String(errors)) + " failed" : "0 failed"} (${missing.length} total).`);
   }
 
@@ -878,7 +885,13 @@
       cmdHistory.push(line);
       cmdHistoryIdx = cmdHistory.length;
       print(cyan("craft&gt;") + " " + esc(line));
-      dispatch(line);
+      dispatch(line).catch((err) => {
+        // Last-ditch recovery: an uncaught error in a command must not leave the UI wedged.
+        try { stopBtn.style.display = "none"; } catch {}
+        running = false;
+        waitingForConfirm = false;
+        print("  " + red("Error: " + (err && err.message || String(err))));
+      });
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
       if (cmdHistoryIdx > 0) { cmdHistoryIdx--; input.value = cmdHistory[cmdHistoryIdx]; }
