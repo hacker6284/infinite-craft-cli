@@ -81,6 +81,7 @@ infinite-craft --version
 | `/import <element\|file.ic>` | Import from Infinibrowser or `.ic` save file |
 | `/fill` | Fetch missing recipes from Infinibrowser |
 | `/unfilled` | List elements without recipes |
+| `/prune` | Remove orphan elements Infinibrowser can't fill |
 | `/export [path]` | Export discoveries as `.ic` save file |
 | `/history` | Show combinations tried this session |
 | `/help` | Show help |

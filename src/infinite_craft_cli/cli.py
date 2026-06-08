@@ -17,7 +17,7 @@ except ImportError:
     pass  # readline not available on Windows
 
 from infinite_craft_cli.element import Element
-from infinite_craft_cli.client import InfiniteCraftClient, fetch_json, clear_fetch_cache
+from infinite_craft_cli.client import InfiniteCraftClient, fetch_json, clear_fetch_cache, _get_sync_session
 from infinite_craft_cli.storage import DiscoveryStorage
 from infinite_craft_cli import __version__
 
@@ -698,6 +698,104 @@ def do_unfilled(storage) -> str:
     return "\n".join(lines)
 
 
+def _included_element_names(recipes: dict[str, list[list[str]]] | None = None) -> set[str]:
+    """Names in the export/prune closure: bases, recipe results, and their constituents."""
+    if recipes is None:
+        recipes = _load_recipes()
+    included = set(_BASE_ELEMENTS)
+    for name, pairs in recipes.items():
+        if pairs:
+            included.add(name)
+    changed = True
+    while changed:
+        changed = False
+        for name in list(included):
+            if name not in recipes:
+                continue
+            for a, b in recipes[name]:
+                if a not in included:
+                    included.add(a)
+                    changed = True
+                if b not in included:
+                    included.add(b)
+                    changed = True
+    return included
+
+
+def _orphan_candidates(storage) -> list:
+    """Discoveries with no recipe lineage and not referenced as a constituent."""
+    included = _included_element_names()
+    return [e for e in storage.get_all() if e.name not in included]
+
+
+def _ib_can_fill(name: str) -> bool | None:
+    """Whether /fill could fetch a recipe for name.
+
+    Returns True if fillable, False if Infinibrowser has no recipe, None on API error.
+    """
+    try:
+        item_resp = _get_sync_session().get(
+            f"{_IB_BASE}/item", params={"id": name}, timeout=15
+        )
+        if item_resp.status_code == 404:
+            return False
+        if not item_resp.ok:
+            return None
+        item_data = item_resp.json()
+        if "code" in item_data:
+            return False
+
+        recipe_resp = _get_sync_session().get(
+            f"{_IB_BASE}/recipe", params={"id": name}, timeout=15
+        )
+        if recipe_resp.status_code == 404:
+            return False
+        if not recipe_resp.ok:
+            return None
+        recipe_data = recipe_resp.json()
+        if "code" in recipe_data:
+            return False
+        steps = recipe_data.get("steps", recipe_data.get("recipe", []))
+        return bool(steps)
+    except Exception:
+        return None
+
+
+def _prune_orphans(storage):
+    """Remove orphan discoveries that Infinibrowser confirms have no recipe."""
+    candidates = _orphan_candidates(storage)
+    if not candidates:
+        print("  Nothing to prune.")
+        return
+
+    total = len(candidates)
+    print(f"  {total} orphan element{'s' if total != 1 else ''} to check on Infinibrowser...")
+    print(f"  (Ctrl+C to stop early)\n")
+    pruned = 0
+    skipped = 0
+    kept = 0
+    try:
+        for i, elem in enumerate(candidates, 1):
+            print(f"\r  [{i}/{total}] {elem.name}...          ", end="", flush=True)
+            fillable = _ib_can_fill(elem.name)
+            if fillable is None:
+                skipped += 1
+            elif fillable:
+                kept += 1
+            else:
+                storage.remove(elem.name)
+                pruned += 1
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print(f"\n  Stopped early.")
+    print(f"\n  Pruned {_color(str(pruned), GREEN)} element{'s' if pruned != 1 else ''}.", end="")
+    if kept:
+        print(f" {kept} fillable on Infinibrowser (kept).", end="")
+    if skipped:
+        print(f" {_color(str(skipped), YELLOW)} skipped (API errors).", end="")
+    print()
+
+
 def do_export(storage, path: str = EXPORT_PATH) -> str:
     """Export discoveries to an Infinite Craft .ic save file.
 
@@ -708,28 +806,7 @@ def do_export(storage, path: str = EXPORT_PATH) -> str:
     """
     recipes = _load_recipes()
     discoveries = storage.get_all()
-
-    # Include bases + anything that has its own recipes.
-    included = set(_BASE_ELEMENTS)
-    for elem in discoveries:
-        if elem.name in recipes:
-            included.add(elem.name)
-
-    # Close under all ingredients referenced by the recipes of included elems.
-    # This pulls in terminal constituents (no recipe of their own) so that
-    # the pairs using them can be emitted with valid local IDs.
-    changed = True
-    while changed:
-        changed = False
-        for name in list(included):
-            if name in recipes:
-                for a, b in recipes[name]:
-                    if a not in included:
-                        included.add(a)
-                        changed = True
-                    if b not in included:
-                        included.add(b)
-                        changed = True
+    included = _included_element_names(recipes)
 
     # Build export items for the closure
     name_to_id = {}
@@ -792,6 +869,7 @@ def do_help() -> str:
     /import <element|file.ic> Import from Infinibrowser or .ic save file
     /fill                     Fetch missing recipes from Infinibrowser
     /unfilled                 List elements without recipes
+    /prune                    Remove orphan elements Infinibrowser can't fill
     /export [path]            Export discoveries as .ic save file
     /history                  Show combinations tried this session
     /help                     Show this help
@@ -858,6 +936,8 @@ async def interactive_mode():
                 print(do_unfilled(storage))
             elif line.startswith("/fill"):
                 _fill_missing_recipes(storage)
+            elif line.startswith("/prune"):
+                _prune_orphans(storage)
             elif line.startswith("/export"):
                 path = line[len("/export"):].strip() or EXPORT_PATH
                 print(do_export(storage, path))
@@ -930,7 +1010,7 @@ async def interactive_mode():
 # ---------------------------------------------------------------------------
 async def noninteractive_mode(args):
     # Commands that only need storage (no API)
-    storage_only_commands = {"search", "list", "recipe", "unfilled", "export", "fill", "import_cmd"}
+    storage_only_commands = {"search", "list", "recipe", "unfilled", "export", "fill", "prune", "import_cmd"}
 
     if args.command in storage_only_commands:
         storage = DiscoveryStorage(DISCOVERIES_PATH)
@@ -947,6 +1027,8 @@ async def noninteractive_mode(args):
             print(do_export(storage, path))
         elif args.command == "fill":
             _fill_missing_recipes(storage)
+        elif args.command == "prune":
+            _prune_orphans(storage)
         elif args.command == "import_cmd":
             print(do_import(storage, args.source))
     else:
@@ -995,6 +1077,8 @@ def main():
     subparsers.add_parser("fill", help="Fetch missing recipes from Infinibrowser")
 
     subparsers.add_parser("unfilled", help="List elements without recipes")
+
+    subparsers.add_parser("prune", help="Remove orphan elements Infinibrowser can't fill")
 
     exhaust_p = subparsers.add_parser("exhaust", help="Combine element with all discoveries")
     exhaust_p.add_argument("name", help="Element name")

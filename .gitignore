@@ -1,9 +1,13 @@
 __pycache__/
+.pytest_cache/
 *.pyc
 *.egg-info/
 dist/
 build/
 .DS_Store
+
+# Extension screenshot tooling
+extension/screenshots/node_modules/
 
 # Bazel
 bazel-*

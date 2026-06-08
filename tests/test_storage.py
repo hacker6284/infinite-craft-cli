@@ -94,6 +94,27 @@ class TestAdd:
         assert result.is_first_discovery is None
 
 
+class TestRemove:
+    def test_removes_element(self, tmp_path):
+        storage = DiscoveryStorage(str(tmp_path / "d.json"))
+        storage.add(name="Steam", emoji="💨", is_first_discovery=False)
+        assert storage.remove("Steam") is True
+        assert storage.get_by_name("Steam") is None
+        assert len(storage.get_all()) == 4
+
+    def test_persists_removal(self, tmp_path):
+        path = tmp_path / "d.json"
+        storage = DiscoveryStorage(str(path))
+        storage.add(name="Steam", emoji="💨", is_first_discovery=False)
+        storage.remove("Steam")
+        data = json.loads(path.read_text())
+        assert not any(d["name"] == "Steam" for d in data)
+
+    def test_missing_returns_false(self, tmp_path):
+        storage = DiscoveryStorage(str(tmp_path / "d.json"))
+        assert storage.remove("Nope") is False
+
+
 class TestReload:
     def test_picks_up_external_changes(self, tmp_path):
         path = tmp_path / "d.json"

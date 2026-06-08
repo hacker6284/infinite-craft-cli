@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- `/prune` command in the Python CLI and browser trainers: removes orphan discoveries (no recipe lineage) that Infinibrowser confirms cannot be filled. API errors skip elements rather than deleting them.
+
+### Fixed
+- Browser trainers no longer add combine operands to discoveries when a pairing returns Nothing (`doCombine` and crawl initial pair). Operands are persisted only on success, matching the Python CLI.
+
 ## [1.2.7] - 2026-06-05
 
 ### Fixed

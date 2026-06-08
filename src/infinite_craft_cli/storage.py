@@ -75,6 +75,15 @@ class DiscoveryStorage:
         self._save()
         return elem
 
+    def remove(self, name: str) -> bool:
+        """Remove an element by name. Returns True if removed."""
+        if name not in self._index:
+            return False
+        del self._index[name]
+        self._elements = [e for e in self._elements if e.name != name]
+        self._save()
+        return True
+
     def reload(self):
         """Re-read discoveries from disk."""
         self._load()

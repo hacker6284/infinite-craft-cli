@@ -163,6 +163,16 @@
     });
   }
 
+  function deleteItem(id) {
+    return new Promise((resolve, reject) => {
+      const tx = _db.transaction(ITEMS_STORE, "readwrite");
+      const store = tx.objectStore(ITEMS_STORE);
+      const req = store.delete(id);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+  }
+
   function rebuildIndexes() {
     _nameIndex = {};
     _idIndex = {};
@@ -211,6 +221,17 @@
     _nameIndex[text.toLowerCase()] = item;
     _idIndex[item.id] = item;
     putItem(item);
+    return true;
+  }
+
+  async function removeElement(name) {
+    const item = _nameIndex[name.toLowerCase()];
+    if (!item || BASE_ELEMENTS.has(item.text)) return false;
+    _items = _items.filter(i => i.id !== item.id);
+    _allItems = _allItems.filter(i => i.id !== item.id);
+    delete _nameIndex[item.text.toLowerCase()];
+    delete _idIndex[item.id];
+    await deleteItem(item.id);
     return true;
   }
 
@@ -303,11 +324,11 @@
   async function doCombine(aName, bName) {
     const a = resolveElement(aName);
     const b = resolveElement(bName);
-    addElement(a.text, a.emoji, false);
-    addElement(b.text, b.emoji, false);
     try {
       const result = await apiPair(a.text, b.text);
       if (result) {
+        addElement(a.text, a.emoji, false);
+        addElement(b.text, b.emoji, false);
         const isNew = addElement(result.text, result.emoji, result.discovered);
         recordRecipe(result.text, a.text, b.text);
         history.push({ a: a.text, b: b.text, result: result.text });
@@ -510,12 +531,12 @@
       let pool = new Set();
       const tried = new Set();
       const result = await apiPair(a.text, b.text);
-      addElement(a.text, a.emoji, false);
-      addElement(b.text, b.emoji, false);
-      pool.add(a.text);
-      pool.add(b.text);
       tried.add(pairKey(a.text, b.text));
       if (result) {
+        addElement(a.text, a.emoji, false);
+        addElement(b.text, b.emoji, false);
+        pool.add(a.text);
+        pool.add(b.text);
         const isNew = addElement(result.text, result.emoji, result.discovered);
         recordRecipe(result.text, a.text, b.text);
         history.push({ a: a.text, b: b.text, result: result.text });
@@ -762,6 +783,81 @@
     for (const el of missing) print("  " + formatElement(el));
   }
 
+  function findOrphanCandidates() {
+    const included = new Set(BASE_ELEMENTS);
+    for (const [name, pairs] of Object.entries(recipeIndex)) {
+      if (pairs && pairs.length) included.add(name);
+    }
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const name of included) {
+        const pairs = recipeIndex[name];
+        if (!pairs) continue;
+        for (const [a, b] of pairs) {
+          if (!included.has(a)) { included.add(a); changed = true; }
+          if (!included.has(b)) { included.add(b); changed = true; }
+        }
+      }
+    }
+    return getAllElements().filter(e => !included.has(e.text));
+  }
+
+  async function ibCanFill(name) {
+    try {
+      const itemResp = await fetchRetry(`https://infinibrowser.wiki/api/item?id=${encodeURIComponent(name)}`);
+      if (itemResp.status === 404) return false;
+      if (!itemResp.ok) return null;
+      const itemData = await itemResp.json();
+      if (itemData.code) return false;
+
+      const recipeResp = await fetchRetry(`https://infinibrowser.wiki/api/recipe?id=${encodeURIComponent(name)}`);
+      if (recipeResp.status === 404) return false;
+      if (!recipeResp.ok) return null;
+      const recipeData = await recipeResp.json();
+      if (recipeData.code) return false;
+      const steps = recipeData.steps || recipeData.recipe || [];
+      return steps.length > 0;
+    } catch {
+      return null;
+    }
+  }
+
+  async function doPrune() {
+    const candidates = findOrphanCandidates();
+    if (!candidates.length) { print("  Nothing to prune."); return; }
+    print(`  ${yellow(String(candidates.length))} orphan element${candidates.length === 1 ? "" : "s"} to check on Infinibrowser...`);
+    cancelled = false;
+    running = true;
+    stopBtn.style.display = "inline";
+    let pruned = 0, kept = 0, skipped = 0;
+    try {
+      for (let i = 0; i < candidates.length; i++) {
+        if (cancelled) { print("  " + yellow("Prune cancelled.")); break; }
+        const el = candidates[i];
+        const fillable = await ibCanFill(el.text);
+        if (fillable === null) {
+          skipped++;
+        } else if (fillable) {
+          kept++;
+        } else {
+          await removeElement(el.text);
+          pruned++;
+        }
+        if ((i + 1) % 10 === 0 || i === candidates.length - 1) {
+          print(`  ${dim(`[${i + 1}/${candidates.length}]`)} ${green(String(pruned))} pruned, ${kept} kept, ${skipped ? yellow(String(skipped)) + " skipped" : "0 skipped"}`);
+        }
+        await new Promise(r => setTimeout(r, 500));
+      }
+    } finally {
+      rebuildIndexes();
+      rebuildRecipeIndex();
+      stopBtn.style.display = "none";
+      running = false;
+    }
+    print(`  Done: ${green(String(pruned))} pruned, ${kept} fillable on Infinibrowser (kept), ${skipped ? yellow(String(skipped)) + " skipped (API errors)" : "0 skipped"}.`);
+  }
+
   async function doExport() {
     const exportItems = _items.map(item => {
       const exportItem = { id: item.id, text: item.text, emoji: item.emoji || "" };
@@ -808,6 +904,7 @@
   ${cyan("/import")}               Import from .ic save file
   ${cyan("/fill")}                 Fetch missing recipes from Infinibrowser
   ${cyan("/unfilled")}             List elements without recipes
+  ${cyan("/prune")}                Remove orphan elements Infinibrowser can't fill
   ${cyan("/export")}               Download discoveries as .ic save file
   ${cyan("/history")}              Show combinations this session
   ${cyan("/clear")}                Clear output
@@ -840,6 +937,7 @@
         case "/import": if (!arg) { await doImportFile(); } else { await doImport(arg); } return;
         case "/fill": await doFill(); return;
         case "/unfilled": doUnfilled(); return;
+        case "/prune": await doPrune(); return;
         case "/export": await doExport(); return;
         case "/history": doHistory(); return;
         case "/clear": output.innerHTML = ""; return;
