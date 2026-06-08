@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [1.2.8] - 2026-06-07
 
 ### Added
 - `/prune` command in the Python CLI and browser trainers: removes orphan discoveries (no recipe lineage) that Infinibrowser confirms cannot be filled. API errors skip elements rather than deleting them.
