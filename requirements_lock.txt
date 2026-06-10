@@ -30,5 +30,7 @@ pytest==8.3.4
     #   pytest-asyncio
 pytest-asyncio==0.24.0
     # via -r requirements.in
+regex==2026.5.9
+    # via -r requirements.in
 rich==14.3.3
     # via curl-cffi

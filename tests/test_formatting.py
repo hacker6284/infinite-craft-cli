@@ -105,9 +105,22 @@ class TestDoHelp:
         assert "/list" in result
         assert "/help" in result
         assert "/quit" in result
+        assert "/combine" in result
+        assert "/with" in result
+        assert "/cross" in result
 
     def test_contains_operators(self):
         from infinite_craft_cli.cli import do_help
         result = do_help()
         assert "++" in result
-        assert "+ |" in result
+        assert "+|" in result
+        assert " * " in result
+
+    def test_documents_query_syntax(self):
+        from infinite_craft_cli.cli import do_help
+        result = do_help()
+        assert "/pattern/" in result
+        assert "!<query>" in result
+        assert "^<query>" in result
+        assert "fnmatch" in result.lower() or "* ? []" in result
+        assert "/crawl <el> <el>" in result

@@ -10,6 +10,13 @@
   const RATE_LIMIT = 60;
   const RATE_WINDOW = 60000;
   const BULK_WARN = 200;
+  const MAX_QUERY_LENGTH = 512;
+  const MAX_REGEX_BODY_LENGTH = 200;
+  const MATCH_SCAN_BUDGET = 500; // ms (Python MATCH_SCAN_BUDGET=0.5s)
+  const REGEX_ERROR_INVALID = "Invalid regex pattern";
+  const REGEX_ERROR_COMPLEX = "Regex pattern too complex";
+  const RE_NESTED_QUANTIFIER = /(\+|\*|\?|\{\d*,?\d*\})\s*(\+|\*|\?|\{)/;
+  const RE_DELIMITED_REGEX = /\/[^/]+\//;
 
   // ── State ────────────────────────────────────────────────────────────
   const history = []; // [{a, b, result}]
@@ -358,26 +365,172 @@
     }
   }
 
-  // ── Glob matching ────────────────────────────────────────────────────
-  function globToRegex(pattern) {
+  // ── Query matching (parity with Python CLI) ───────────────────────────
+  function parseQueryFilter(query) {
+    let q = query.trim();
+    let onlyNew = false;
+    if (q.startsWith("!")) {
+      onlyNew = true;
+      q = q.slice(1);
+    } else if (q.startsWith("^")) {
+      onlyNew = true;
+      q = q.slice(1);
+    }
+    return { pattern: q, onlyNew };
+  }
+
+  function isDelimitedRegex(pattern) {
+    pattern = pattern.trim();
+    return pattern.length >= 2 && pattern.startsWith("/") && pattern.endsWith("/");
+  }
+
+  function containsDelimitedRegex(text) {
+    return RE_DELIMITED_REGEX.test(text);
+  }
+
+  function regexIsSafe(regexBody) {
+    if (!regexBody || regexBody.length > MAX_REGEX_BODY_LENGTH) return false;
+    if (regexBody.includes("|")) return false;
+    if (RE_NESTED_QUANTIFIER.test(regexBody)) return false;
+    if (/\([^)]*[+*?][^)]*\)[+*?{]/.test(regexBody)) return false;
+    return true;
+  }
+
+  function regexSearch(pattern, name) {
+    if (!regexIsSafe(pattern)) {
+      return { matched: null, error: REGEX_ERROR_COMPLEX };
+    }
+    try {
+      const re = new RegExp(pattern, "i");
+      return { matched: re.test(name), error: null };
+    } catch {
+      return { matched: null, error: REGEX_ERROR_INVALID };
+    }
+  }
+
+  function fnmatchToRegex(pattern) {
     let re = "^";
-    for (const ch of pattern) {
-      if (ch === "*") re += ".*";
-      else if (ch === "?") re += ".";
-      else re += ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    for (let i = 0; i < pattern.length; i++) {
+      const ch = pattern[i];
+      if (ch === "*") {
+        re += ".*";
+      } else if (ch === "?") {
+        re += ".";
+      } else if (ch === "[") {
+        let j = i + 1;
+        let cls = "[";
+        if (j < pattern.length && (pattern[j] === "!" || pattern[j] === "^")) {
+          cls += "^";
+          j++;
+        }
+        if (j < pattern.length && pattern[j] === "]") {
+          cls += "\\]";
+          j++;
+        }
+        while (j < pattern.length && pattern[j] !== "]") {
+          cls += pattern[j];
+          j++;
+        }
+        if (j >= pattern.length) {
+          re += "\\[";
+        } else {
+          re += cls + "]";
+          i = j;
+        }
+      } else {
+        re += ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      }
     }
     return new RegExp(re + "$", "i");
   }
 
-  function matchElements(query) {
-    const elements = getAllElements();
-    if (query.includes("*") || query.includes("?")) {
-      const re = globToRegex(query);
-      return elements.filter(e => re.test(e.text));
+  function elementMatchesPattern(name, pattern) {
+    pattern = pattern.trim();
+    if (!pattern) return { matched: false, error: null };
+    if (isDelimitedRegex(pattern)) {
+      const regexBody = pattern.slice(1, -1);
+      if (!regexBody) return { matched: false, error: null };
+      const { matched, error } = regexSearch(regexBody, name);
+      if (error) return { matched: false, error };
+      return { matched, error: null };
     }
-    // Substring fallback
-    const lower = query.toLowerCase();
-    return elements.filter(e => e.text.toLowerCase().includes(lower));
+    const nameLower = name.toLowerCase();
+    const patternLower = pattern.toLowerCase();
+    if (/[*?[\]]/.test(patternLower)) {
+      return { matched: fnmatchToRegex(patternLower).test(nameLower), error: null };
+    }
+    return { matched: nameLower.includes(patternLower), error: null };
+  }
+
+  function matchElements(query) {
+    if (query.length > MAX_QUERY_LENGTH) {
+      return { matches: [], error: `Query too long (max ${MAX_QUERY_LENGTH} characters)` };
+    }
+    const discoveries = getAllElements();
+    const { pattern, onlyNew } = parseQueryFilter(query);
+    if (!pattern.trim()) return { matches: [], error: null };
+
+    const matches = [];
+    let matchError = null;
+    const deadline = Date.now() + MATCH_SCAN_BUDGET;
+    for (const e of discoveries) {
+      if (Date.now() > deadline) {
+        return { matches: [], error: REGEX_ERROR_COMPLEX };
+      }
+      const { matched, error } = elementMatchesPattern(e.text, pattern);
+      if (error) {
+        matchError = error;
+        break;
+      }
+      if (matched) matches.push(e);
+    }
+    if (matchError) return { matches: [], error: matchError };
+    if (onlyNew) {
+      return { matches: matches.filter(e => e.discovered), error: null };
+    }
+    return { matches, error: null };
+  }
+
+  function slashArgs(line, command) {
+    if (line === command) return "";
+    const prefix = command + " ";
+    if (line.startsWith(prefix)) return line.slice(prefix.length);
+    return null;
+  }
+
+  function splitOnFirstWhitespace(rest) {
+    const i = rest.search(/\s/);
+    if (i < 0) return null;
+    const first = rest.slice(0, i).trim();
+    const second = rest.slice(i).trim();
+    if (!first || !second) return null;
+    return [first, second];
+  }
+
+  function splitOnce(rest, delimiter) {
+    const idx = rest.indexOf(delimiter);
+    if (idx < 0) return null;
+    const first = rest.slice(0, idx).trim();
+    const second = rest.slice(idx + delimiter.length).trim();
+    if (!first || !second) return null;
+    return [first, second];
+  }
+
+  function parseTwoElements(rest) {
+    rest = rest.trim();
+    if (rest.includes(" + ")) return splitOnce(rest, " + ");
+    return splitOnFirstWhitespace(rest);
+  }
+
+  function parseWithArgs(rest) {
+    return splitOnFirstWhitespace(rest.trim());
+  }
+
+  function parseCrossQueries(rest) {
+    rest = rest.trim();
+    if (rest.includes(" * ")) return splitOnce(rest, " * ");
+    if (containsDelimitedRegex(rest)) return null;
+    return splitOnFirstWhitespace(rest);
   }
 
   // ── Bulk pair processor ──────────────────────────────────────────────
@@ -420,9 +573,9 @@
     if (pairs.length > BULK_WARN) {
       try {
         beginRun();
-        print(`  ${yellow(`${pairs.length} pairs`)} — type ${bold("yes")} to continue, anything else to cancel.`);
+        print(`  ${yellow(`${pairs.length} pairs`)} — type ${bold("y")} or ${bold("yes")} to continue, anything else to cancel.`);
         const answer = await waitForInput();
-        if (answer.toLowerCase() !== "yes") { print("  Cancelled."); return; }
+        if (!["y", "yes"].includes(answer.toLowerCase())) { print("  Cancelled."); return; }
       } finally {
         endRun();
       }
@@ -460,12 +613,9 @@
   // ── Commands ─────────────────────────────────────────────────────────
 
   function doSearch(query) {
-    let firstOnly = false;
-    if (query.startsWith("^")) { firstOnly = true; query = query.slice(1); }
-    let matches = matchElements(query);
-    if (firstOnly) matches = matches.filter(e => e.discovered);
-    if (!matches.length) { print("  No matches."); return; }
-    print(`  ${green(String(matches.length))} matches:`);
+    const { matches, error } = matchElements(query);
+    if (error) { print("  " + red(error)); return; }
+    if (!matches.length) { print("  No matches found."); return; }
     for (const el of matches) print("  " + formatElement(el));
   }
 
@@ -538,9 +688,13 @@
 
   async function doExhaust(name) {
     const target = resolveElement(name);
-    if (!getByName(target.text)) { print("  " + red("Element not found.")); return; }
     const all = getAllElements();
     const pairs = all.filter(e => e.text !== target.text).map(e => [target, e]);
+    if (!pairs.length) {
+      print(`  No other elements to combine with ${bold(esc(target.text))}.`);
+      return;
+    }
+    print(`  Combining ${bold(esc(target.text))} with ${pairs.length} elements...`);
     await confirmAndRunPairs(pairs);
   }
 
@@ -613,41 +767,63 @@
   }
 
   async function doPermute(query) {
-    const matches = matchElements(query);
-    if (!matches.length) { print("  No matches."); return; }
+    const { matches, error } = matchElements(query);
+    if (error) { print("  " + red(error)); return; }
+    if (!matches.length) { print("  No elements match that query."); return; }
+    if (matches.length === 1) {
+      print(`  Only one match: ${formatElement(matches[0])}. Need at least two.`);
+      return;
+    }
     const pairs = [];
     for (let i = 0; i < matches.length; i++) {
       for (let j = i + 1; j < matches.length; j++) {
         pairs.push([matches[i], matches[j]]);
       }
     }
-    print(`  Permuting ${bold(String(matches.length))} elements (${pairs.length} pairs)...`);
+    print(`  ${matches.length} elements match, ${pairs.length} unique pairs:`);
+    for (const m of matches) print(`    ${formatElement(m)}`);
     await confirmAndRunPairs(pairs);
   }
 
   async function doCross(leftQ, rightQ) {
-    const left = matchElements(leftQ);
-    const right = matchElements(rightQ);
-    if (!left.length || !right.length) { print("  No matches."); return; }
+    const leftResult = matchElements(leftQ);
+    if (leftResult.error) { print("  " + red(leftResult.error)); return; }
+    const rightResult = matchElements(rightQ);
+    if (rightResult.error) { print("  " + red(rightResult.error)); return; }
+    const left = leftResult.matches;
+    const right = rightResult.matches;
+    if (!left.length) { print(`  No elements match: ${esc(leftQ)}`); return; }
+    if (!right.length) { print(`  No elements match: ${esc(rightQ)}`); return; }
     const seen = new Set();
     const pairs = [];
     for (const a of left) {
       for (const b of right) {
+        if (a.text === b.text) continue;
         const key = pairKey(a.text, b.text);
         if (seen.has(key)) continue;
         seen.add(key);
         pairs.push([a, b]);
       }
     }
-    print(`  Cross: ${left.length} x ${right.length} = ${pairs.length} pairs...`);
+    if (!pairs.length) {
+      print("  No valid pairs (all matches overlap).");
+      return;
+    }
+    const leftPreview = left.slice(0, 10).map(e => e.text).join(", ");
+    const rightPreview = right.slice(0, 10).map(e => e.text).join(", ");
+    print(`  Left (${left.length}): ${esc(leftPreview)}${left.length > 10 ? "..." : ""}`);
+    print(`  Right (${right.length}): ${esc(rightPreview)}${right.length > 10 ? "..." : ""}`);
+    print(`  ${pairs.length} unique pairs`);
     await confirmAndRunPairs(pairs);
   }
 
   async function doCombineWithQuery(name, query) {
     const target = resolveElement(name);
-    const others = matchElements(query);
+    const { matches: others, error } = matchElements(query);
+    if (error) { print("  " + red(error)); return; }
     if (!others.length) { print(`  No elements match: ${esc(query)}`); return; }
     const pairs = others.filter(o => o.text !== target.text).map(o => [target, o]);
+    if (!pairs.length) { print(`  No other elements match: ${esc(query)}`); return; }
     print(`  Combining ${bold(esc(target.text))} with ${pairs.length} elements matching ${yellow(esc(query))}...`);
     await confirmAndRunPairs(pairs);
   }
@@ -906,26 +1082,42 @@
   }
 
   function doHelp() {
-    print(`  ${bold("Commands:")}
-  ${cyan("element + element")}     Combine two elements
-  ${cyan("element ++ element")}    Combine & crawl: iterate until no new discoveries
-  ${cyan("element + | query")}     Combine element with all matching discoveries
-  ${cyan("query * query")}         Cross-combine all matches from both queries
-  ${cyan("/search query")}         Search discoveries (* ? wildcards, ^ for first discoveries)
-  ${cyan("/recipe element")}       Show shortest recipe from base elements
-  ${cyan("/list")}                 List all discovered elements
-  ${cyan("/exhaust element")}      Combine element with all discoveries
-  ${cyan("/crawl el + el")}        Same as ++ (alternate syntax)
-  ${cyan("/permute query")}        Combine all matching elements with each other
-  ${cyan("/import element")}       Import recipe from Infinibrowser
-  ${cyan("/import")}               Import from .ic save file
-  ${cyan("/fill")}                 Fetch missing recipes from Infinibrowser
-  ${cyan("/unfilled")}             List elements without recipes
-  ${cyan("/prune")}                Remove orphan elements Infinibrowser can't fill
-  ${cyan("/export")}               Download discoveries as .ic save file
-  ${cyan("/history")}              Show combinations this session
-  ${cyan("/clear")}                Clear output
-  ${cyan("/help")}                 Show this help`);
+    print(`  ${bold("Combine:")}
+    ${cyan("<element> + <element>")}       Combine two elements
+    ${cyan("/combine <el> + <el>")}        Same (also: /combine <el> <el>)
+
+  ${bold("Crawl:")}
+    ${cyan("<element> ++ <element>")}      Combine & crawl until no new discoveries
+    ${cyan("/crawl <el> + <el>")}          Same as ++ (also: /crawl <el> <el>)
+
+  ${bold("Bulk combine (query syntax below):")}
+    ${cyan("<element> +| <query>")}        Combine element with all matching discoveries
+    ${cyan("<element> + | <query>")}       Same as +| (spaced variant)
+    ${cyan("/with <element> <query>")}     Same as +|
+    ${cyan("<query> * <query>")}           Cross-combine matches from both queries
+    ${cyan("/cross <query> * <query>")}    Same as * (also: /cross <q> <q>)
+    ${cyan("/permute <query>")}            Combine all matching elements with each other
+    ${cyan("/exhaust <element>")}          Combine element with all discoveries
+
+  ${bold("Query syntax (/search, /with, /permute, /cross, shorthands):")}
+    substring                   Default: case-insensitive substring
+    * ? []                      fnmatch wildcards (e.g. fire*, mu?)
+    /pattern/                   Regex, case-insensitive (no | alternation)
+    !<query>                    First discoveries only (e.g. !fire*)
+    ^<query>                    Legacy alias for !<query>
+
+  ${bold("Discoveries & recipes:")}
+    ${cyan("/search <query>")}             Search discoveries
+    ${cyan("/recipe <element>")}           Show shortest recipe from base elements
+    ${cyan("/list")}                       List all discovered elements
+    ${cyan("/import <element|file.ic>")}   Import from Infinibrowser or .ic save file
+    ${cyan("/fill")}                       Fetch missing recipes from Infinibrowser
+    ${cyan("/unfilled")}                   List elements without recipes
+    ${cyan("/prune")}                      Remove orphan elements Infinibrowser can't fill
+    ${cyan("/export")}                     Download discoveries as .ic save file
+    ${cyan("/history")}                    Show combinations this session
+    ${cyan("/clear")}                      Clear output (browser only)
+    ${cyan("/help")}                       Show this help`);
   }
 
   // ── Command dispatcher ───────────────────────────────────────────────
@@ -936,58 +1128,96 @@
     }
 
     if (line.startsWith("/")) {
+      let rest;
+      if ((rest = slashArgs(line, "/help")) !== null) { doHelp(); return; }
+      if ((rest = slashArgs(line, "/search")) !== null) {
+        if (!rest) print("  Usage: /search <query>");
+        else doSearch(rest);
+        return;
+      }
+      if ((rest = slashArgs(line, "/recipe")) !== null) {
+        if (!rest) print("  Usage: /recipe <element>");
+        else doRecipe(rest);
+        return;
+      }
+      if ((rest = slashArgs(line, "/list")) !== null) { doList(); return; }
+      if ((rest = slashArgs(line, "/permute")) !== null) {
+        if (!rest) print("  Usage: /permute <query>");
+        else await doPermute(rest);
+        return;
+      }
+      if ((rest = slashArgs(line, "/import")) !== null) {
+        if (!rest) await doImportFile();
+        else if (rest.endsWith(".ic") || rest.includes("/") || rest.includes("\\")) await doImportFile();
+        else await doImport(rest);
+        return;
+      }
+      if ((rest = slashArgs(line, "/unfilled")) !== null) { doUnfilled(); return; }
+      if ((rest = slashArgs(line, "/fill")) !== null) { await doFill(); return; }
+      if ((rest = slashArgs(line, "/prune")) !== null) { await doPrune(); return; }
+      if ((rest = slashArgs(line, "/export")) !== null) { await doExport(); return; }
+      if ((rest = slashArgs(line, "/exhaust")) !== null) {
+        if (!rest) print("  Usage: /exhaust <element>");
+        else await doExhaust(rest);
+        return;
+      }
+      if ((rest = slashArgs(line, "/combine")) !== null) {
+        const parsed = parseTwoElements(rest);
+        if (!parsed) print("  Usage: /combine <element> + <element>");
+        else await doCombine(parsed[0], parsed[1]);
+        return;
+      }
+      if ((rest = slashArgs(line, "/crawl")) !== null) {
+        const parsed = parseTwoElements(rest);
+        if (!parsed) print("  Usage: /crawl <element> + <element>");
+        else await doCrawl(parsed[0], parsed[1]);
+        return;
+      }
+      if ((rest = slashArgs(line, "/with")) !== null) {
+        const parsed = parseWithArgs(rest);
+        if (!parsed) print("  Usage: /with <element> <query>");
+        else await doCombineWithQuery(parsed[0], parsed[1]);
+        return;
+      }
+      if ((rest = slashArgs(line, "/cross")) !== null) {
+        const parsed = parseCrossQueries(rest);
+        if (!parsed) print("  Usage: /cross <query> * <query>");
+        else await doCross(parsed[0], parsed[1]);
+        return;
+      }
+      if ((rest = slashArgs(line, "/history")) !== null) { doHistory(); return; }
+      if ((rest = slashArgs(line, "/clear")) !== null) { output.innerHTML = ""; return; }
       const spaceIdx = line.indexOf(" ");
       const cmd = spaceIdx > 0 ? line.slice(0, spaceIdx) : line;
-      const arg = spaceIdx > 0 ? line.slice(spaceIdx + 1).trim() : "";
-
-      switch (cmd) {
-        case "/help": doHelp(); return;
-        case "/search": if (!arg) { print("  Usage: /search query"); } else { doSearch(arg); } return;
-        case "/recipe": if (!arg) { print("  Usage: /recipe element"); } else { doRecipe(arg); } return;
-        case "/list": doList(); return;
-        case "/exhaust": if (!arg) { print("  Usage: /exhaust element"); } else { await doExhaust(arg); } return;
-        case "/crawl": {
-          if (!arg.includes("+")) { print("  Usage: /crawl el + el"); return; }
-          const [a, b] = arg.split("+", 2).map(s => s.trim());
-          if (!a || !b) { print("  Usage: /crawl el + el"); return; }
-          await doCrawl(a, b);
-          return;
-        }
-        case "/permute": if (!arg) { print("  Usage: /permute query"); } else { await doPermute(arg); } return;
-        case "/import": if (!arg) { await doImportFile(); } else { await doImport(arg); } return;
-        case "/fill": await doFill(); return;
-        case "/unfilled": doUnfilled(); return;
-        case "/prune": await doPrune(); return;
-        case "/export": await doExport(); return;
-        case "/history": doHistory(); return;
-        case "/clear": output.innerHTML = ""; return;
-        default: print(`  Unknown command: ${esc(cmd)}. Type ${yellow("/help")} for commands.`); return;
-      }
-    }
-
-    // Operator parsing (precedence: ++ > +| > * > +)
-    if (line.includes("++")) {
-      const [a, b] = line.split("++", 2).map(s => s.trim());
-      if (a && b) { await doCrawl(a, b); return; }
-      print("  Usage: element ++ element");
+      print(`  Unknown command: ${esc(cmd)}. Type ${yellow("/help")} for commands.`);
       return;
     }
-    if (line.includes("+|")) {
-      const [name, query] = line.split("+|", 2).map(s => s.trim());
+
+    // Operator parsing (precedence: ++ > +| > * > +; spaced delimiters only)
+    if (line.includes(" ++ ")) {
+      const [a, b] = line.split(" ++ ", 2).map(s => s.trim());
+      if (a && b) { await doCrawl(a, b); return; }
+      print("  Usage: <element> ++ <element>");
+      return;
+    }
+    if (/\+\s*\|/.test(line)) {
+      const parts = line.split(/\+\s*\|/, 2);
+      const name = parts[0].trim();
+      const query = parts[1].trim();
       if (name && query) { await doCombineWithQuery(name, query); return; }
-      print("  Usage: element + | query");
+      print("  Usage: <element> +| <query>");
       return;
     }
     if (line.includes(" * ")) {
       const [left, right] = line.split(" * ", 2).map(s => s.trim());
       if (left && right) { await doCross(left, right); return; }
-      print("  Usage: query * query");
+      print("  Usage: <query> * <query>");
       return;
     }
-    if (line.includes("+")) {
-      const [a, b] = line.split("+", 2).map(s => s.trim());
+    if (line.includes(" + ")) {
+      const [a, b] = line.split(" + ", 2).map(s => s.trim());
       if (a && b) { await doCombine(a, b); return; }
-      print("  Usage: element + element");
+      print("  Usage: <element> + <element>");
       return;
     }
 

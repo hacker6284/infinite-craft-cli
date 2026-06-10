@@ -1,5 +1,28 @@
 # Changelog
 
+## [1.3.0] - 2026-06-10
+
+### Added
+- REPL slash commands `/combine`, `/with`, and `/cross` mirroring `+`, `+|`, and `*` shorthands
+- Non-interactive `with` subcommand: `infinite-craft with <element> <query>`
+- Regex query syntax via `/pattern/` delimiters (case-insensitive)
+- `!` prefix for first-discovery filters (`^` retained as legacy alias)
+- Reorganized `/help` with shorthand/slash-command groupings and query-syntax documentation
+- `regex` package dependency for bounded-time regex matching (20ms timeout)
+
+### Changed
+- Browser extension and bookmarklet trainers brought to parity with the Python CLI: `/combine`, `/with`, `/cross`, grouped `/help`, `!`/`/pattern/` query syntax, spaced operator delimiters, and matching parser/dispatch behavior
+- Regenerated `bookmarklet/trainer.min.js`; updated `bookmarklet/index.html` command reference
+
+### Fixed
+- Empty regex `//` and empty queries after `!`/`^` no longer match all elements
+- `do_with()` and `do_exhaust()` short-circuit when no valid pairs remain
+- `/cross` delimited-regex queries with spaces require explicit ` * ` delimiter; substring queries with `/` still work
+- Element names containing `+` or `++` no longer misfire combine/crawl parsers (combine requires spaced ` + `)
+- `/with`, `/cross`, `/fill`, `/unfilled`, `/prune` no longer misroute similarly-prefixed commands
+- Invalid regex patterns report distinct errors ("Invalid regex pattern" vs "Regex pattern too complex")
+- ReDoS mitigation: nested-quantifier and alternation-quantifier rejection, regex body length cap, 20ms timeout
+
 ## [1.2.9] - 2026-06-07
 
 ### Fixed

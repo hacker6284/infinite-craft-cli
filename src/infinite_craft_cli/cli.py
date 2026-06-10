@@ -5,6 +5,7 @@ import asyncio
 import argparse
 import fnmatch
 import gzip
+import re
 import json
 import os
 import signal
@@ -37,6 +38,18 @@ RED = "\033[31m"
 
 API_RATE_LIMIT = 60   # requests per minute — conservative to avoid Cloudflare blocks
 API_CONCURRENCY = 2   # parallel workers for bulk operations
+MAX_QUERY_LENGTH = 512
+MAX_REGEX_BODY_LENGTH = 200
+REGEX_TIMEOUT = 0.02
+MATCH_SCAN_BUDGET = 0.5
+REGEX_ERROR_INVALID = "Invalid regex pattern"
+REGEX_ERROR_COMPLEX = "Regex pattern too complex"
+_QUERY_HELP = "Search query (wildcards, /regex/, ! or ^ for first discoveries)"
+
+import regex as _regex_module
+
+_RE_NESTED_QUANTIFIER = re.compile(r"(\+|\*|\?|\{\d*,?\d*\})\s*(\+|\*|\?|\{)")
+_RE_DELIMITED_REGEX = re.compile(r"/[^/]+/")
 
 # Session-only history
 _history: list[tuple[str, str, str]] = []
@@ -154,30 +167,121 @@ async def do_combine(client, storage, first_name: str, second_name: str) -> str:
     return format_result(str(first), str(second), result)
 
 
-def _match_elements(storage, query: str) -> list:
-    """Return discovered elements matching a query.
+def _slash_args(line: str, command: str) -> str | None:
+    """Return arguments after a slash command, or None if the line is not that command."""
+    if line == command:
+        return ""
+    prefix = command + " "
+    if line.startswith(prefix):
+        return line[len(prefix):]
+    return None
 
-    Supports wildcards (* and ?) via fnmatch when present,
-    otherwise falls back to substring matching.
-    Prefix with ^ to limit to first discoveries only.
+
+def _parse_query_filter(query: str) -> tuple[str, bool]:
+    """Parse a query, returning (pattern, first_discoveries_only).
+
+    Prefix ``!`` limits to first discoveries only (``^`` is accepted as legacy).
     """
-    discoveries = storage.get_all()
     q = query.strip()
-    only_new = q.startswith("^")
-    if only_new:
+    only_new = False
+    if q.startswith("!"):
+        only_new = True
         q = q[1:]
-    q = q.lower()
-    if any(c in q for c in "*?[]"):
-        matches = [e for e in discoveries if fnmatch.fnmatch(e.name.lower(), q)]
-    else:
-        matches = [e for e in discoveries if q in e.name.lower()]
+    elif q.startswith("^"):
+        only_new = True
+        q = q[1:]
+    return q, only_new
+
+
+def _is_delimited_regex(pattern: str) -> bool:
+    pattern = pattern.strip()
+    return len(pattern) >= 2 and pattern.startswith("/") and pattern.endswith("/")
+
+
+def _contains_delimited_regex(text: str) -> bool:
+    return _RE_DELIMITED_REGEX.search(text) is not None
+
+
+def _regex_is_safe(regex_body: str) -> bool:
+    if not regex_body or len(regex_body) > MAX_REGEX_BODY_LENGTH:
+        return False
+    # Alternation is not supported — nested groups bypass simpler safety checks.
+    if "|" in regex_body:
+        return False
+    if _RE_NESTED_QUANTIFIER.search(regex_body):
+        return False
+    # Reject grouped quantifiers followed by quantifiers, e.g. (a+)+ or (a*)*
+    if re.search(r"\([^)]*[+*?][^)]*\)[+*?{]", regex_body):
+        return False
+    return True
+
+
+def _regex_search(pattern: str, name: str) -> tuple[bool | None, str | None]:
+    """Search with regex. Returns (matched, error_message)."""
+    if not _regex_is_safe(pattern):
+        return None, REGEX_ERROR_COMPLEX
+    try:
+        found = _regex_module.search(
+            pattern, name, _regex_module.IGNORECASE, timeout=REGEX_TIMEOUT
+        )
+        return (found is not None), None
+    except TimeoutError:
+        return None, REGEX_ERROR_COMPLEX
+    except _regex_module.error:
+        return None, REGEX_ERROR_INVALID
+
+
+def _element_matches_pattern(name: str, pattern: str) -> tuple[bool, str | None]:
+    """Match an element name against a query pattern."""
+    pattern = pattern.strip()
+    if not pattern:
+        return False, None
+    if _is_delimited_regex(pattern):
+        regex_body = pattern[1:-1]
+        if not regex_body:
+            return False, None
+        matched, err = _regex_search(regex_body, name)
+        if err:
+            return False, err
+        return matched, None
+    name_lower = name.lower()
+    pattern_lower = pattern.lower()
+    if any(c in pattern_lower for c in "*?[]"):
+        return fnmatch.fnmatch(name_lower, pattern_lower), None
+    return pattern_lower in name_lower, None
+
+
+def _match_elements(storage, query: str) -> tuple[list[Element], str | None]:
+    """Return (matches, error_message) for discovered elements matching a query."""
+    if len(query) > MAX_QUERY_LENGTH:
+        return [], f"Query too long (max {MAX_QUERY_LENGTH} characters)"
+    discoveries = storage.get_all()
+    q, only_new = _parse_query_filter(query)
+    if not q.strip():
+        return [], None
+    matches: list[Element] = []
+    match_error: str | None = None
+    deadline = time.monotonic() + MATCH_SCAN_BUDGET
+    for e in discoveries:
+        if time.monotonic() > deadline:
+            return [], REGEX_ERROR_COMPLEX
+        matched, err = _element_matches_pattern(e.name, q)
+        if err:
+            match_error = err
+            break
+        if matched:
+            matches.append(e)
+    if match_error:
+        return [], match_error
     if only_new:
         matches = [e for e in matches if e.is_first_discovery]
-    return matches
+    return matches, None
 
 
 def do_search(storage, query: str) -> str:
-    matches = _match_elements(storage, query)
+    matches, err = _match_elements(storage, query)
+    if err:
+        return f"  {err}"
     if not matches:
         return "  No matches found."
     return "\n".join(f"  {format_element(e)}" for e in matches)
@@ -365,8 +469,79 @@ async def do_exhaust(client, storage, name: str):
     target = _resolve_element(storage, name)
     others = list(storage.get_all())
     pairs = [(target, o) for o in others if o.name != target.name]
+    if not pairs:
+        print(f"  No other elements to combine with {_color(str(target), BOLD)}.")
+        return
     print(f"  Combining {_color(str(target), BOLD)} with {len(pairs)} elements...")
     await _confirm_and_run_pairs(client, storage, pairs)
+
+
+async def do_with(client, storage, element_name: str, query: str):
+    """Combine an element with all discoveries matching a query."""
+    target = _resolve_element(storage, element_name)
+    others, err = _match_elements(storage, query)
+    if err:
+        print(f"  {err}")
+        return
+    if not others:
+        print(f"  No elements match: {query}")
+        return
+    pairs = [(target, o) for o in others if o.name != target.name]
+    if not pairs:
+        print(f"  No other elements match: {query}")
+        return
+    print(
+        f"  Combining {_color(str(target), BOLD)} with {len(pairs)} elements "
+        f"matching {_color(query, YELLOW)}..."
+    )
+    await _confirm_and_run_pairs(client, storage, pairs)
+
+
+def _parse_two_elements(rest: str) -> tuple[str, str] | None:
+    """Parse two element names from ``<el> + <el>`` or ``<el> <el>``."""
+    rest = rest.strip()
+    if " + " in rest:
+        parts = rest.split(" + ", 1)
+        first, second = parts[0].strip(), parts[1].strip()
+    else:
+        parts = rest.split(None, 1)
+        if len(parts) != 2:
+            return None
+        first, second = parts[0].strip(), parts[1].strip()
+    if not first or not second:
+        return None
+    return first, second
+
+
+def _parse_with_args(rest: str) -> tuple[str, str] | None:
+    """Parse ``<element> <query>`` for /with."""
+    rest = rest.strip()
+    parts = rest.split(None, 1)
+    if len(parts) != 2:
+        return None
+    element, query = parts[0].strip(), parts[1].strip()
+    if not element or not query:
+        return None
+    return element, query
+
+
+def _parse_cross_queries(rest: str) -> tuple[str, str] | None:
+    """Parse two queries from ``<query> * <query>`` or ``<query> <query>``."""
+    rest = rest.strip()
+    if " * " in rest:
+        parts = rest.split(" * ", 1)
+        left, right = parts[0].strip(), parts[1].strip()
+    elif _contains_delimited_regex(rest):
+        # Delimited regex queries may contain spaces; require explicit * delimiter.
+        return None
+    else:
+        parts = rest.split(None, 1)
+        if len(parts) != 2:
+            return None
+        left, right = parts[0].strip(), parts[1].strip()
+    if not left or not right:
+        return None
+    return left, right
 
 
 _BULK_WARN_THRESHOLD = 200
@@ -452,21 +627,25 @@ async def _confirm_and_run_pairs(client, storage, pairs: list[tuple]):
     """Warn if too many pairs, then run them."""
     if len(pairs) > _BULK_WARN_THRESHOLD:
         print(f"\n  {_color(f'Warning: this will make {len(pairs)} API requests.', YELLOW)}")
-        try:
-            answer = input("  Continue? [y/N] ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print("\n  Cancelled.")
-            return
-        if answer not in ("y", "yes"):
-            print("  Cancelled.")
-            return
+        if sys.stdin.isatty():
+            try:
+                answer = input("  Continue? [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\n  Cancelled.")
+                return
+            if answer not in ("y", "yes"):
+                print("  Cancelled.")
+                return
     print()
     await _combine_pairs(client, storage, pairs)
 
 
 async def do_permute(client, storage, query: str):
     """Combine every pair of elements matching the query with each other."""
-    matches = _match_elements(storage, query)
+    matches, err = _match_elements(storage, query)
+    if err:
+        print(f"  {err}")
+        return
     if not matches:
         print("  No elements match that query.")
         return
@@ -484,8 +663,14 @@ async def do_permute(client, storage, query: str):
 
 async def do_cross(client, storage, left_query: str, right_query: str):
     """Cross-combine all elements matching left_query with all matching right_query."""
-    left = _match_elements(storage, left_query)
-    right = _match_elements(storage, right_query)
+    left, left_err = _match_elements(storage, left_query)
+    if left_err:
+        print(f"  {left_err}")
+        return
+    right, right_err = _match_elements(storage, right_query)
+    if right_err:
+        print(f"  {right_err}")
+        return
     if not left:
         print(f"  No elements match: {left_query}")
         return
@@ -855,25 +1040,42 @@ def do_export(storage, path: str = EXPORT_PATH) -> str:
 
 
 def do_help() -> str:
-    return """  Commands:
-    <element> + <element>     Combine two elements
-    <element> ++ <element>    Combine & crawl: iterate until no new discoveries
-    <element> + | <query>     Combine element with all matching discoveries
-    <query> * <query>         Cross-combine all matches from both queries
-    /search <query>           Search discoveries (supports * ? wildcards, ^ for new)
-    /recipe <element>         Show shortest recipe from base elements
-    /list                     List all discovered elements
-    /exhaust <element>        Combine element with all discoveries
-    /crawl <el> + <el>        Same as ++ (alternate syntax)
-    /permute <query>          Combine all matching elements with each other
-    /import <element|file.ic> Import from Infinibrowser or .ic save file
-    /fill                     Fetch missing recipes from Infinibrowser
-    /unfilled                 List elements without recipes
-    /prune                    Remove orphan elements Infinibrowser can't fill
-    /export [path]            Export discoveries as .ic save file
-    /history                  Show combinations tried this session
-    /help                     Show this help
-    /quit                     Exit"""
+    return """  Combine:
+    <element> + <element>       Combine two elements
+    /combine <el> + <el>        Same (also: /combine <el> <el>)
+
+  Crawl:
+    <element> ++ <element>      Combine & crawl until no new discoveries
+    /crawl <el> + <el>          Same as ++ (also: /crawl <el> <el>)
+
+  Bulk combine (query syntax below):
+    <element> +| <query>        Combine element with all matching discoveries
+    <element> + | <query>       Same as +| (spaced variant)
+    /with <element> <query>     Same as +|
+    <query> * <query>           Cross-combine matches from both queries
+    /cross <query> * <query>    Same as * (also: /cross <q> <q>)
+    /permute <query>            Combine all matching elements with each other
+    /exhaust <element>          Combine element with all discoveries
+
+  Query syntax (/search, /with, /permute, /cross, shorthands):
+    substring                   Default: case-insensitive substring
+    * ? []                      fnmatch wildcards (e.g. fire*, mu?)
+    /pattern/                   Regex, case-insensitive (no | alternation)
+    !<query>                    First discoveries only (e.g. !fire*)
+    ^<query>                    Legacy alias for !<query>
+
+  Discoveries & recipes:
+    /search <query>             Search discoveries
+    /recipe <element>           Show shortest recipe from base elements
+    /list                       List all discovered elements
+    /import <element|file.ic>   Import from Infinibrowser or .ic save file
+    /fill                       Fetch missing recipes from Infinibrowser
+    /unfilled                   List elements without recipes
+    /prune                      Remove orphan elements Infinibrowser can't fill
+    /export [path]              Export discoveries as .ic save file
+    /history                    Show combinations tried this session
+    /help                       Show this help
+    /quit                       Exit"""
 
 
 # ---------------------------------------------------------------------------
@@ -906,84 +1108,87 @@ async def interactive_mode():
                 break
             elif line == "/help":
                 print(do_help())
-            elif line.startswith("/search"):
-                query = line[len("/search"):].strip()
-                if not query:
+            elif (rest := _slash_args(line, "/search")) is not None:
+                if not rest:
                     print("  Usage: /search <query>")
                 else:
-                    print(do_search(storage, query))
-            elif line.startswith("/recipe"):
-                name = line[len("/recipe"):].strip()
-                if not name:
+                    print(do_search(storage, rest))
+            elif (rest := _slash_args(line, "/recipe")) is not None:
+                if not rest:
                     print("  Usage: /recipe <element>")
                 else:
-                    print(do_recipe(storage, name))
+                    print(do_recipe(storage, rest))
             elif line == "/list":
                 print(do_list(storage))
-            elif line.startswith("/permute"):
-                query = line[len("/permute"):].strip()
-                if not query:
+            elif (rest := _slash_args(line, "/permute")) is not None:
+                if not rest:
                     print("  Usage: /permute <query>")
                 else:
-                    await do_permute(client, storage, query)
-            elif line.startswith("/import"):
-                name = line[len("/import"):].strip()
-                if not name:
+                    await do_permute(client, storage, rest)
+            elif (rest := _slash_args(line, "/import")) is not None:
+                if not rest:
                     print("  Usage: /import <element>")
                 else:
-                    print(do_import(storage, name))
-            elif line.startswith("/unfilled"):
+                    print(do_import(storage, rest))
+            elif (rest := _slash_args(line, "/unfilled")) is not None:
                 print(do_unfilled(storage))
-            elif line.startswith("/fill"):
+            elif (rest := _slash_args(line, "/fill")) is not None:
                 _fill_missing_recipes(storage)
-            elif line.startswith("/prune"):
+            elif (rest := _slash_args(line, "/prune")) is not None:
                 _prune_orphans(storage)
-            elif line.startswith("/export"):
-                path = line[len("/export"):].strip() or EXPORT_PATH
-                print(do_export(storage, path))
-            elif line.startswith("/exhaust"):
-                name = line[len("/exhaust"):].strip()
-                if not name:
+            elif (rest := _slash_args(line, "/export")) is not None:
+                print(do_export(storage, rest or EXPORT_PATH))
+            elif (rest := _slash_args(line, "/exhaust")) is not None:
+                if not rest:
                     print("  Usage: /exhaust <element>")
                 else:
-                    await do_exhaust(client, storage, name)
-            elif line.startswith("/crawl"):
-                rest = line[len("/crawl"):].strip()
-                if "+" not in rest:
+                    await do_exhaust(client, storage, rest)
+            elif (rest := _slash_args(line, "/combine")) is not None:
+                parsed = _parse_two_elements(rest)
+                if parsed is None:
+                    print("  Usage: /combine <element> + <element>")
+                else:
+                    first, second = parsed
+                    print(await do_combine(client, storage, first, second))
+            elif (rest := _slash_args(line, "/crawl")) is not None:
+                parsed = _parse_two_elements(rest)
+                if parsed is None:
                     print("  Usage: /crawl <element> + <element>")
                 else:
-                    parts = rest.split("+", 1)
-                    first, second = parts[0].strip(), parts[1].strip()
-                    if not first or not second:
-                        print("  Usage: /crawl <element> + <element>")
-                    else:
-                        await do_crawl(client, storage, first, second)
+                    first, second = parsed
+                    await do_crawl(client, storage, first, second)
+            elif (rest := _slash_args(line, "/with")) is not None:
+                parsed = _parse_with_args(rest)
+                if parsed is None:
+                    print("  Usage: /with <element> <query>")
+                else:
+                    element, query = parsed
+                    await do_with(client, storage, element, query)
+            elif (rest := _slash_args(line, "/cross")) is not None:
+                parsed = _parse_cross_queries(rest)
+                if parsed is None:
+                    print("  Usage: /cross <query> * <query>")
+                else:
+                    left_q, right_q = parsed
+                    await do_cross(client, storage, left_q, right_q)
             elif line == "/history":
                 print(do_history())
-            elif "++" in line:
-                parts = line.split("++", 1)
+            elif " ++ " in line:
+                parts = line.split(" ++ ", 1)
                 first = parts[0].strip()
                 second = parts[1].strip()
                 if not first or not second:
                     print("  Usage: <element> ++ <element>")
                 else:
                     await do_crawl(client, storage, first, second)
-            elif "+|" in line:
-                # element + | query
-                parts = line.split("+|", 1)
+            elif re.search(r"\+\s*\|", line):
+                parts = re.split(r"\+\s*\|", line, 1)
                 name = parts[0].strip()
                 query = parts[1].strip()
                 if not name or not query:
-                    print("  Usage: <element> + | <query>")
+                    print("  Usage: <element> +| <query>")
                 else:
-                    target = _resolve_element(storage, name)
-                    others = _match_elements(storage, query)
-                    if not others:
-                        print(f"  No elements match: {query}")
-                    else:
-                        pairs = [(target, o) for o in others if o.name != target.name]
-                        print(f"  Combining {_color(str(target), BOLD)} with {len(pairs)} elements matching {_color(query, YELLOW)}...")
-                        await _confirm_and_run_pairs(client, storage, pairs)
+                    await do_with(client, storage, name, query)
             elif " * " in line:
                 # query * query
                 parts = line.split(" * ", 1)
@@ -993,8 +1198,8 @@ async def interactive_mode():
                     print("  Usage: <query> * <query>")
                 else:
                     await do_cross(client, storage, left_q, right_q)
-            elif "+" in line:
-                parts = line.split("+", 1)
+            elif " + " in line:
+                parts = line.split(" + ", 1)
                 first = parts[0].strip()
                 second = parts[1].strip()
                 if not first or not second:
@@ -1045,6 +1250,8 @@ async def noninteractive_mode(args):
                 await do_permute(client, storage, args.query)
             elif args.command == "cross":
                 await do_cross(client, storage, args.left, args.right)
+            elif args.command == "with":
+                await do_with(client, storage, args.element, args.query)
 
 
 # ---------------------------------------------------------------------------
@@ -1060,7 +1267,7 @@ def main():
     combine_p.add_argument("second", help="Second element name")
 
     search_p = subparsers.add_parser("search", help="Search discovered elements")
-    search_p.add_argument("query", help="Search substring")
+    search_p.add_argument("query", help=_QUERY_HELP)
 
     subparsers.add_parser("list", help="List all discovered elements")
 
@@ -1088,11 +1295,15 @@ def main():
     crawl_p.add_argument("second", help="Second element name")
 
     permute_p = subparsers.add_parser("permute", help="Combine all matching elements with each other")
-    permute_p.add_argument("query", help="Search query")
+    permute_p.add_argument("query", help=_QUERY_HELP)
 
     cross_p = subparsers.add_parser("cross", help="Cross-combine matches from two queries")
-    cross_p.add_argument("left", help="Left search query")
-    cross_p.add_argument("right", help="Right search query")
+    cross_p.add_argument("left", help=_QUERY_HELP)
+    cross_p.add_argument("right", help=_QUERY_HELP)
+
+    with_p = subparsers.add_parser("with", help="Combine element with all matching discoveries")
+    with_p.add_argument("element", help="Element name")
+    with_p.add_argument("query", help=_QUERY_HELP)
 
     args = parser.parse_args()
 

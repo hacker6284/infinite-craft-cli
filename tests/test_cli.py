@@ -61,6 +61,15 @@ class TestArgParsing:
                 main()
         assert exc_info.value.code == 0
 
+    def test_with_args(self):
+        from infinite_craft_cli.cli import main
+        with patch("sys.argv", ["infinite-craft", "with", "Water", "/^fi/"]):
+            with patch("asyncio.run") as mock_run:
+                with patch("infinite_craft_cli.cli.interactive_mode"):
+                    with patch("infinite_craft_cli.cli.noninteractive_mode"):
+                        main()
+        mock_run.assert_called_once()
+
 
 class TestNonInteractiveMode:
     def test_combine_command(self, capsys):
@@ -121,3 +130,67 @@ class TestNonInteractiveMode:
                 run_async(noninteractive_mode(args))
         captured = capsys.readouterr()
         assert "4 elements" in captured.out
+
+    def test_with_command(self, capsys):
+        from infinite_craft_cli.cli import noninteractive_mode
+        args = MagicMock()
+        args.command = "with"
+        args.element = "Water"
+        args.query = "/^fi/"
+        client = make_mock_client()
+        storage = make_mock_storage([
+            MockElement("Water", "💧"),
+            MockElement("Fire", "🔥"),
+            MockElement("Firewall", "🧱"),
+        ])
+        nothing = MagicMock()
+        nothing.name = None
+        client.pair.return_value = nothing
+
+        mock_client_cls = MagicMock()
+        mock_client_ctx = AsyncMock()
+        mock_client_ctx.__aenter__.return_value = client
+        mock_client_ctx.__aexit__.return_value = False
+        mock_client_cls.return_value = mock_client_ctx
+
+        mock_storage_cls = MagicMock()
+        mock_storage_cls.return_value = storage
+
+        with patch("infinite_craft_cli.cli.InfiniteCraftClient", mock_client_cls):
+            with patch("infinite_craft_cli.cli.DiscoveryStorage", mock_storage_cls):
+                with patch("sys.stdout.isatty", return_value=False):
+                    run_async(noninteractive_mode(args))
+        captured = capsys.readouterr()
+        assert "Combining" in captured.out
+
+    def test_cross_command(self, capsys):
+        from infinite_craft_cli.cli import noninteractive_mode
+        args = MagicMock()
+        args.command = "cross"
+        args.left = "/^fi/"
+        args.right = "/^wa/"
+        client = make_mock_client()
+        storage = make_mock_storage([
+            MockElement("Water", "💧"),
+            MockElement("Fire", "🔥"),
+            MockElement("Firewall", "🧱"),
+        ])
+        nothing = MagicMock()
+        nothing.name = None
+        client.pair.return_value = nothing
+
+        mock_client_cls = MagicMock()
+        mock_client_ctx = AsyncMock()
+        mock_client_ctx.__aenter__.return_value = client
+        mock_client_ctx.__aexit__.return_value = False
+        mock_client_cls.return_value = mock_client_ctx
+
+        mock_storage_cls = MagicMock()
+        mock_storage_cls.return_value = storage
+
+        with patch("infinite_craft_cli.cli.InfiniteCraftClient", mock_client_cls):
+            with patch("infinite_craft_cli.cli.DiscoveryStorage", mock_storage_cls):
+                with patch("sys.stdout.isatty", return_value=False):
+                    run_async(noninteractive_mode(args))
+        captured = capsys.readouterr()
+        assert "unique pairs" in captured.out

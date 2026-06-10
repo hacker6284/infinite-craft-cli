@@ -94,8 +94,9 @@ class TestConfirmAndRunPairs:
         storage = make_mock_storage()
         pairs = [(MockElement(f"A{i}"), MockElement(f"B{i}"))
                  for i in range(_BULK_WARN_THRESHOLD + 1)]
-        with patch("builtins.input", return_value="n"):
-            run_async(_confirm_and_run_pairs(client, storage, pairs))
+        with patch("sys.stdin.isatty", return_value=True):
+            with patch("builtins.input", return_value="n"):
+                run_async(_confirm_and_run_pairs(client, storage, pairs))
         captured = capsys.readouterr()
         assert "Warning" in captured.out
         assert "Cancelled" in captured.out
@@ -109,8 +110,9 @@ class TestConfirmAndRunPairs:
         client.pair.return_value = nothing
         pairs = [(MockElement(f"A{i}"), MockElement(f"B{i}"))
                  for i in range(_BULK_WARN_THRESHOLD + 1)]
-        with patch("builtins.input", return_value="y"):
-            run_async(_confirm_and_run_pairs(client, storage, pairs))
+        with patch("sys.stdin.isatty", return_value=True):
+            with patch("builtins.input", return_value="y"):
+                run_async(_confirm_and_run_pairs(client, storage, pairs))
         captured = capsys.readouterr()
         assert "Done" in captured.out
 
@@ -120,10 +122,29 @@ class TestConfirmAndRunPairs:
         storage = make_mock_storage()
         pairs = [(MockElement(f"A{i}"), MockElement(f"B{i}"))
                  for i in range(_BULK_WARN_THRESHOLD + 1)]
-        with patch("builtins.input", side_effect=EOFError):
-            run_async(_confirm_and_run_pairs(client, storage, pairs))
+        with patch("sys.stdin.isatty", return_value=True):
+            with patch("builtins.input", side_effect=EOFError):
+                run_async(_confirm_and_run_pairs(client, storage, pairs))
         captured = capsys.readouterr()
         assert "Cancelled" in captured.out
+
+    def test_non_tty_skips_confirmation(self, capsys):
+        from infinite_craft_cli.cli import _confirm_and_run_pairs, _BULK_WARN_THRESHOLD
+        client = make_mock_client()
+        storage = make_mock_storage()
+        nothing = MagicMock()
+        nothing.name = None
+        client.pair.return_value = nothing
+        pairs = [(MockElement(f"A{i}"), MockElement(f"B{i}"))
+                 for i in range(_BULK_WARN_THRESHOLD + 1)]
+        with patch("sys.stdin.isatty", return_value=False):
+            with patch("builtins.input") as mock_input:
+                run_async(_confirm_and_run_pairs(client, storage, pairs))
+        captured = capsys.readouterr()
+        mock_input.assert_not_called()
+        assert "Warning" in captured.out
+        assert "Done" in captured.out
+        assert "Cancelled" not in captured.out
 
 
 class TestDoPermute:
@@ -161,7 +182,81 @@ class TestDoPermute:
         assert "3 unique pairs" in captured.out
 
 
+class TestDoWith:
+    def test_no_matches(self, capsys):
+        from infinite_craft_cli.cli import do_with
+        client = make_mock_client()
+        storage = make_mock_storage()
+        run_async(do_with(client, storage, "Water", "zzz"))
+        captured = capsys.readouterr()
+        assert "No elements match: zzz" in captured.out
+
+    def test_self_only_match(self, capsys):
+        from infinite_craft_cli.cli import do_with
+        client = make_mock_client()
+        storage = make_mock_storage([MockElement("Water", "💧")])
+        run_async(do_with(client, storage, "Water", "water"))
+        captured = capsys.readouterr()
+        assert "No other elements match" in captured.out
+
+    def test_regex_query(self, capsys):
+        from infinite_craft_cli.cli import do_with
+        client = make_mock_client()
+        storage = make_mock_storage([
+            MockElement("Water", "💧"),
+            MockElement("Fire", "🔥"),
+            MockElement("Firewall", "🧱"),
+        ])
+        nothing = MagicMock()
+        nothing.name = None
+        client.pair.return_value = nothing
+        run_async(do_with(client, storage, "Water", "/^fi/"))
+        captured = capsys.readouterr()
+        assert "Combining" in captured.out
+        assert "2 elements" in captured.out
+
+    def test_first_discovery_filter(self, capsys):
+        from infinite_craft_cli.cli import do_with
+        client = make_mock_client()
+        storage = make_mock_storage([
+            MockElement("Water", "💧"),
+            MockElement("Firewall", "🧱", is_first_discovery=True),
+            MockElement("Fire", "🔥"),
+        ])
+        nothing = MagicMock()
+        nothing.name = None
+        client.pair.return_value = nothing
+        run_async(do_with(client, storage, "Water", "!fire*"))
+        captured = capsys.readouterr()
+        assert "Combining" in captured.out
+        assert "1 elements" in captured.out
+
+    def test_invalid_regex(self, capsys):
+        from infinite_craft_cli.cli import do_with
+        client = make_mock_client()
+        storage = make_mock_storage()
+        run_async(do_with(client, storage, "Water", "/[invalid/"))
+        captured = capsys.readouterr()
+        assert "Invalid regex pattern" in captured.out
+
+
 class TestDoCross:
+    def test_invalid_regex(self, capsys):
+        from infinite_craft_cli.cli import do_cross
+        client = make_mock_client()
+        storage = make_mock_storage()
+        run_async(do_cross(client, storage, "/[invalid/", "water"))
+        captured = capsys.readouterr()
+        assert "Invalid regex pattern" in captured.out
+
+    def test_complex_regex(self, capsys):
+        from infinite_craft_cli.cli import do_cross, REGEX_ERROR_COMPLEX
+        client = make_mock_client()
+        storage = make_mock_storage()
+        run_async(do_cross(client, storage, "/(a|aa)+/", "water"))
+        captured = capsys.readouterr()
+        assert REGEX_ERROR_COMPLEX in captured.out
+
     def test_left_no_matches(self, capsys):
         from infinite_craft_cli.cli import do_cross
         client = make_mock_client()
@@ -220,12 +315,9 @@ class TestDoExhaust:
         from infinite_craft_cli.cli import do_exhaust
         client = make_mock_client()
         storage = make_mock_storage([MockElement("Water", "💧")])
-        nothing = MagicMock()
-        nothing.name = None
-        client.pair.return_value = nothing
         run_async(do_exhaust(client, storage, "Water"))
         captured = capsys.readouterr()
-        assert "0 elements" in captured.out
+        assert "No other elements" in captured.out
 
 
 class TestDoCrawl:

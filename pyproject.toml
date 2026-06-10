@@ -18,6 +18,7 @@ classifiers = [
 ]
 dependencies = [
     "curl-cffi>=0.15",
+    "regex>=2024.0.0",
 ]
 
 [project.urls]

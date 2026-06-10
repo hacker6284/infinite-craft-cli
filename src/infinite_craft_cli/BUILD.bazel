@@ -7,5 +7,6 @@ py_library(
     visibility = ["//visibility:public"],
     deps = [
         "@pip//curl_cffi",
+        "@pip//regex",
     ],
 )

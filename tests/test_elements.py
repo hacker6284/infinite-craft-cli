@@ -49,14 +49,14 @@ class TestResolveElement:
 class TestMatchElements:
     def test_substring_match(self, mock_storage_with_extras):
         from infinite_craft_cli.cli import _match_elements
-        matches = _match_elements(mock_storage_with_extras, "water")
+        matches, _ = _match_elements(mock_storage_with_extras, "water")
         names = [e.name for e in matches]
         assert "Water" in names
         assert "Waterfall" in names
 
     def test_wildcard_match(self, mock_storage_with_extras):
         from infinite_craft_cli.cli import _match_elements
-        matches = _match_elements(mock_storage_with_extras, "fire*")
+        matches, _ = _match_elements(mock_storage_with_extras, "fire*")
         names = [e.name for e in matches]
         assert "Fire" in names
         assert "Firewall" in names
@@ -64,36 +64,148 @@ class TestMatchElements:
 
     def test_question_mark_wildcard(self, mock_storage_with_extras):
         from infinite_craft_cli.cli import _match_elements
-        matches = _match_elements(mock_storage_with_extras, "mu?")
+        matches, _ = _match_elements(mock_storage_with_extras, "mu?")
         names = [e.name for e in matches]
         assert "Mud" in names
 
     def test_first_discovery_filter(self, mock_storage_with_extras):
         from infinite_craft_cli.cli import _match_elements
-        matches = _match_elements(mock_storage_with_extras, "^*")
+        matches, _ = _match_elements(mock_storage_with_extras, "!*")
         assert all(e.is_first_discovery for e in matches)
         names = [e.name for e in matches]
         assert "Waterfall" in names
         assert "Firewall" in names
         assert "Water" not in names
 
+    def test_first_discovery_legacy_caret(self, mock_storage_with_extras):
+        from infinite_craft_cli.cli import _match_elements
+        matches, _ = _match_elements(mock_storage_with_extras, "^fire*")
+        assert all(e.is_first_discovery for e in matches)
+        names = [e.name for e in matches]
+        assert "Firewall" in names
+        assert "Fire" not in names
+
+    def test_regex_match(self, mock_storage_with_extras):
+        from infinite_craft_cli.cli import _match_elements
+        matches, _ = _match_elements(mock_storage_with_extras, "/^fi/")
+        names = [e.name for e in matches]
+        assert "Fire" in names
+        assert "Firewall" in names
+        assert "Water" not in names
+
+    def test_regex_first_discovery(self, mock_storage_with_extras):
+        from infinite_craft_cli.cli import _match_elements
+        matches, _ = _match_elements(mock_storage_with_extras, "!/wall/")
+        names = [e.name for e in matches]
+        assert names == ["Firewall"]
+
+    def test_invalid_regex_returns_error(self, mock_storage_with_extras):
+        from infinite_craft_cli.cli import _match_elements
+        matches, err = _match_elements(mock_storage_with_extras, "/[invalid/")
+        assert matches == []
+        assert err == "Invalid regex pattern"
+
+    def test_empty_regex_no_match(self, mock_storage_with_extras):
+        from infinite_craft_cli.cli import _match_elements
+        matches, err = _match_elements(mock_storage_with_extras, "//")
+        assert matches == []
+        assert err is None
+
+    def test_empty_query_after_prefix_no_match(self, mock_storage_with_extras):
+        from infinite_craft_cli.cli import _match_elements
+        for query in ("!", "^", "!  ", "^  "):
+            matches, err = _match_elements(mock_storage_with_extras, query)
+            assert matches == []
+            assert err is None
+
+    def test_query_too_long(self, mock_storage_with_extras):
+        from infinite_craft_cli.cli import _match_elements, MAX_QUERY_LENGTH
+        matches, err = _match_elements(mock_storage_with_extras, "x" * (MAX_QUERY_LENGTH + 1))
+        assert matches == []
+        assert "too long" in err
+
+    def test_unsafe_nested_quantifier_regex(self, mock_storage_with_extras):
+        from infinite_craft_cli.cli import _match_elements, REGEX_ERROR_COMPLEX
+        matches, err = _match_elements(mock_storage_with_extras, "/(a+)+/")
+        assert matches == []
+        assert err == REGEX_ERROR_COMPLEX
+
+    def test_unsafe_alternation_quantifier_regex(self, mock_storage_with_extras):
+        from infinite_craft_cli.cli import _match_elements, REGEX_ERROR_COMPLEX
+        matches, err = _match_elements(mock_storage_with_extras, "/(a|aa)+/")
+        assert matches == []
+        assert err == REGEX_ERROR_COMPLEX
+
+    def test_nested_paren_alternation_regex_rejected(self, mock_storage_with_extras):
+        from infinite_craft_cli.cli import _match_elements, REGEX_ERROR_COMPLEX
+        matches, err = _match_elements(mock_storage_with_extras, "/(a|(?:aa))+b/")
+        assert matches == []
+        assert err == REGEX_ERROR_COMPLEX
+
     def test_no_matches(self, mock_storage_with_extras):
         from infinite_craft_cli.cli import _match_elements
-        matches = _match_elements(mock_storage_with_extras, "zzzznothing")
+        matches, _ = _match_elements(mock_storage_with_extras, "zzzznothing")
         assert matches == []
 
     def test_case_insensitive(self, mock_storage_with_extras):
         from infinite_craft_cli.cli import _match_elements
-        matches = _match_elements(mock_storage_with_extras, "WATER")
+        matches, _ = _match_elements(mock_storage_with_extras, "WATER")
         names = [e.name for e in matches]
         assert "Water" in names
 
     def test_bracket_pattern(self, mock_storage_with_extras):
         from infinite_craft_cli.cli import _match_elements
-        matches = _match_elements(mock_storage_with_extras, "[md]u*")
+        matches, _ = _match_elements(mock_storage_with_extras, "[md]u*")
         names = [e.name for e in matches]
         assert "Mud" in names
         assert "Dust" in names
+
+
+class TestParseHelpers:
+    def test_parse_two_elements_spaced_plus(self):
+        from infinite_craft_cli.cli import _parse_two_elements
+        assert _parse_two_elements("Water + Fire") == ("Water", "Fire")
+
+    def test_parse_two_elements_element_with_plus(self):
+        from infinite_craft_cli.cli import _parse_two_elements
+        assert _parse_two_elements("Water + C++") == ("Water", "C++")
+
+    def test_parse_two_elements_space_syntax(self):
+        from infinite_craft_cli.cli import _parse_two_elements
+        assert _parse_two_elements("Water Fire") == ("Water", "Fire")
+
+    def test_parse_cross_queries_star_delimiter(self):
+        from infinite_craft_cli.cli import _parse_cross_queries
+        assert _parse_cross_queries("fire* * water*") == ("fire*", "water*")
+
+    def test_parse_cross_queries_space_fallback(self):
+        from infinite_craft_cli.cli import _parse_cross_queries
+        assert _parse_cross_queries("fire water") == ("fire", "water")
+
+    def test_parse_cross_queries_slash_substring_allowed(self):
+        from infinite_craft_cli.cli import _parse_cross_queries
+        assert _parse_cross_queries("fire/water steam") == ("fire/water", "steam")
+
+    def test_parse_cross_queries_regex_requires_star(self):
+        from infinite_craft_cli.cli import _parse_cross_queries
+        assert _parse_cross_queries("/a b/ /c d/") is None
+
+    def test_parse_two_elements_no_bare_plus(self):
+        from infinite_craft_cli.cli import _parse_two_elements
+        assert _parse_two_elements("C+++Fire") is None
+        assert _parse_two_elements("C++ + Fire") == ("C++", "Fire")
+        assert _parse_two_elements("C++ Fire") == ("C++", "Fire")
+
+    def test_parse_with_args(self):
+        from infinite_craft_cli.cli import _parse_with_args
+        assert _parse_with_args("Water fire*") == ("Water", "fire*")
+
+    def test_slash_args_exact_and_spaced(self):
+        from infinite_craft_cli.cli import _slash_args
+        assert _slash_args("/with", "/with") == ""
+        assert _slash_args("/with Water fire*", "/with") == "Water fire*"
+        assert _slash_args("/without", "/with") is None
+        assert _slash_args("/crossing", "/cross") is None
 
 
 class TestDoSearch:
@@ -101,6 +213,18 @@ class TestDoSearch:
         from infinite_craft_cli.cli import do_search
         result = do_search(mock_storage, "zzz")
         assert "No matches found" in result
+
+    def test_invalid_regex_message(self, mock_storage):
+        from infinite_craft_cli.cli import do_search
+        result = do_search(mock_storage, "/[invalid/")
+        assert "Invalid regex pattern" in result
+        assert "No matches found" not in result
+
+    def test_complex_regex_message(self, mock_storage):
+        from infinite_craft_cli.cli import do_search, REGEX_ERROR_COMPLEX
+        result = do_search(mock_storage, "/(a|aa)+/")
+        assert REGEX_ERROR_COMPLEX in result
+        assert "Invalid regex pattern" not in result
 
     def test_single_match(self, mock_storage):
         from infinite_craft_cli.cli import do_search

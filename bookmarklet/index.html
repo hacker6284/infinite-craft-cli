@@ -108,19 +108,33 @@ function switchTab(name) {
 <div class="card">
   <h2>Commands</h2>
   <div class="commands">
-    <span class="cmd">element + element</span> <span class="desc">— Combine two elements</span><br>
-    <span class="cmd">element ++ element</span> <span class="desc">— Combine &amp; crawl iteratively</span><br>
-    <span class="cmd">element + | query</span> <span class="desc">— Combine with all matching elements</span><br>
-    <span class="cmd">query * query</span> <span class="desc">— Cross-combine two sets of matches</span><br>
-    <span class="cmd">/search query</span> <span class="desc">— Search discoveries (* ? wildcards, ^ for first discoveries)</span><br>
-    <span class="cmd">/recipe element</span> <span class="desc">— Show shortest recipe from base elements</span><br>
+    <strong>Combine</strong><br>
+    <span class="cmd">&lt;element&gt; + &lt;element&gt;</span> <span class="desc">— Combine two elements</span><br>
+    <span class="cmd">/combine &lt;el&gt; + &lt;el&gt;</span> <span class="desc">— Same (also: /combine &lt;el&gt; &lt;el&gt;)</span><br>
+    <br>
+    <strong>Crawl</strong><br>
+    <span class="cmd">&lt;element&gt; ++ &lt;element&gt;</span> <span class="desc">— Combine &amp; crawl until no new discoveries</span><br>
+    <span class="cmd">/crawl &lt;el&gt; + &lt;el&gt;</span> <span class="desc">— Same as ++ (also: /crawl &lt;el&gt; &lt;el&gt;)</span><br>
+    <br>
+    <strong>Bulk combine</strong><br>
+    <span class="cmd">&lt;element&gt; +| &lt;query&gt;</span> <span class="desc">— Combine with all matching discoveries</span><br>
+    <span class="cmd">&lt;element&gt; + | &lt;query&gt;</span> <span class="desc">— Same as +| (spaced variant)</span><br>
+    <span class="cmd">/with &lt;element&gt; &lt;query&gt;</span> <span class="desc">— Same as +|</span><br>
+    <span class="cmd">&lt;query&gt; * &lt;query&gt;</span> <span class="desc">— Cross-combine matches from both queries</span><br>
+    <span class="cmd">/cross &lt;query&gt; * &lt;query&gt;</span> <span class="desc">— Same as * (also: /cross &lt;q&gt; &lt;q&gt;)</span><br>
+    <span class="cmd">/permute &lt;query&gt;</span> <span class="desc">— Combine all matching elements with each other</span><br>
+    <span class="cmd">/exhaust &lt;element&gt;</span> <span class="desc">— Combine element with all discoveries</span><br>
+    <br>
+    <strong>Query syntax</strong> (<span class="cmd">/search</span>, <span class="cmd">/with</span>, <span class="cmd">/permute</span>, <span class="cmd">/cross</span>, shorthands) — substring (default), <span class="cmd">* ? []</span> wildcards, <span class="cmd">/pattern/</span> regex, <span class="cmd">!query</span> or <span class="cmd">^query</span> for first discoveries<br>
+    <br>
+    <strong>Discoveries &amp; recipes</strong><br>
+    <span class="cmd">/search &lt;query&gt;</span> <span class="desc">— Search discoveries</span><br>
+    <span class="cmd">/recipe &lt;element&gt;</span> <span class="desc">— Show shortest recipe from base elements</span><br>
     <span class="cmd">/list</span> <span class="desc">— List all discovered elements</span><br>
-    <span class="cmd">/exhaust element</span> <span class="desc">— Combine element with everything</span><br>
-    <span class="cmd">/crawl el + el</span> <span class="desc">— Same as ++ (alternate syntax)</span><br>
-    <span class="cmd">/permute query</span> <span class="desc">— Combine all matching elements with each other</span><br>
-    <span class="cmd">/import element</span> <span class="desc">— Import recipe from Infinibrowser</span><br>
+    <span class="cmd">/import &lt;element|file.ic&gt;</span> <span class="desc">— Import from Infinibrowser or .ic save file</span><br>
     <span class="cmd">/fill</span> <span class="desc">— Fetch missing recipes from Infinibrowser</span><br>
     <span class="cmd">/unfilled</span> <span class="desc">— List elements without recipes</span><br>
+    <span class="cmd">/prune</span> <span class="desc">— Remove orphan elements Infinibrowser can't fill</span><br>
     <span class="cmd">/export</span> <span class="desc">— Download discoveries as .ic file</span><br>
     <span class="cmd">/history</span> <span class="desc">— Show combinations this session</span><br>
     <span class="cmd">/clear</span> <span class="desc">— Clear the terminal</span><br>
