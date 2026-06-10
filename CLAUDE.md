@@ -2,10 +2,14 @@
 
 ## Release Process
 
-When completing a new feature, bug fix, or any change that should be released:
+**`main` is release-only.** Do not push to `main` until the change is ready to ship. There is no `[Unreleased]` staging section in `CHANGELOG.md` — every merge to `main` is a versioned release.
 
-1. **Determine the new version** — check the latest tag with `git describe --tags --abbrev=0`, then bump following semver (patch for fixes, minor for features, major for breaking changes)
-2. **Update `CHANGELOG.md`** — add a new `## [X.Y.Z] - YYYY-MM-DD` section at the top with the changes
-3. **Tag the commit** — after committing, create a git tag: `git tag vX.Y.Z`
+When landing a change on `main`:
 
-The version in `pyproject.toml` is derived automatically from git tags via `hatch-vcs` — do not set it manually. The GitHub Actions workflow (`.github/workflows/publish.yml`) uses the tag to trigger a PyPI publish and creates a GitHub Release with notes extracted from `CHANGELOG.md`.
+1. **Determine the new version** — `git describe --tags --abbrev=0`, then bump semver (patch for fixes, minor for features, major for breaking changes)
+2. **Update `CHANGELOG.md`** — add `## [X.Y.Z] - YYYY-MM-DD` at the top with the changes (never `[Unreleased]`)
+3. **Commit, tag, and push** — `git tag vX.Y.Z`, then push `main` and the tag: `git push origin main && git push origin vX.Y.Z`
+
+Work-in-progress stays on branches or worktrees until steps 1–3 are done.
+
+The version in `pyproject.toml` is derived automatically from git tags via `hatch-vcs` — do not set it manually. The GitHub Actions workflow (`.github/workflows/publish.yml`) runs on `v*` tag pushes to publish PyPI and create a GitHub Release from the matching `CHANGELOG.md` section.

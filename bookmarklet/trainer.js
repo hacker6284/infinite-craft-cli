@@ -69,7 +69,23 @@
   document.getElementById("ict-header").addEventListener("click", () => {
     toggle.click();
   });
-  stopBtn.addEventListener("click", () => { cancelled = true; });
+  stopBtn.addEventListener("click", () => {
+    cancelled = true;
+    waitingForConfirm = false;
+    endRun();
+  });
+
+  function endRun() {
+    running = false;
+    try { stopBtn.style.display = "none"; } catch {}
+  }
+
+  function beginRun() {
+    cancelled = false;
+    running = true;
+    try { stopBtn.style.display = "inline"; } catch {}
+  }
+
   input.focus();
 
   // ── Output helpers ───────────────────────────────────────────────────
@@ -366,12 +382,10 @@
 
   // ── Bulk pair processor ──────────────────────────────────────────────
   async function runPairs(pairs) {
-    cancelled = false;
-    running = true;
-    stopBtn.style.display = "inline";
     let done = 0, newCount = 0, nothingCount = 0, errors = 0;
     const total = pairs.length;
     try {
+      beginRun();
       for (const [a, b] of pairs) {
         if (cancelled) { print("  " + yellow("Cancelled.")); break; }
         try {
@@ -397,37 +411,49 @@
         await new Promise(r => setTimeout(r, 0));
       }
     } finally {
-      stopBtn.style.display = "none";
-      running = false;
+      endRun();
     }
     print(`  Done: ${green(String(newCount))} new, ${dim(String(nothingCount))} nothing, ${errors ? red(String(errors)) + " errors" : "0 errors"} (${done}/${total})`);
   }
 
   async function confirmAndRunPairs(pairs) {
     if (pairs.length > BULK_WARN) {
-      print(`  ${yellow(`${pairs.length} pairs`)} — type ${bold("yes")} to continue, anything else to cancel.`);
-      const answer = await waitForInput();
-      if (answer.toLowerCase() !== "yes") { print("  Cancelled."); return; }
+      try {
+        beginRun();
+        print(`  ${yellow(`${pairs.length} pairs`)} — type ${bold("yes")} to continue, anything else to cancel.`);
+        const answer = await waitForInput();
+        if (answer.toLowerCase() !== "yes") { print("  Cancelled."); return; }
+      } finally {
+        endRun();
+      }
     }
     print(`  Running ${bold(String(pairs.length))} combinations...`);
     await runPairs(pairs);
   }
 
   function waitForInput() {
-    waitingForConfirm = true;
     return new Promise((resolve) => {
+      waitingForConfirm = true;
+      function cleanup() {
+        waitingForConfirm = false;
+        try { input.removeEventListener("keydown", handler, true); } catch {}
+      }
       function handler(e) {
         if (e.key === "Enter") {
           e.stopImmediatePropagation();
-          input.removeEventListener("keydown", handler);
           const val = input.value.trim();
           input.value = "";
-          waitingForConfirm = false;
+          cleanup();
           resolve(val);
         }
       }
-      // Use capture to get this before the main handler
-      input.addEventListener("keydown", handler, true);
+      try {
+        // Use capture to get this before the main handler
+        input.addEventListener("keydown", handler, true);
+      } catch (err) {
+        cleanup();
+        throw err;
+      }
     });
   }
 
@@ -521,12 +547,10 @@
   async function doCrawl(aName, bName) {
     const a = resolveElement(aName);
     const b = resolveElement(bName);
-    cancelled = false;
-    running = true;
-    stopBtn.style.display = "inline";
     print(`  Crawling from ${formatElement(a)} + ${formatElement(b)}...`);
 
     try {
+      beginRun();
       // Initial combine
       let pool = new Set();
       const tried = new Set();
@@ -584,8 +608,7 @@
       if (cancelled) print("  " + yellow("Crawl cancelled."));
       print(`  Pool size: ${bold(String(pool.size))} elements.`);
     } finally {
-      stopBtn.style.display = "none";
-      running = false;
+      endRun();
     }
   }
 
@@ -743,11 +766,9 @@
     const missing = elements.filter(e => !BASE_ELEMENTS.has(e.text) && (!recipeIndex[e.text] || !recipeIndex[e.text].length));
     if (!missing.length) { print("  All elements have recipes."); return; }
     print(`  ${yellow(String(missing.length))} elements missing recipes. Fetching from Infinibrowser...`);
-    cancelled = false;
-    running = true;
-    stopBtn.style.display = "inline";
     let filled = 0, errors = 0;
     try {
+      beginRun();
       for (let i = 0; i < missing.length; i++) {
         if (cancelled) { print("  " + yellow("Fill cancelled.")); break; }
         const el = missing[i];
@@ -769,8 +790,7 @@
       }
     } finally {
       rebuildRecipeIndex();
-      stopBtn.style.display = "none";
-      running = false;
+      endRun();
     }
     print(`  Done: ${green(String(filled))} filled, ${errors ? red(String(errors)) + " failed" : "0 failed"} (${missing.length} total).`);
   }
@@ -827,11 +847,9 @@
     const candidates = findOrphanCandidates();
     if (!candidates.length) { print("  Nothing to prune."); return; }
     print(`  ${yellow(String(candidates.length))} orphan element${candidates.length === 1 ? "" : "s"} to check on Infinibrowser...`);
-    cancelled = false;
-    running = true;
-    stopBtn.style.display = "inline";
     let pruned = 0, kept = 0, skipped = 0;
     try {
+      beginRun();
       for (let i = 0; i < candidates.length; i++) {
         if (cancelled) { print("  " + yellow("Prune cancelled.")); break; }
         const el = candidates[i];
@@ -852,8 +870,7 @@
     } finally {
       rebuildIndexes();
       rebuildRecipeIndex();
-      stopBtn.style.display = "none";
-      running = false;
+      endRun();
     }
     print(`  Done: ${green(String(pruned))} pruned, ${kept} fillable on Infinibrowser (kept), ${skipped ? yellow(String(skipped)) + " skipped (API errors)" : "0 skipped"}.`);
   }
@@ -913,7 +930,10 @@
 
   // ── Command dispatcher ───────────────────────────────────────────────
   async function dispatch(line) {
-    if (running) return;
+    if (running || waitingForConfirm) {
+      print("  " + yellow("Busy — wait for current operation to finish."));
+      return;
+    }
 
     if (line.startsWith("/")) {
       const spaceIdx = line.indexOf(" ");
@@ -985,8 +1005,7 @@
       print(cyan("craft&gt;") + " " + esc(line));
       dispatch(line).catch((err) => {
         // Last-ditch recovery: an uncaught error in a command must not leave the UI wedged.
-        try { stopBtn.style.display = "none"; } catch {}
-        running = false;
+        endRun();
         waitingForConfirm = false;
         print("  " + red("Error: " + (err && err.message || String(err))));
       });

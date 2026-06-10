@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.2.9] - 2026-06-07
+
+### Fixed
+- Browser trainers no longer wedge after long `/exhaust`, `/crawl`, `/cross`, `/fill`, `/prune`, or other bulk commands when `running` fails to reset, the stop button is used, or confirmation is abandoned. Centralized `beginRun()`/`endRun()` helpers guarantee `running=false` before UI cleanup; stop now clears `waitingForConfirm`; `dispatch()` shows a busy message instead of silently ignoring input; bulk confirm sets `running` before `waitForInput` to block double-dispatch. (bookmarklet/trainer.js + extension/trainer.js)
+
 ## [1.2.8] - 2026-06-07
 
 ### Added
