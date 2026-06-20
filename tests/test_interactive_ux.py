@@ -4118,3 +4118,49 @@ class TestREPLHarnessEdges:
         # rfind usage for order
         assert out.rfind("Goodbye") > out.rfind("queue") or "queue" not in out.lower()
 
+    def test_long_emoji_first_in_result_plus_queue_or_list_via_harness(self, repl_harness, capsys):
+        """Drive case with long/emoji/FIRST element in result + queue (or /list during running).
+        Assert only with allowed style: formatted phrases w/ emoji or [FIRST] or tag appear in out;
+        no corruption of prompt; relative order + "craft>" last prompt + Goodbye; use `in` / `rfind`.
+        """
+        from tests.conftest import MockElement
+        from unittest.mock import AsyncMock
+
+        long_name = "SuperLongEmojiFirstDiscoveryElementNameForTUIFormattingAndTruncTest98765"
+        elems = [
+            MockElement("Water", "💧"),
+            MockElement("Fire", "🔥"),
+            MockElement(long_name, "🦄", is_first_discovery=True),
+        ]
+        storage = repl_harness.set_storage_elems(elems)
+        mock_client = repl_harness.set_mock_client()
+        # Return a FIRST long+emoji result so the combine result line exercises format_element
+        result_elem = MockElement(long_name, "🦄", is_first_discovery=True)
+        mock_client.pair = AsyncMock(return_value=result_elem)
+
+        # /combine enqueues (exercises queue running/pending panel); /list during seq
+        repl_harness.feed("/combine Water Fire")
+        repl_harness.feed("/list")
+        repl_harness.feed("/quit")
+        run_async(repl_harness.run_until_quit(auto_feed_quit=False, storage=storage, client=mock_client))
+
+        out = capsys.readouterr().out
+
+        # formatted phrases with emoji or [FIRST] or tag appear in out (from result + list)
+        assert "🦄" in out
+        assert long_name in out
+        assert "[FIRST DISCOVERY!]" in out
+
+        # no corruption of prompt (via harness record)
+        assert repl_harness.prompt_calls
+        last_p, _ = repl_harness.prompt_calls[-1]
+        assert "craft>" in last_p.lower()
+
+        # relative order + "craft>" last prompt + Goodbye; use in / rfind (non-brittle)
+        assert "Goodbye" in out
+        assert (
+            out.find(long_name) < out.rfind("Goodbye")
+            or out.find("🦄") < out.rfind("Goodbye")
+            or out.find("[FIRST DISCOVERY!]") < out.rfind("Goodbye")
+        )
+
