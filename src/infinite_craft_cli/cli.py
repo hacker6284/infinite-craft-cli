@@ -1179,7 +1179,7 @@ def _repl_print(*args, **kwargs):
         sys.stdout.write(RESET)  # close attrs if truncated mid-span (long name/emoji/FIRST)
         sys.stdout.flush()
 
-        _chrome_draw(partial=partial)
+        _chrome_draw(partial=partial, force=True)
 
 
 def _repl_print_lines(text: str) -> None:

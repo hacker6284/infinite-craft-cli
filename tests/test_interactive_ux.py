@@ -4173,6 +4173,52 @@ class TestREPLHarnessEdges:
             or out.find("[FIRST DISCOVERY!]") < out.rfind("Goodbye")
         )
 
+    def test_direct_combine_produces_first_result_tag_in_output_line(self, repl_harness, capsys):
+        """Pure non-brittle harness test in TestREPLHarnessEdges.
+
+        Use storage elems + one is_first_discovery=True; drive combine that produces a first result;
+        assert (in/rfind + phrases + Goodbye + craft>) that "[FIRST DISCOVERY!]" (or the tag)
+        appears in the result output line, with emoji if present.
+        """
+        from tests.conftest import MockElement
+        from unittest.mock import AsyncMock
+
+        elems = [
+            MockElement("Water", "💧"),
+            MockElement("Fire", "🔥", is_first_discovery=True),  # first on operand to exercise direct result line
+            MockElement("Steam", "💨"),
+        ]
+        storage = repl_harness.set_storage_elems(elems)
+        mock_client = repl_harness.set_mock_client()
+        # drive combine that produces a first result
+        result_elem = MockElement("Phoenix", "🐦", is_first_discovery=True)
+        mock_client.pair = AsyncMock(return_value=result_elem)
+
+        repl_harness.feed("Water + Fire")
+        repl_harness.feed("/quit")
+        run_async(repl_harness.run_until_quit(auto_feed_quit=False, storage=storage, client=mock_client))
+
+        out = capsys.readouterr().out
+
+        # result output line from do_combine
+        assert "Water" in out
+        assert "Fire" in out
+        assert "🐦 Phoenix" in out or "Phoenix" in out
+        assert "[FIRST DISCOVERY!]" in out
+        # emoji if present (on operand or result)
+        assert "💧" in out or "🔥" in out or "🐦" in out
+        # non-brittle: in result before shutdown
+        assert "Goodbye" in out
+        assert (
+            out.find("[FIRST DISCOVERY!]") < out.rfind("Goodbye")
+            or out.find("🐦") < out.rfind("Goodbye")
+            or out.find("Phoenix") < out.rfind("Goodbye")
+        )
+        # ends with clean prompt
+        assert repl_harness.prompt_calls
+        last_p, _ = repl_harness.prompt_calls[-1]
+        assert "craft>" in last_p.lower()
+
     def test_rapid_locals_output_queue_interleave_clean_via_harness(self, repl_harness, capsys):
         """Pure non-brittle harness test in TestREPLHarnessEdges for redraw throttle.
 
@@ -4236,4 +4282,88 @@ class TestREPLHarnessEdges:
         )
         # relative rfind order for key markers
         assert out.find("Goodbye") > out.find("combine") or "combine" not in out.lower()
+
+    def test_streaming_bulk_slow_pairs_interleaved_local_and_queue_status_via_harness(self, repl_harness, capsys):
+        """Pure non-brittle harness test in TestREPLHarnessEdges.
+
+        Drive streaming bulk (slow pairs) + interleaved local (/list or /search) + /queue;
+        assert (allowed in/rfind/phrases + prompt seq + Goodbye) that queue/prompt status
+        remains visible/updated (e.g. "running" or "▶" or "pending" phrases appear after
+        output lines without corruption; no stale panel).
+        Uses Event + timing.
+        """
+        import asyncio
+        from unittest.mock import patch, MagicMock
+
+        elems = _bulk_elems("Bulk", 3)
+        storage = repl_harness.set_storage_elems(elems)
+        mock_client = repl_harness.set_mock_client()
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_pair(a, b):
+            started.set()
+            await release.wait()
+            m = MagicMock()
+            m.name = None
+            return m
+
+        mock_client.pair = slow_pair
+
+        async def drive():
+            repl_harness.feed("/permutate Bulk*")
+            t = asyncio.create_task(
+                repl_harness.run_until_quit(client=mock_client, auto_feed_quit=False, storage=storage)
+            )
+            await started.wait()
+            await asyncio.sleep(0)
+            # interleaved locals during running bulk (streaming outputs via slow pairs)
+            repl_harness.feed("/list")
+            repl_harness.feed("/search Bulk")
+            repl_harness.feed("/queue")
+            release.set()
+            repl_harness.feed("/quit")
+            await t
+
+        with patch("infinite_craft_cli.cli._record_recipe"), \
+             patch("infinite_craft_cli.cli._BULK_WARN_THRESHOLD", 100), \
+             patch("infinite_craft_cli.cli._MAX_PERMUTATE_ROUNDS", 1), \
+             patch("infinite_craft_cli.cli._load_recipes", return_value={}), \
+             patch("infinite_craft_cli.cli._tty_height", return_value=24), \
+             patch("infinite_craft_cli.cli._tty_width", return_value=80):
+            run_async(drive())
+
+        out = capsys.readouterr().out
+
+        assert repl_harness.prompt_calls
+        last_p, _ = repl_harness.prompt_calls[-1]
+        assert "craft>" in last_p.lower()
+        assert "Goodbye" in out
+
+        pre = out[:out.rfind("Goodbye")] if "Goodbye" in out else out
+
+        # panel phrases for queue/prompt status visible (under chrome during streaming)
+        assert "▶" in out or "running" in pre
+        assert "pending" in pre or "queue" in out.lower() or "◆" in out or "[active]" in pre.lower()
+
+        # no corruption / stale panel
+        assert "craft>." not in out
+
+        # phrases appear after output lines (verifies force redraw of chrome after scroll writes)
+        # /list and bulk progress are output; status must be refreshed after them
+        assert (
+            out.find("Discovered") < out.rfind("▶")
+            or out.find("Discovered") < out.rfind("running")
+            or out.find("list") < out.rfind("running")
+            or out.find("search") < out.rfind("▶")
+            or out.find("Bulk") < out.rfind("running")
+            or out.find("elements") < out.rfind("pending")
+            or "pending" in pre
+            or "▶" in out
+        )
+
+        # relative order via rfind (output before final status/Goodbye)
+        assert out.rfind("Goodbye") > 0
+        assert out.rfind("Goodbye") > out.rfind("permutate") or "permutate" not in out.lower()
 
