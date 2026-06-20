@@ -372,7 +372,7 @@ async def do_combine(client, storage, first_name: str, second_name: str) -> str:
         )
     result_display = result.name if result.name else "Nothing"
     _history.append((first_name.strip(), second_name.strip(), result_display))
-    return format_result(str(first), str(second), result)
+    return format_result(format_element(first), format_element(second), result)
 
 
 def _slash_args(line: str, command: str) -> str | None:
@@ -1151,7 +1151,10 @@ def _repl_print(*args, **kwargs):
         partial = _chrome_partial if _chrome_input_active else ""
 
         bottom = _chrome_update_scroll_region(reposition=True)
-        sys.stdout.write(f"\033[{bottom};1H\033[K{text}{end}")
+        cols = _tty_width()
+        safe = _fit_visible(text, max(0, cols - 1))
+        sys.stdout.write(f"\033[{bottom};1H\033[K{safe}{end}")
+        sys.stdout.write(RESET)  # close attrs if truncated mid-span (long name/emoji/FIRST)
         sys.stdout.flush()
 
         _chrome_draw(partial=partial)
