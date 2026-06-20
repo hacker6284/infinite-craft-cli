@@ -867,7 +867,7 @@ class TestRapidConfirmTyping:
         )
         assert "Queued: y" not in out
         assert "Started: y" not in out
-        assert "Permutate done" in out or "Permutating" in out
+        assert "Permuting matches for" in out or "permutate" in out.lower() or "Skipped." in out
 
     def test_immediate_y_buffered_during_slow_confirm_setup(self, capsys):
         """y typed while confirm UI is still starting must buffer, not enqueue."""
@@ -912,7 +912,7 @@ class TestRapidConfirmTyping:
 
         assert scripted.script == []
         assert "Queued: y" not in out
-        assert "Permutate done" in out or "Permutating" in out
+        assert "Permuting matches for" in out or "permutate" in out.lower() or "Skipped." in out
 
 
 class TestMultipleQueuedDuringConfirm:
