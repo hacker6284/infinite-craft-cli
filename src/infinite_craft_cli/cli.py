@@ -999,7 +999,11 @@ def _chrome_write_row(row: int, content: str = "") -> None:
 
 
 def _chrome_reserved_lines() -> int:
-    """Lines reserved at the bottom for queue panel + prompt."""
+    """Lines reserved at the bottom for queue panel + prompt.
+
+    For single-item queue (compact path in _format_queue_display), display has 1 line
+    so reserved drops to 2 (vs ~4 previously); multi-item uses full. Dynamic via count.
+    """
     display = _format_queue_display()
     queue_lines = display.count("\n") + 1 if display else 0
     return max(1, queue_lines + 1)
@@ -1072,6 +1076,7 @@ def _chrome_draw(*, partial: str = "") -> None:
         for offset, line in enumerate(display.split("\n")):
             _chrome_write_row(chrome_start + offset, line)
 
+    # prompt follows immediately after (shorter for compact single queue line)
     prompt_row = chrome_start + (display.count("\n") + 1 if display else 0)
     prompt_text = _chrome_active_prompt()
     if prompt_text:
@@ -2679,13 +2684,62 @@ def do_queue_status() -> str:
 
 
 def _format_queue_display() -> str:
-    """Render the queue status panel (empty string when idle)."""
+    """Render the queue status panel (empty string when idle).
+
+    For exactly one content line (single running / only pending / only awaiting/bulk-confirm),
+    emit *only* that status line (no header rule "── queue ──", no footer rule). This reduces
+    reserved vertical space by ~2 lines in common case. >1 items keep header+items+footer.
+    All truncation/color/sanitize/width preserved exactly.
+    """
     running = _current_command
     pending = list(_command_queue)
     awaiting_confirm = _waiting_for_confirm() or _bulk_confirm_pending
     if not running and not pending and not awaiting_confirm:
         return ""
     width = _tty_width()
+    # build content lines (with existing truncation etc)
+    content: list[str] = []
+    if running:
+        cmd = _sanitize_queue_line(running)
+        prefix = f"  {_color('▶', YELLOW)} {_color('running', DIM)}  "
+        pvis = _ansi_visible_len(prefix)
+        avail = max(1, width - pvis - 1)  # margin so no wrap into chrome/prompt
+        if _ansi_visible_len(cmd) > avail:
+            cmd = cmd[: max(0, avail - 1)] + "…"
+        content.append(f"{prefix}{_color(cmd, YELLOW)}")
+    for i, cmd in enumerate(pending, 1):
+        safe = _sanitize_queue_line(cmd)
+        prefix = f"  {_color(f'{i}.', DIM)} {_color('pending', DIM)}  "
+        pvis = _ansi_visible_len(prefix)
+        avail = max(1, width - pvis - 1)  # margin so no wrap into chrome/prompt
+        if _ansi_visible_len(safe) > avail:
+            safe = safe[: max(0, avail - 1)] + "…"
+        content.append(f"{prefix}{safe}")
+    if _waiting_for_confirm():
+        prefix = f"  {_color('◆', YELLOW)} {_color('awaiting confirm', BOLD + YELLOW)}  "
+        plain = "answer y/n at prompt below"
+        pvis = _ansi_visible_len(prefix)
+        avail = max(1, width - pvis - 1)  # margin so no wrap into chrome/prompt
+        if _ansi_visible_len(plain) > avail:
+            plain = plain[: max(0, avail - 1)] + "…"
+        desc = _color(plain, DIM)
+        content.append(f"{prefix}{desc}")
+    elif _bulk_confirm_pending:
+        prefix = f"  {_color('◆', YELLOW)} {_color('confirm', BOLD + YELLOW)}  "
+        plain = "preparing bulk prompt..."
+        pvis = _ansi_visible_len(prefix)
+        avail = max(1, width - pvis - 1)  # margin so no wrap into chrome/prompt
+        if _ansi_visible_len(plain) > avail:
+            plain = plain[: max(0, avail - 1)] + "…"
+        desc = _color(plain, DIM)
+        content.append(f"{prefix}{desc}")
+    if not content:
+        return ""
+    if len(content) == 1:
+        # compact: single status line only (no rules)
+        return content[0]
+    # multi: header + contents + footer (existing behavior)
+
     # width-adaptive rule that fits "  ── queue ──" line within terminal width
     overhead = 2 + 1 + 5 + 1  # indent + space + "queue" + space
     sep_len = max(3, (width - overhead) // 2)
@@ -2697,42 +2751,7 @@ def _format_queue_display() -> str:
         sep_len = max(1, sep_len - 2)
         rule = _color("─" * sep_len, DIM)
         lines[0] = f"  {rule} {_color('queue', BOLD + CYAN)} {rule}"
-    if running:
-        cmd = _sanitize_queue_line(running)
-        prefix = f"  {_color('▶', YELLOW)} {_color('running', DIM)}  "
-        pvis = _ansi_visible_len(prefix)
-        avail = max(1, width - pvis - 1)  # margin so no wrap into chrome/prompt
-        if _ansi_visible_len(cmd) > avail:
-            cmd = cmd[: max(0, avail - 1)] + "…"
-        lines.append(
-            f"{prefix}{_color(cmd, YELLOW)}"
-        )
-    for i, cmd in enumerate(pending, 1):
-        safe = _sanitize_queue_line(cmd)
-        prefix = f"  {_color(f'{i}.', DIM)} {_color('pending', DIM)}  "
-        pvis = _ansi_visible_len(prefix)
-        avail = max(1, width - pvis - 1)  # margin so no wrap into chrome/prompt
-        if _ansi_visible_len(safe) > avail:
-            safe = safe[: max(0, avail - 1)] + "…"
-        lines.append(f"{prefix}{safe}")
-    if _waiting_for_confirm():
-        prefix = f"  {_color('◆', YELLOW)} {_color('awaiting confirm', BOLD + YELLOW)}  "
-        plain = "answer y/n at prompt below"
-        pvis = _ansi_visible_len(prefix)
-        avail = max(1, width - pvis - 1)  # margin so no wrap into chrome/prompt
-        if _ansi_visible_len(plain) > avail:
-            plain = plain[: max(0, avail - 1)] + "…"
-        desc = _color(plain, DIM)
-        lines.append(f"{prefix}{desc}")
-    elif _bulk_confirm_pending:
-        prefix = f"  {_color('◆', YELLOW)} {_color('confirm', BOLD + YELLOW)}  "
-        plain = "preparing bulk prompt..."
-        pvis = _ansi_visible_len(prefix)
-        avail = max(1, width - pvis - 1)  # margin so no wrap into chrome/prompt
-        if _ansi_visible_len(plain) > avail:
-            plain = plain[: max(0, avail - 1)] + "…"
-        desc = _color(plain, DIM)
-        lines.append(f"{prefix}{desc}")
+    lines.extend(content)
     foot_len = max(3, min(50, width - 2))
     foot = f"  {_color('─' * foot_len, DIM)}"
     if _ansi_visible_len(foot) > width:
@@ -2765,7 +2784,7 @@ def _paint_queue_panel(force: bool = False):
     _erase_queue_panel()
     if display:
         print(display, flush=True)
-        _queue_panel_height = display.count("\n") + 1
+        _queue_panel_height = display.count("\n") + 1  # auto 1 for compact single; 3+ for multi
     _last_queue_snapshot = display
 
 
