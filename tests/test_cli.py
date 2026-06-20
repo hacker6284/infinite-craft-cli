@@ -13,7 +13,8 @@ if __name__ == "__main__":
 
 
 def run_async(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # modernized (was deprecated get_event_loop)
+    return asyncio.run(asyncio.wait_for(coro, timeout=30.0))
 
 
 class TestArgParsing:
@@ -64,6 +65,24 @@ class TestArgParsing:
     def test_with_args(self):
         from infinite_craft_cli.cli import main
         with patch("sys.argv", ["infinite-craft", "with", "Water", "/^fi/"]):
+            with patch("asyncio.run") as mock_run:
+                with patch("infinite_craft_cli.cli.interactive_mode"):
+                    with patch("infinite_craft_cli.cli.noninteractive_mode"):
+                        main()
+        mock_run.assert_called_once()
+
+    def test_exhaust_args(self):
+        from infinite_craft_cli.cli import main
+        with patch("sys.argv", ["infinite-craft", "exhaust", "w*"]):
+            with patch("asyncio.run") as mock_run:
+                with patch("infinite_craft_cli.cli.interactive_mode"):
+                    with patch("infinite_craft_cli.cli.noninteractive_mode"):
+                        main()
+        mock_run.assert_called_once()
+
+    def test_permutate_args(self):
+        from infinite_craft_cli.cli import main
+        with patch("sys.argv", ["infinite-craft", "permutate", "w*"]):
             with patch("asyncio.run") as mock_run:
                 with patch("infinite_craft_cli.cli.interactive_mode"):
                     with patch("infinite_craft_cli.cli.noninteractive_mode"):
@@ -194,3 +213,62 @@ class TestNonInteractiveMode:
                     run_async(noninteractive_mode(args))
         captured = capsys.readouterr()
         assert "unique pairs" in captured.out
+
+    def test_exhaust_command(self, capsys):
+        from infinite_craft_cli.cli import noninteractive_mode
+        args = MagicMock()
+        args.command = "exhaust"
+        args.query = "water"
+        client = make_mock_client()
+        storage = make_mock_storage()
+        nothing = MagicMock()
+        nothing.name = None
+        client.pair.return_value = nothing
+
+        mock_client_cls = MagicMock()
+        mock_client_ctx = AsyncMock()
+        mock_client_ctx.__aenter__.return_value = client
+        mock_client_ctx.__aexit__.return_value = False
+        mock_client_cls.return_value = mock_client_ctx
+
+        mock_storage_cls = MagicMock()
+        mock_storage_cls.return_value = storage
+
+        with patch("infinite_craft_cli.cli.InfiniteCraftClient", mock_client_cls):
+            with patch("infinite_craft_cli.cli.DiscoveryStorage", mock_storage_cls):
+                with patch("infinite_craft_cli.cli._record_recipe"):
+                    with patch("sys.stdout.isatty", return_value=False):
+                        run_async(noninteractive_mode(args))
+        captured = capsys.readouterr()
+        assert "Exhausting" in captured.out
+
+    def test_permutate_command(self, capsys):
+        from infinite_craft_cli.cli import noninteractive_mode
+        args = MagicMock()
+        args.command = "permutate"
+        args.query = "w*"
+        client = make_mock_client()
+        storage = make_mock_storage([
+            MockElement("Water", "💧"),
+            MockElement("Wind", "🌬️"),
+        ])
+        nothing = MagicMock()
+        nothing.name = None
+        client.pair.return_value = nothing
+
+        mock_client_cls = MagicMock()
+        mock_client_ctx = AsyncMock()
+        mock_client_ctx.__aenter__.return_value = client
+        mock_client_ctx.__aexit__.return_value = False
+        mock_client_cls.return_value = mock_client_ctx
+
+        mock_storage_cls = MagicMock()
+        mock_storage_cls.return_value = storage
+
+        with patch("infinite_craft_cli.cli.InfiniteCraftClient", mock_client_cls):
+            with patch("infinite_craft_cli.cli.DiscoveryStorage", mock_storage_cls):
+                with patch("infinite_craft_cli.cli._record_recipe"):
+                    with patch("sys.stdout.isatty", return_value=False):
+                        run_async(noninteractive_mode(args))
+        captured = capsys.readouterr()
+        assert "Permuting matches for" in captured.out or "Permutating" in captured.out

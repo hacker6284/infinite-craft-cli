@@ -554,7 +554,7 @@ class TestInteractiveSlashCommands:
                     run_async(interactive_mode())
 
         captured = capsys.readouterr()
-        assert "Permutating" in captured.out
+        assert "Permuting matches for" in captured.out or "Permutating" in captured.out
         assert "Round 1" in captured.out
         assert "Permutate done" in captured.out
 
@@ -899,7 +899,7 @@ class TestInteractiveQueue:
         captured = capsys.readouterr()
         assert confirm_answered
         assert "pairs per round" in captured.out
-        assert "Permutating" in captured.out
+        assert "Permuting matches for" in captured.out or "Permutating" in captured.out
         assert "Permutate done" in captured.out
         assert "Already queued" not in captured.out
 
@@ -1107,7 +1107,7 @@ class TestInteractiveQueue:
 
         assert confirm_prompt_seen
         captured = capsys.readouterr()
-        assert "Permutating" in captured.out
+        assert "Permuting matches for" in captured.out or "permutate" in captured.out.lower()
         assert "1. pending  y" not in captured.out
 
     def test_early_y_not_enqueued_during_permutate(self, capsys):

@@ -105,6 +105,7 @@ _chrome_prompt: str = ""
 _chrome_input_active: bool = False
 _chrome_partial: str = ""
 _chrome_last_reserve: int = 0
+_chrome_last_height: int = 0
 _repl_print_patched: bool = False
 _repl_print_lock = threading.RLock()
 _chrome_last_state: object = None
@@ -157,6 +158,7 @@ def _reset_test_state() -> None:
     _chrome_input_active = False
     _chrome_partial = ""
     _chrome_last_reserve = 0
+    _chrome_last_height = 0
     _chrome_last_state = None
     if _repl_print_patched:
         try:
@@ -652,7 +654,7 @@ async def do_crawl(client, storage, first_name: str, second_name: str):
     while True:
         if _cancelled:
             if not _skip_summary_shown:
-                _repl_print_lines("  Stopped.")
+                _repl_print_lines("  Stopped early.")
                 _mark_cancel_notified()
             break
         generation += 1
@@ -690,7 +692,7 @@ async def do_crawl(client, storage, first_name: str, second_name: str):
         if new_count == 0 or _cancelled:
             if _cancelled:
                 if not _skip_summary_shown:
-                    _repl_print_lines("  Stopped.")
+                    _repl_print_lines("  Stopped early.")
                     _mark_cancel_notified()
             else:
                 _repl_print_lines("  No new discoveries. Stopping.")
@@ -1015,14 +1017,16 @@ def _scroll_region_bottom() -> int:
     return max(1, rows - reserve)
 
 
-def _chrome_update_scroll_region(*, reposition: bool = False) -> int:
+def _chrome_update_scroll_region(*, reposition: bool = False, force: bool = False) -> int:
     """Pin the bottom chrome; return the last line of the scrolling output region."""
-    global _chrome_last_reserve
+    global _chrome_last_reserve, _chrome_last_height
     rows = _tty_height()
     reserve = _chrome_reserved_lines()
     bottom = max(1, rows - reserve)
-    if reserve != _chrome_last_reserve:
-        if _chrome_last_reserve > reserve:
+    height_changed = rows != _chrome_last_height
+    reserve_changed = reserve != _chrome_last_reserve
+    if force or reserve_changed or height_changed:
+        if reserve_changed and _chrome_last_reserve > reserve:
             # Rows that were chrome are now scrollable; clear stale queue/prompt text.
             clear_from = rows - _chrome_last_reserve + 1
             clear_to = rows - reserve
@@ -1031,8 +1035,9 @@ def _chrome_update_scroll_region(*, reposition: bool = False) -> int:
         sys.stdout.write(f"\033[1;{bottom}r")
         sys.stdout.flush()
         _chrome_last_reserve = reserve
+        _chrome_last_height = rows
         reposition = True
-    if reposition:
+    if force or reposition:
         sys.stdout.write(f"\033[{bottom};1H")
         sys.stdout.flush()
     return bottom
@@ -1046,6 +1051,7 @@ def _chrome_active_prompt() -> str:
 
 
 def _chrome_state_key() -> tuple:
+    # Include height/width so deltas force refresh/region (real size change is a change).
     return (
         _format_queue_display(),
         _chrome_active_prompt(),
@@ -1057,12 +1063,20 @@ def _chrome_state_key() -> tuple:
         _api_worker_task is not None and not _api_worker_task.done()
         if _api_worker_task
         else False,
+        _tty_height(),
+        _tty_width(),
     )
 
 
-def _chrome_draw(*, partial: str = "") -> None:
-    """Draw queue panel and prompt on fixed rows below the scroll region."""
+def _chrome_draw(*, partial: str = "", force: bool = False) -> None:
+    """Draw queue panel and prompt on fixed rows below the scroll region.
+    Throttled: skips when state identical (no force, no queue/prompt/height/etc change).
+    """
     if not _chrome_enabled:
+        return
+    global _chrome_last_state
+    state = _chrome_state_key()
+    if not force and state == _chrome_last_state:
         return
     rows = _tty_height()
     scroll_end = _scroll_region_bottom()
@@ -1082,10 +1096,14 @@ def _chrome_draw(*, partial: str = "") -> None:
     if prompt_text:
         _chrome_write_row(prompt_row, f"{prompt_text}{partial}")
     sys.stdout.flush()
+    _chrome_last_state = state
 
 
 def _chrome_refresh(*, force: bool = False, partial: str | None = None) -> None:
-    """Repaint pinned chrome when queue state changes."""
+    """Repaint pinned chrome when queue state changes.
+    Uses _chrome_state_key + _last_queue_snapshot + force for lightweight throttle:
+    skips unnecessary updates/draws/region sets when identical.
+    """
     global _last_queue_snapshot, _chrome_last_state
     if not _chrome_enabled:
         return
@@ -1094,14 +1112,16 @@ def _chrome_refresh(*, force: bool = False, partial: str | None = None) -> None:
         return
     _chrome_last_state = state
     _last_queue_snapshot = _format_queue_display()
-    _chrome_update_scroll_region(reposition=True)
+    _chrome_update_scroll_region(reposition=True, force=force)
     if partial is None and _chrome_input_active:
         partial = _chrome_partial
-    _chrome_draw(partial=partial or "")
+    _chrome_draw(partial=partial or "", force=True)
 
 
 def _chrome_sync() -> None:
-    """Refresh chrome after queue/confirm changes while the user may be mid-input."""
+    """Refresh chrome after queue/confirm changes while the user may be mid-input.
+    Uses force path (callers signal real change); throttled downstream via state_key.
+    """
     if not _chrome_enabled:
         return
     with _repl_print_lock:
@@ -1115,6 +1135,7 @@ def _chrome_enable() -> None:
         return
     _chrome_enabled = True
     _chrome_last_reserve = 0
+    _chrome_last_height = 0
     _chrome_update_scroll_region(reposition=True)
     _chrome_refresh(force=True)
 
@@ -1131,6 +1152,7 @@ def _chrome_disable() -> None:
     _chrome_input_active = False
     _chrome_partial = ""
     _chrome_last_reserve = 0
+    _chrome_last_height = 0
     _chrome_last_state = None
 
 
@@ -1662,7 +1684,7 @@ def _awaiting_bulk_confirm_setup() -> bool:
 
 
 async def _await_confirmation(prompt: str) -> str:
-    """Request confirmation via the interactive loop (avoids competing craft> prompts)."""
+    """Request confirmation via the interactive loop (avoids competing prompts)."""
     if not _interactive_mode_active:
         return await _prompt_input(prompt)
     global _confirm_future, _confirm_expected, _confirm_answer_buffer, _chrome_prompt, _chrome_partial
@@ -1855,7 +1877,7 @@ async def do_permutate(client, storage, query: str):
     stopped = False
     try:
         _repl_print_lines(
-            f"  Permutating matches for {_color(query, YELLOW)} until no new discoveries..."
+            f"  Permuting matches for {_color(query, YELLOW)} until no new discoveries..."
         )
         _repl_print_lines("  (Ctrl+C to stop)")
 
@@ -1934,7 +1956,7 @@ async def do_permutate(client, storage, query: str):
 
         if stopped:
             if not _skip_summary_shown:
-                _repl_print_lines("  Stopped.")
+                _repl_print_lines("  Stopped early.")
                 _mark_cancel_notified()
         else:
             _repl_print_lines(f"  Permutate done after {round_num} round(s).")
@@ -2467,7 +2489,7 @@ def do_help() -> str:
     /prune                      Remove orphan elements Infinibrowser can't fill
     /export [path]              Export discoveries as .ic save file
     /history                    Show combinations tried this session
-    /queue                      Show running and pending commands (status also appears above craft>)
+    /queue                      Show running and pending commands (status also appears above the prompt)
     /help                       Show this help
     /quit                       Exit
 
@@ -2775,9 +2797,17 @@ def _erase_queue_panel():
 
 
 def _paint_queue_panel(force: bool = False):
-    """Redraw the queue panel above the prompt; clear it when idle."""
+    """Redraw the queue panel above the prompt; clear it when idle.
+    Lightweight throttle for chrome path using state_key / snapshot + force.
+    """
     global _last_queue_snapshot, _queue_panel_height
     if _chrome_enabled:
+        if not force:
+            # early throttle using state (covers queue/prompt/confirm/height/width deltas etc)
+            state = _chrome_state_key()
+            if state == _chrome_last_state:
+                # keep snapshot in sync if display same
+                return
         with _repl_print_lock:
             _chrome_refresh(force=force)
         return
@@ -3055,7 +3085,7 @@ async def _shutdown_interactive() -> int:
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
     if discarded:
-        msg = f"  Discarded {discarded} queued command(s)."
+        msg = f"  Cancelled. Discarded {discarded} queued command(s)."
         _repl_print_lines(msg)
     _repl_print_lines("Goodbye!")
     return discarded
