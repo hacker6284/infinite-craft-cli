@@ -2697,13 +2697,12 @@ def _format_queue_display() -> str:
     if not running and not pending and not awaiting_confirm:
         return ""
     width = _tty_width()
-    # build content lines (with existing truncation etc)
     content: list[str] = []
     if running:
         cmd = _sanitize_queue_line(running)
         prefix = f"  {_color('▶', YELLOW)} {_color('running', DIM)}  "
         pvis = _ansi_visible_len(prefix)
-        avail = max(1, width - pvis - 1)  # margin so no wrap into chrome/prompt
+        avail = max(1, width - pvis - 1)
         if _ansi_visible_len(cmd) > avail:
             cmd = cmd[: max(0, avail - 1)] + "…"
         content.append(f"{prefix}{_color(cmd, YELLOW)}")
@@ -2711,7 +2710,7 @@ def _format_queue_display() -> str:
         safe = _sanitize_queue_line(cmd)
         prefix = f"  {_color(f'{i}.', DIM)} {_color('pending', DIM)}  "
         pvis = _ansi_visible_len(prefix)
-        avail = max(1, width - pvis - 1)  # margin so no wrap into chrome/prompt
+        avail = max(1, width - pvis - 1)
         if _ansi_visible_len(safe) > avail:
             safe = safe[: max(0, avail - 1)] + "…"
         content.append(f"{prefix}{safe}")
@@ -2719,7 +2718,7 @@ def _format_queue_display() -> str:
         prefix = f"  {_color('◆', YELLOW)} {_color('awaiting confirm', BOLD + YELLOW)}  "
         plain = "answer y/n at prompt below"
         pvis = _ansi_visible_len(prefix)
-        avail = max(1, width - pvis - 1)  # margin so no wrap into chrome/prompt
+        avail = max(1, width - pvis - 1)
         if _ansi_visible_len(plain) > avail:
             plain = plain[: max(0, avail - 1)] + "…"
         desc = _color(plain, DIM)
@@ -2728,7 +2727,7 @@ def _format_queue_display() -> str:
         prefix = f"  {_color('◆', YELLOW)} {_color('confirm', BOLD + YELLOW)}  "
         plain = "preparing bulk prompt..."
         pvis = _ansi_visible_len(prefix)
-        avail = max(1, width - pvis - 1)  # margin so no wrap into chrome/prompt
+        avail = max(1, width - pvis - 1)
         if _ansi_visible_len(plain) > avail:
             plain = plain[: max(0, avail - 1)] + "…"
         desc = _color(plain, DIM)
@@ -2736,17 +2735,12 @@ def _format_queue_display() -> str:
     if not content:
         return ""
     if len(content) == 1:
-        # compact: single status line only (no rules)
         return content[0]
-    # multi: header + contents + footer (existing behavior)
-
-    # width-adaptive rule that fits "  ── queue ──" line within terminal width
-    overhead = 2 + 1 + 5 + 1  # indent + space + "queue" + space
+    overhead = 2 + 1 + 5 + 1
     sep_len = max(3, (width - overhead) // 2)
     sep_len = min(sep_len, 40)
     rule = _color("─" * sep_len, DIM)
     lines: list[str] = [f"  {rule} {_color('queue', BOLD + CYAN)} {rule}"]
-    # ensure header itself does not exceed width (for very narrow ttys)
     if _ansi_visible_len(lines[0]) > width:
         sep_len = max(1, sep_len - 2)
         rule = _color("─" * sep_len, DIM)
