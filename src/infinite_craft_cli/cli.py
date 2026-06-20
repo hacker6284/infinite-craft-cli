@@ -374,7 +374,13 @@ async def do_combine(client, storage, first_name: str, second_name: str) -> str:
         )
     result_display = result.name if result.name else "Nothing"
     _history.append((first_name.strip(), second_name.strip(), result_display))
-    return format_result(format_element(first), format_element(second), result)
+    # Use format_element(...) directly for operands (and result) so FIRST tag color/text
+    # survives; avoid format_result's re-sanitize on pre-rendered names (which strips ANSI).
+    if result.name is None:
+        res = _color("Nothing", DIM)
+    else:
+        res = format_element(result)
+    return f"  {format_element(first)} + {format_element(second)} = {res}"
 
 
 def _slash_args(line: str, command: str) -> str | None:
