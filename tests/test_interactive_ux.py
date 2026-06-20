@@ -4050,3 +4050,72 @@ class TestREPLHarnessEdges:
         # rfind order
         assert out.rfind("running") < out.rfind("Goodbye") or out.rfind("pending") < out.rfind("Goodbye")
 
+    def test_no_duplicate_queue_status_under_chrome_via_harness(self, repl_harness, capsys):
+        """Pure non-brittle harness test in TestREPLHarnessEdges.
+
+        Drive cases under chrome (via harness isatty + enable) + /queue feed when running or idle.
+        Assert with allowed style only: in / rfind + prompt_calls[-1] "craft>" + "Goodbye".
+        No duplicate phrases (e.g. "Running:" not with panel "▶ running" or "1. pending" textual);
+        panel phrases ("▶" or "running", "pending", "◆", "queue") in out when expected;
+        for idle, status msg does not contain literal "craft>" (checked via "craft>." absent; clean panel).
+        Uses Events if timing, follows existing harness patterns.
+        """
+        import asyncio
+        from unittest.mock import patch, MagicMock
+
+        mock_client = repl_harness.set_mock_client()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_pair(a, b):
+            started.set()
+            await release.wait()
+            m = MagicMock()
+            m.name = None
+            return m
+
+        mock_client.pair = slow_pair
+
+        async def drive():
+            # idle /queue first (chrome path)
+            repl_harness.feed("/queue")
+            # start running work
+            repl_harness.feed("/combine Water Fire")
+            t = asyncio.create_task(
+                repl_harness.run_until_quit(client=mock_client, auto_feed_quit=False)
+            )
+            await started.wait()
+            await asyncio.sleep(0)
+            # pending + /queue while running (chrome)
+            repl_harness.feed("/combine Wind Earth")
+            repl_harness.feed("/queue")
+            release.set()
+            repl_harness.feed("/quit")
+            await t
+
+        with patch("infinite_craft_cli.cli._record_recipe"), \
+             patch("sys.stdin.isatty", return_value=True), \
+             patch("sys.stdout.isatty", return_value=True), \
+             patch("infinite_craft_cli.cli._tty_height", return_value=24), \
+             patch("infinite_craft_cli.cli._tty_width", return_value=80):
+            run_async(drive())
+
+        out = capsys.readouterr().out
+
+        assert repl_harness.prompt_calls
+        last_p, _ = repl_harness.prompt_calls[-1]
+        assert "craft>" in last_p.lower()
+        assert "Goodbye" in out
+
+        pre = out[:out.rfind("Goodbye")] if "Goodbye" in out else out
+        # no textual dupes (Running: / " pending:") when panel provides under chrome
+        assert "Running:" not in out
+        assert " pending:" not in out
+        # panel phrases present for running/pending case
+        assert "▶" in out or "running" in pre
+        assert "pending" in pre or "queue" in out.lower() or "◆" in out
+        # for idle /queue: no status containing literal "craft>"
+        assert "craft>." not in out
+        # rfind usage for order
+        assert out.rfind("Goodbye") > out.rfind("queue") or "queue" not in out.lower()
+

@@ -2675,10 +2675,7 @@ def _is_recognized_command(line: str) -> bool:
 def do_queue_status() -> str:
     """Describe the current command queue."""
     if not _current_command and not _command_queue:
-        if _chrome_enabled:
-            status_hint = "its status appears in the panel above craft>."
-        else:
-            status_hint = "its status appears in the queue panel above the prompt."
+        status_hint = "its status appears in the panel above the prompt."
         return (
             "  Queue is idle.\n"
             "  When you start a long command (combine, fill, permutate, ...), "
@@ -2916,9 +2913,7 @@ async def _dispatch_line(client, storage, line: str) -> None:
         _repl_print_lines(do_history(storage))
     elif line == "/queue":
         _paint_queue_panel(force=True)
-        if _chrome_enabled:
-            _repl_print_lines(do_queue_status())
-        elif not _current_command and not _command_queue:
+        if not _chrome_enabled and not _current_command and not _command_queue:
             _repl_print_lines(do_queue_status())
     elif line == "/clear":
         if not _chrome_enabled:
