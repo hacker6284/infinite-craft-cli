@@ -3149,6 +3149,79 @@ class TestREPLHarnessEdges:
             nxt = calls[cmd_i + 1][0].lower()
             assert "confirm" in nxt
 
+    def test_bulk_confirm_quit_at_confirm_via_harness_pure(self, repl_harness, capsys):
+        """Pure non-brittle harness test (TestREPLHarnessEdges): drive bulk confirm (low thresh permutate), Event + prompt_calls polling to wait for confirm, feed "/quit" while confirm prompt active.
+        Covers /quit-at-confirm immediate shutdown (discard, Goodbye, no y/n required, no enqueue).
+        Asserts (allowed style only): "confirm" in seq, "Goodbye" in out, no stray "craft>" between bulk cmd and final, rfind order, final prompt_calls may reflect quit path, clean.
+        """
+        import asyncio
+        from unittest.mock import patch, MagicMock, AsyncMock
+
+        elems = _bulk_elems("Bulk", 4)
+        storage = repl_harness.set_storage_elems(elems)
+        mock_client = repl_harness.set_mock_client()
+
+        async def quick_pair(a, b):
+            await asyncio.sleep(0)
+            m = MagicMock()
+            m.name = None
+            return m
+
+        mock_client.pair = quick_pair
+
+        confirm_ready = asyncio.Event()
+
+        async def drive():
+            repl_harness.feed("/permutate Bulk*")
+            t = asyncio.create_task(
+                repl_harness.run_until_quit(client=mock_client, auto_feed_quit=False, storage=storage)
+            )
+            # event-driven poll: feed /quit strictly after confirm seen in prompt_calls (while prompt active)
+            async def _wait_for_confirm_in_seq():
+                for _ in range(150):
+                    if any("confirm" in (p or "").lower() for p, _a in repl_harness.prompt_calls):
+                        confirm_ready.set()
+                        return
+                    await asyncio.sleep(0.005)
+                confirm_ready.set()
+            asyncio.create_task(_wait_for_confirm_in_seq())
+            await confirm_ready.wait()
+            await asyncio.sleep(0)
+            repl_harness.feed("/quit")
+            await t
+
+        with patch("infinite_craft_cli.cli._BULK_WARN_THRESHOLD", 1), \
+             patch("sys.stdin.isatty", return_value=True), \
+             patch("infinite_craft_cli.cli._record_recipe"), \
+             patch("infinite_craft_cli.cli._load_recipes", return_value={}):
+            run_async(drive())
+
+        out = capsys.readouterr().out
+        calls = repl_harness.prompt_calls
+
+        # confirm seen in seq
+        assert any("confirm" in p.lower() for p, _ in calls), f"no confirm prompt seen: {calls}"
+        # /quit fed at the confirm prompt (the cover path)
+        qconfirm = [(p, a) for p, a in calls if "confirm" in p.lower() and "/quit" in a.lower()]
+        assert qconfirm, "no /quit fed while at confirm prompt"
+        # clean exit with Goodbye (no y/n answered; may or not have Cancelled. depending exact cancel path)
+        assert "Goodbye" in out
+        # no stray craft> between bulk cmd and final (confirm window clean)
+        cmd_i = next((i for i, (_p, a) in enumerate(calls) if "permutate" in a.lower()), -1)
+        if cmd_i >= 0 and cmd_i + 1 < len(calls):
+            for j in range(cmd_i + 1, len(calls)):
+                nxtp = calls[j][0].lower()
+                if "craft>" in nxtp and "confirm" not in nxtp:
+                    assert False, f"stray craft> in seq after bulk cmd before final: {nxtp}"
+        # rfind order: bulk/confirm phrases before Goodbye
+        ppos = out.find("pairs")
+        assert ppos < out.rfind("Goodbye") or ppos == -1
+        # clean restoration; final prompt in calls for path
+        if calls:
+            last_p, _ = calls[-1]
+            assert "confirm" in last_p.lower() or "craft>" in last_p.lower()
+        assert "craft>" in out or "Goodbye" in out
+
     def test_history_recipe_cross_use_formatted_elements_emoji_first(self, repl_harness, capsys):
         """History (now unified), recipe summaries, cross outputs show elements via format_element (emoji, FIRST tag where set)."""
         from unittest.mock import patch, MagicMock, AsyncMock

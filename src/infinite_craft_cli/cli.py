@@ -1040,7 +1040,7 @@ def _chrome_update_scroll_region(*, reposition: bool = False) -> int:
 
 def _chrome_active_prompt() -> str:
     """Prompt shown in the pinned chrome row (live while input is active)."""
-    if _chrome_input_active:
+    if _waiting_for_confirm() or _bulk_confirm_pending or _confirm_expected or _chrome_input_active:
         return _craft_prompt()
     return _chrome_prompt
 
@@ -1686,7 +1686,8 @@ async def _await_confirmation(prompt: str) -> str:
         if _chrome_enabled:
             with _repl_print_lock:
                 _chrome_partial = ""
-                # keep _chrome_prompt for post-output draws to restore clean prompt row
+                _chrome_prompt = _craft_prompt()
+                # keep updated for post-output draws to restore correct (confirm or craft) prompt row
                 _chrome_refresh(force=True)
         else:
             _chrome_sync()
@@ -1792,13 +1793,14 @@ async def _confirm_and_run_pairs(client, storage, pairs: list[tuple]):
     if len(pairs) <= _BULK_WARN_THRESHOLD:
         _bulk_confirm_resolved = True
     if len(pairs) > _BULK_WARN_THRESHOLD:
+        if sys.stdin.isatty():
+            _bulk_confirm_pending = True
+            _chrome_sync()
         _repl_print_lines(
             f"  {_color(f'{len(pairs)} pairs', YELLOW)} — "
             f"type {_color('y', BOLD)} or {_color('yes', BOLD)} to continue"
         )
         if sys.stdin.isatty():
-            _bulk_confirm_pending = True
-            _chrome_sync()
             try:
                 try:
                     answer = (await _await_confirmation("")).strip().lower()
@@ -1814,6 +1816,8 @@ async def _confirm_and_run_pairs(client, storage, pairs: list[tuple]):
                 _bulk_confirm_pending = False
                 _confirm_expected = False
                 _confirm_answer_buffer = None
+                if _chrome_enabled:
+                    _chrome_prompt = _craft_prompt()
                 _chrome_sync()
         _bulk_confirm_resolved = True
     await _combine_pairs(client, storage, pairs)
@@ -1881,14 +1885,15 @@ async def do_permutate(client, storage, query: str):
             _repl_print_lines(f"  --- Round {round_num}: {n} elements, {len(pairs)} pairs ---")
 
             if not confirmed and len(pairs) > _BULK_WARN_THRESHOLD:
+                if sys.stdin.isatty():
+                    global _bulk_confirm_pending
+                    _bulk_confirm_pending = True
+                    _chrome_sync()
                 _repl_print_lines(
                     f"  {_color(f'{len(pairs)} pairs per round', YELLOW)} — "
                     f"type {_color('y', BOLD)} or {_color('yes', BOLD)} to continue"
                 )
                 if sys.stdin.isatty():
-                    global _bulk_confirm_pending
-                    _bulk_confirm_pending = True
-                    _chrome_sync()
                     try:
                         try:
                             answer = (await _await_confirmation("")).strip().lower()
@@ -1904,6 +1909,8 @@ async def do_permutate(client, storage, query: str):
                         _bulk_confirm_pending = False
                         _confirm_expected = False
                         _confirm_answer_buffer = None
+                        if _chrome_enabled:
+                            _chrome_prompt = _craft_prompt()
                         _chrome_sync()
                 confirmed = True
                 _bulk_confirm_resolved = True
@@ -1931,6 +1938,8 @@ async def do_permutate(client, storage, query: str):
     finally:
         _confirm_expected = False
         _confirm_answer_buffer = None
+        if _chrome_enabled:
+            _chrome_prompt = _craft_prompt()
 
 
 async def do_cross(client, storage, left_query: str, right_query: str):
@@ -2784,7 +2793,7 @@ def _paint_queue_panel(force: bool = False):
 
 def _craft_prompt() -> str:
     """Prompt string; hints when background work is active."""
-    if _waiting_for_confirm():
+    if _waiting_for_confirm() or _bulk_confirm_pending or _confirm_expected:
         return _color("confirm [y/N]> ", YELLOW)
     base = _color("craft> ", CYAN)
     if not (_current_command or _command_queue):
@@ -3107,10 +3116,17 @@ async def interactive_mode():
                         if _confirm_future is not None and not _confirm_future.done():
                             _confirm_future.set_result("")
                     else:
+                        if line in ("/quit", "/exit"):
+                            await _shutdown_interactive()
+                            break
                         if _is_local_command(line):
                             await _dispatch_line(client, storage, line)
                             continue
                         if _route_confirm_input(line):
+                            if _chrome_enabled:
+                                with _repl_print_lock:
+                                    _chrome_prompt = _craft_prompt()
+                                    _chrome_refresh(force=True)
                             pass
                         elif line.strip():
                             _enqueue_command_line(line, client, storage)
