@@ -4321,7 +4321,6 @@ class TestREPLHarnessEdges:
             # interleaved locals during running bulk (streaming outputs via slow pairs)
             repl_harness.feed("/list")
             repl_harness.feed("/search Bulk")
-            repl_harness.feed("/queue")
             release.set()
             repl_harness.feed("/quit")
             await t
@@ -4330,6 +4329,8 @@ class TestREPLHarnessEdges:
              patch("infinite_craft_cli.cli._BULK_WARN_THRESHOLD", 100), \
              patch("infinite_craft_cli.cli._MAX_PERMUTATE_ROUNDS", 1), \
              patch("infinite_craft_cli.cli._load_recipes", return_value={}), \
+             patch("sys.stdin.isatty", return_value=True), \
+             patch("sys.stdout.isatty", return_value=True), \
              patch("infinite_craft_cli.cli._tty_height", return_value=24), \
              patch("infinite_craft_cli.cli._tty_width", return_value=80):
             run_async(drive())
@@ -4345,29 +4346,24 @@ class TestREPLHarnessEdges:
 
         # panel phrases for queue/prompt status visible (under chrome during streaming)
         assert "▶" in out or "running" in pre
-        assert "pending" in pre or "queue" in out.lower() or "◆" in out or "[active]" in pre.lower()
+        assert "pending" in pre or "◆" in out or "[active]" in pre.lower()
 
         # no corruption / stale panel
         assert "craft>." not in out
+        assert "Queue is idle" not in out  # chrome panel path, avoid non-chrome idle text
 
         # phrases appear after output lines (verifies force redraw of chrome after scroll writes)
-        # /list /search outputs + bulk progress lines; status text re-emitted after (via forced draw)
-        list_pos = max((out.rfind(p) for p in ("Discovered", "elements", "search", "list output")), default=-1)
-        status_last = max((out.rfind(p) for p in ("▶", "running", "pending")), default=-1)
-        # DEBUG positions to diagnose
-        print("DEBUG_POS: list_pos=", list_pos, "status_last=", status_last, "len_out=", len(out))
-        print("DEBUG running_rfind=", out.rfind("running"), "▶_rfind=", out.rfind("▶"))
-        print("DEBUG last200:", repr(out[-200:]) if len(out)>200 else repr(out))
-        if "▶" in out:
-            idx = out.rfind("▶")
-            print("DEBUG around last ▶:", repr(out[max(0,idx-30):idx+80]))
-        assert list_pos >= 0, "expected local output lines from /list"
+        # /list output (contains "Discovered") + bulk progress from slow pairs; status re-emitted after
+        list_pos = max((out.rfind(p) for p in ("Discovered", "elements:")), default=-1)
+        status_last = max((out.rfind(p) for p in ("▶", "running")), default=-1)
+        assert list_pos >= 0, "expected output lines from /list during running"
         assert status_last > list_pos, "queue/prompt status (▶ running etc) must appear after output lines; no stale panel after scroll writes"
-        # also some bulk progress before final status/Goodbye
-        assert out.find("permutate") < out.rfind("running") or out.find("Bulk") < out.rfind("▶") or True  # allowed fallback for bulk timing
+        # bulk progress lines (emitted via _repl during streaming) also followed by status redraw
+        bulk_pos = max((out.rfind(p) for p in ("Permutate done", "Stopping", "Round", "+0 new")), default=-1)
+        if bulk_pos >= 0:
+            assert status_last >= bulk_pos or out.rfind("▶") >= bulk_pos, "status after bulk streaming output"
 
-
-        # relative order via rfind (output before final status/Goodbye)
+        # relative order via rfind (output before final Goodbye)
         assert out.rfind("Goodbye") > 0
         assert out.rfind("Goodbye") > out.rfind("permutate") or "permutate" not in out.lower()
 
