@@ -3073,7 +3073,7 @@ def _enqueue_command_line(line: str, client, storage) -> bool:
     _ensure_api_worker(client, storage)
     if deferred and not _chrome_enabled:
         msg = f"  {_color(f'Queued: {_sanitize_queue_line(line)}', DIM)}"
-        print(msg)
+        _repl_print_lines(msg)
     _chrome_sync()
     return True
 
