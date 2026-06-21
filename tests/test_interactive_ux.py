@@ -2333,6 +2333,68 @@ class TestREPLHarnessEdges:
             or repl_harness._interactive_task.done()
         )
 
+    def test_harness_cleans_up_api_worker_after_enqueue(self, repl_harness, capsys):
+        """TDD test: after enqueue path + /quit via harness, _api_worker_task must be fully reaped (None or done).
+        Catches bare .cancel() without await in interactive finally / reset / harness cleanup.
+        Exercises the bare finally cancel path via uncaught exc (after worker started) + also quit paths.
+        """
+        import asyncio
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_combine(client, storage, first, second):
+            started.set()
+            await release.wait()  # hang the worker; exc path will cut before release
+            return "  ok"
+
+        enqueued = asyncio.Event()
+        orig_enqueue = cli._enqueue_command_line
+
+        def tracking_enqueue(line, client, storage):
+            enqueued.set()
+            return orig_enqueue(line, client, storage)
+
+        prompt_count = 0
+        orig_prompt = cli._prompt_input
+
+        async def raising_prompt(prompt: str) -> str:
+            nonlocal prompt_count
+            prompt_count += 1
+            if prompt_count >= 2:
+                # second prompt (while slow worker from first cmd running) -> uncaught exc -> hits finally bare cancel
+                raise RuntimeError("simulated uncaught error after enqueue to hit bare finally")
+            return await orig_prompt(prompt)
+
+        with patch.object(cli, "do_combine", side_effect=slow_combine), \
+             patch.object(cli, "_enqueue_command_line", side_effect=tracking_enqueue), \
+             patch.object(cli, "_prompt_input", side_effect=raising_prompt):
+            repl_harness.feed("Water + Fire")
+            # raise will happen on second prompt; no need second feed
+            try:
+                run_async(repl_harness.run_until_quit(auto_feed_quit=False))
+            except RuntimeError as e:
+                if "simulated uncaught" not in str(e):
+                    raise
+                # exc path hit: exercises finally bare (no await) -- expect RED before helper
+
+        # After run returns: worker must be fully reaped (None or done) -- no orphans
+        task = repl_harness.cli._api_worker_task
+        assert task is None or getattr(task, "done", lambda: False)(), f"worker not reaped: {task}"
+
+        # Optional pending check (after asyncio.run, all_tasks may raise; covered by except)
+        try:
+            pending = [
+                t
+                for t in asyncio.all_tasks()
+                if not t.done() and "api_worker" in repr(t).lower()
+            ]
+            assert not pending, f"leftover api_worker tasks: {pending}"
+        except RuntimeError:
+            pass
+
+        assert enqueued.is_set(), "enqueue was never observed"
+        assert started.is_set(), "worker did not start (slow_combine not hit)"
+
     def test_harness_vs_legacy_equiv_smoke(self, capsys):
         # parity smoke: harness drive produces similar goodbye as legacy _run (sequential reads isolate deltas)
         from tests.test_interactive import _run_interactive

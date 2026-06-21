@@ -174,16 +174,33 @@ def _reset_test_state() -> None:
     _sigint_previous = None
     _tty_read_byte_hook = None
     _test_prompt_input_hook = None
-    # ensure no stray worker (cancel before null to avoid leak)
-    if (
-        _api_worker_task is not None
-        and not getattr(_api_worker_task, "done", lambda: True)()
-    ):
-        try:
-            _api_worker_task.cancel()
-        except Exception:
-            pass
-    _api_worker_task = None
+    # ensure no stray worker (full cancel+await via helper if possible from sync ctx; drain to avoid orphan)
+    coro = None
+    try:
+        loop = asyncio.get_running_loop()
+        coro = _cancel_and_await_worker()
+        fut = asyncio.run_coroutine_threadsafe(coro, loop)
+        fut.result(timeout=1)
+    except RuntimeError:
+        # no running loop (normal for sync test resets/finalizers): bare + None
+        if (
+            _api_worker_task is not None
+            and not getattr(_api_worker_task, "done", lambda: True)()
+        ):
+            try:
+                _api_worker_task.cancel()
+            except Exception:
+                pass
+        _api_worker_task = None
+    except Exception:
+        if coro is not None:
+            try:
+                coro.close()
+            except Exception:
+                pass
+        # other error: at least detach
+        _api_worker_task = None
+    # (if helper ran, it already set _api_worker_task = None)
 
 
 # ---------------------------------------------------------------------------
@@ -3124,17 +3141,27 @@ async def _shutdown_interactive() -> int:
     _cancelled = True
     discarded = len(_command_queue)
     _command_queue.clear()
-    if _api_worker_task is not None and not _api_worker_task.done():
-        _api_worker_task.cancel()
-        try:
-            await asyncio.wait_for(_api_worker_task, timeout=5.0)
-        except (asyncio.CancelledError, asyncio.TimeoutError):
-            pass
+    await _cancel_and_await_worker(timeout=5.0)
     if discarded:
         msg = f"  Cancelled. Discarded {discarded} queued command(s)."
         _repl_print_lines(msg)
     _repl_print_lines("Goodbye!")
     return discarded
+
+
+async def _cancel_and_await_worker(timeout: float = 2.0) -> None:
+    """Cancel the api worker (if running) and await its completion. Idempotent.
+    Sets the global to None. Used by finally/exit paths and harness to ensure full reap.
+    """
+    global _api_worker_task
+    t = _api_worker_task
+    if t and not t.done():
+        t.cancel()
+        try:
+            await asyncio.wait_for(t, timeout=timeout)
+        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+            pass
+    _api_worker_task = None
 
 
 async def interactive_mode():
@@ -3233,8 +3260,7 @@ async def interactive_mode():
     finally:
         # Best-effort cleanup of worker on any exit (including uncaught exceptions or KI
         # during input) to avoid lingering high-memory processes/threads.
-        if _api_worker_task is not None and not _api_worker_task.done():
-            _api_worker_task.cancel()
+        await _cancel_and_await_worker()
         _patch_repl_print(False)
         _chrome_disable()
         _interactive_mode_active = False
