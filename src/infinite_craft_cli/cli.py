@@ -113,6 +113,7 @@ _tty_stdin_unread: list[str] = []
 # Total time budget to collect CSI/SS3 bytes after ESC before lone-Escape (skip).
 _ESC_SEQUENCE_WAIT_S = 0.3
 _CSI_POLL_INTERVAL_S = 0.02
+_ORPHAN_CSI_WAIT_S = 0.01
 _builtin_print = builtins.print
 
 # Test-only seams (set by harness in tests; never used in production).
@@ -204,10 +205,18 @@ def _load_recipes() -> dict[str, list[list[str]]]:
         with open(RECIPES_PATH, encoding="utf-8") as f:
             return json.load(f)
     except json.JSONDecodeError as e:
-        raise RecipeStoreError(
-            f"recipes.json is corrupted ({e}). "
-            f"Back up {RECIPES_PATH}, repair or delete it, then retry."
-        ) from e
+        # Attempt simple repair for common truncation at end (e.g. interrupted write)
+        try:
+            with open(RECIPES_PATH, encoding="utf-8") as f:
+                c = f.read().rstrip()
+            repaired = json.loads(c + "\n}\n")
+            _save_recipes(repaired)
+            return repaired
+        except Exception:
+            raise RecipeStoreError(
+                f"recipes.json is corrupted ({e}). "
+                f"Back up {RECIPES_PATH}, repair or delete it, then retry."
+            ) from e
 
 
 def _save_recipes(recipes: dict[str, list[list[str]]]):
@@ -1074,16 +1083,25 @@ def _chrome_state_key() -> tuple:
     )
 
 
+def _chrome_state_unchanged(force: bool) -> bool:
+    if force:
+        return False
+    state = _chrome_state_key()
+    if state == _chrome_last_state:
+        return True
+    return False
+
+
 def _chrome_draw(*, partial: str = "", force: bool = False) -> None:
     """Draw queue panel and prompt on fixed rows below the scroll region.
-    Throttled: skips when state identical (no force, no queue/prompt/height/etc change).
+    Throttled via _chrome_state_unchanged + force.
     """
     if not _chrome_enabled:
         return
     global _chrome_last_state
-    state = _chrome_state_key()
-    if not force and state == _chrome_last_state:
+    if _chrome_state_unchanged(force):
         return
+    state = _chrome_state_key()
     rows = _tty_height()
     scroll_end = _scroll_region_bottom()
     display = _format_queue_display()
@@ -1107,15 +1125,15 @@ def _chrome_draw(*, partial: str = "", force: bool = False) -> None:
 
 def _chrome_refresh(*, force: bool = False, partial: str | None = None) -> None:
     """Repaint pinned chrome when queue state changes.
-    Uses _chrome_state_key + _last_queue_snapshot + force for lightweight throttle:
+    Uses _chrome_state_unchanged + _chrome_state_key + _last_queue_snapshot + force for lightweight throttle:
     skips unnecessary updates/draws/region sets when identical.
     """
     global _last_queue_snapshot, _chrome_last_state
     if not _chrome_enabled:
         return
-    state = _chrome_state_key()
-    if not force and state == _chrome_last_state:
+    if _chrome_state_unchanged(force):
         return
+    state = _chrome_state_key()
     _chrome_last_state = state
     _last_queue_snapshot = _format_queue_display()
     _chrome_update_scroll_region(reposition=True, force=force)
@@ -1437,9 +1455,26 @@ def _tty_apply_arrow_key(
 
 
 def _tty_try_read_orphan_csi(prefix: str) -> str | None:
-    """Parse CSI/SS3 that lost its leading ESC (TextIO read-ahead edge case)."""
+    """Parse CSI/SS3 that lost its leading ESC (TextIO read-ahead edge case).
+
+    Fast-paths literal [ / O (common in queries/regex) without full CSI poll delay.
+    """
     pending = [prefix] + _tty_slurp_stdin(stop_on_newline=False)
-    deadline = time.monotonic() + 0.05
+    # Quick bail for literal input of [ or O that doesn't look like CSI continuation.
+    # This avoids 10-50ms polling lag on every normal '[' or 'O' typed (e.g. in /search globs or regex).
+    if prefix == "[":
+        if len(pending) < 2 or not (pending[1].isdigit() or pending[1] in ";-" or pending[1].isalpha()):
+            extras = pending[1:]
+            if extras:
+                _tty_unread_stdin_many(extras)
+            return None
+    elif prefix == "O":
+        if len(pending) < 2 or not pending[1].isalpha():
+            extras = pending[1:]
+            if extras:
+                _tty_unread_stdin_many(extras)
+            return None
+    deadline = time.monotonic() + _ORPHAN_CSI_WAIT_S
     while time.monotonic() < deadline:
         seq, used = _tty_try_parse_esc_from_pending(pending)
         if seq is not None:
@@ -1454,9 +1489,14 @@ def _tty_try_read_orphan_csi(prefix: str) -> str | None:
             break
         if ch in ("\n", "\r"):
             _tty_unread_stdin_byte(ch)
-            break
+            extras = pending[1:]
+            if extras:
+                _tty_unread_stdin_many(extras)
+            return None
         pending.append(ch)
-    _tty_unread_stdin_many(pending)
+    extras = pending[1:]
+    if extras:
+        _tty_unread_stdin_many(extras)
     return None
 
 
@@ -1566,7 +1606,8 @@ def _tty_read_line() -> str:
                 _tty_refresh_input(buf, pos)
     finally:
         if use_real_tty and old is not None:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            with contextlib.suppress(Exception):
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
 def _patch_repl_print(active: bool) -> None:
@@ -2495,6 +2536,7 @@ def do_help() -> str:
     /prune                      Remove orphan elements Infinibrowser can't fill
     /export [path]              Export discoveries as .ic save file
     /history                    Show combinations tried this session
+    /clear                      Clear output (browser only)
     /queue                      Show running and pending commands (status also appears above the prompt)
     /help                       Show this help
     /quit                       Exit
@@ -2804,15 +2846,13 @@ def _erase_queue_panel():
 
 def _paint_queue_panel(force: bool = False):
     """Redraw the queue panel above the prompt; clear it when idle.
-    Lightweight throttle for chrome path using state_key / snapshot + force.
+    Lightweight throttle for chrome path using _chrome_state_unchanged / state_key / snapshot + force.
     """
     global _last_queue_snapshot, _queue_panel_height
     if _chrome_enabled:
         if not force:
-            # early throttle using state (covers queue/prompt/confirm/height/width deltas etc)
-            state = _chrome_state_key()
-            if state == _chrome_last_state:
-                # keep snapshot in sync if display same
+            # early throttle using _chrome_state_unchanged (covers queue/prompt/confirm/height/width deltas etc)
+            if _chrome_state_unchanged(force):
                 return
         with _repl_print_lock:
             _chrome_refresh(force=force)
@@ -3191,6 +3231,10 @@ async def interactive_mode():
 
                 _enqueue_command_line(line, client, storage)
     finally:
+        # Best-effort cleanup of worker on any exit (including uncaught exceptions or KI
+        # during input) to avoid lingering high-memory processes/threads.
+        if _api_worker_task is not None and not _api_worker_task.done():
+            _api_worker_task.cancel()
         _patch_repl_print(False)
         _chrome_disable()
         _interactive_mode_active = False
