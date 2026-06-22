@@ -1,6 +1,5 @@
 """Tests for fetch_json (shared HTTP helper) and Infinibrowser wrappers."""
 
-import json
 import sys
 import pytest
 from unittest.mock import patch, MagicMock

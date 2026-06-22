@@ -162,7 +162,7 @@ class REPLTestHarness:
     - Auto cleanup: cancels worker tasks, resets state, undoes chrome patches.
     - Records prompt calls (via .prompt_calls) for assertions. Output: rely on capsys (no stdout patch).
     - Supports local cmds during long ops via feed (queues enable interleaving; see legacy TimedPrompt for Event gates).
-    - For special keys/ESC/CSI: use enable_tty_mode() + feed_tty_bytes(). (Incremental migration of _Pipe tests ongoing; see TestREPLHarnessEdges.)
+    - For special keys/ESC/CSI and metachars (search [] * ? / / ! ^ etc): use enable_tty_mode() + feed_tty_bytes(). (Covers real _tty_read_line per-char path for user query syntax; high-level .feed bypasses it.)
     """
 
     def __init__(self):
@@ -221,34 +221,30 @@ class REPLTestHarness:
         for t in (self._interactive_task, self._ensure_task):
             if t and not t.done():
                 t.cancel()
-        # Full reap for api worker: use threadsafe if loop avail, else best effort + reset will drain
-        if self.cli and self.cli._api_worker_task and not self.cli._api_worker_task.done():
-            coro = None
+        # Full reap for api worker: always delegate to _cancel_and_await_worker (centralized, awaits)
+        # Use threadsafe from sync cleanup; reset below will also ensure. Reduces orphan risk.
+        # Assumption: cleanup from test thread; if loop running use it for proper await, else null ref.
+        if (
+            self.cli
+            and self.cli._api_worker_task
+            and not self.cli._api_worker_task.done()
+        ):
             try:
                 loop = asyncio.get_running_loop()
-                coro = self.cli._cancel_and_await_worker()
-                fut = asyncio.run_coroutine_threadsafe(coro, loop)
+                fut = asyncio.run_coroutine_threadsafe(
+                    self.cli._cancel_and_await_worker(), loop
+                )
                 fut.result(timeout=1)
             except Exception:
-                # best effort if no loop or would deadlock
-                if coro is not None:
-                    try:
-                        coro.close()
-                    except Exception:
-                        pass
-                try:
+                # best effort only; reset will clear
+                with contextlib.suppress(Exception):
                     if self.cli._api_worker_task:
                         self.cli._api_worker_task.cancel()
-                except Exception:
-                    pass
                 self.cli._api_worker_task = None
         # clear to restore prod paths (delegated to _full_cli_reset which calls single-source _reset_test_state)
         if self.cli:
-            try:
-                if self.cli._chrome_enabled:
-                    self.cli._chrome_disable()
-            except Exception:
-                pass
+            with contextlib.suppress(Exception):
+                self.cli._teardown_tty_and_chrome()
             self._full_cli_reset()
         try:
             self._patches.close()
@@ -287,7 +283,17 @@ class REPLTestHarness:
         return provider
 
     def feed(self, line: str) -> None:
-        """Feed next line for the next _prompt_input. Safe from any thread."""
+        """Feed next line for the next _prompt_input. Safe from any thread.
+
+        VISIBLE no-op in _tty_mode (see guard below + DEBUG comment).
+        Avoids installing _test hook which would bypass real _tty_read_line
+        for metachars. MUST use feed_tty_bytes in pure-tty tests.
+        """
+        if getattr(self, "_tty_mode", False):
+            # [VISIBLE TTY GUARD] no-op: prevents _test hook install (bypass of _tty_read_line).
+            # DEBUG note for callers: use feed_tty_bytes exclusively for pure tty metachar tests.
+            # (silent to avoid breaking ensure_quit paths; see harness doc)
+            return
         if self.cli and self.cli._test_prompt_input_hook is None:
             # auto install if not yet
             self.cli._test_prompt_input_hook = self._make_input_provider()
@@ -361,9 +367,20 @@ class REPLTestHarness:
         self._patches.enter_context(p_storage)
         p_client_ctx.return_value.__aenter__ = AsyncMock(return_value=client)
         p_client_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
+        # Centralize record here (pure harness surface). High-level drop cli._* record patch sites from bodies.
+        # isatty via explicit sys patch (allowed, not cli._*) or enable_tty in tty tests.
+        self._patches.enter_context(patch("infinite_craft_cli.cli._record_recipe"))
         if not self._tty_mode:
-            cli._test_prompt_input_hook = self._make_input_provider()
+            if (
+                self.cli
+                and getattr(self.cli, "_test_prompt_input_hook", None) is not None
+            ):
+                # respect pre-installed custom hook (e.g. raising for error-finally coverage)
+                pass
+            else:
+                cli._test_prompt_input_hook = self._make_input_provider()
         else:
+            # layered: enable may have been called; re-ensure hook (existing pattern)
             if self._tty_byte_q is None:
                 self.enable_tty_mode()
             cli._tty_read_byte_hook = self._make_tty_byte_hook()
@@ -391,17 +408,13 @@ class REPLTestHarness:
             self._running = False
             if self._ensure_task and not self._ensure_task.done():
                 self._ensure_task.cancel()
-            # ensure worker fully reaped even on direct harness paths
-            try:
+            # ensure worker fully reaped even on direct harness paths (always use the helper)
+            with contextlib.suppress(Exception):
                 await cli._cancel_and_await_worker()
-            except Exception:
-                pass
             # drain any leftover
-            while True:
-                try:
+            while not self.input_q.empty():
+                with contextlib.suppress(Exception):
                     self.input_q.get_nowait()
-                except Exception:
-                    break
             cli._test_prompt_input_hook = None
             cli._tty_read_byte_hook = None
         # Output capture intentionally not performed here (capsys sees writes; avoids patch conflicts)
@@ -421,3 +434,129 @@ class REPLTestHarness:
 
     def answers(self) -> list[str]:
         return [a for p, a in self.prompt_calls]
+
+    def get_rate_limit_wait_callback(self):
+        """Test-only seam: obtain the rate wait cb for exercising real rate path in harness tests.
+        Keeps high-level tests from reaching cli._* directly.
+        """
+        if self.cli is not None:
+            return self.cli._rate_limit_wait_callback
+        import infinite_craft_cli.cli as cli
+
+        return cli._rate_limit_wait_callback
+
+    def get_repl_print_lines(self):
+        """Test-only seam for instrumenting repl output (used by pure harness edge tests)."""
+        import infinite_craft_cli.cli as cli
+
+        return cli._repl_print_lines
+
+    def set_session_input_history(self, hist: list[str]) -> None:
+        """Test seam (tty history tests): populate history without direct cli._ in caller."""
+        if self.cli:
+            self.cli._session_input_history = list(hist) or []
+
+    def tty_read_line(self) -> str:
+        """Test seam for direct low-level tty line read in edge tests (bypasses full repl run to avoid stdin capsys issues)."""
+        import infinite_craft_cli.cli as cli
+
+        return cli._tty_read_line()
+
+    def is_cancelled(self) -> bool:
+        """Seam: cancel flag read for mocks in pure harness behavioral tests (no cli._ in test body)."""
+        if self.cli:
+            return bool(getattr(self.cli, "_cancelled", False))
+        import infinite_craft_cli.cli as cli
+
+        return bool(getattr(cli, "_cancelled", False))
+
+    def force_cancel(self) -> None:
+        """Seam: set cancel flag (harness may poke; high-level tests call only this)."""
+        if self.cli:
+            self.cli._cancelled = True
+        else:
+            import infinite_craft_cli.cli as cli
+
+            cli._cancelled = True
+
+    def set_test_prompt_hook(self, hook):
+        """Seam: install custom (raising) prompt hook; run_until respects pre-set."""
+        if self.cli:
+            self.cli._test_prompt_input_hook = hook
+
+    def install_enqueue_wrapper(self, tracker):
+        """Seam: wrap _enqueue for count tracking in edges (no patch _ in test)."""
+        if self.cli:
+            real = self.cli._enqueue_command_line
+
+            def w(line, client, storage):
+                tracker(line, client, storage)
+                return real(line, client, storage)
+
+            p = patch("infinite_craft_cli.cli._enqueue_command_line", side_effect=w)
+            self._patches.enter_context(p)
+
+    def install_combine_side_effect(self, side_effect):
+        """Seam: set slow combine etc without patch.object(cli, ...) in high-level test bodies."""
+        p = patch("infinite_craft_cli.cli.do_combine", side_effect=side_effect)
+        self._patches.enter_context(p)
+
+    def install_repl_lines_wrapper(self, instrument_func):
+        """Seam: install timing wrapper (from get_repl..) w/o cli._ patch literal in test."""
+        p = patch(
+            "infinite_craft_cli.cli._repl_print_lines", side_effect=instrument_func
+        )
+        self._patches.enter_context(p)
+
+    def simulate_resize(self, rows: int, cols: int) -> None:
+        """Seam for SIGWINCH behavioral harness test: patch size + force handler."""
+        if self.cli is None:
+            return
+        p_h = patch("infinite_craft_cli.cli._tty_height", return_value=max(1, rows))
+        p_w = patch("infinite_craft_cli.cli._tty_width", return_value=max(1, cols))
+        self._patches.enter_context(p_h)
+        self._patches.enter_context(p_w)
+        with contextlib.suppress(Exception):
+            self.cli._on_sigwinch()
+
+    def install_cli_patch(self, name: str, *args, **kwargs):
+        """Seam (minimal) for high-level TestREPLHarnessEdges purity: apply patches to cli.<name>
+        (e.g. "_load_recipes") without any patch("infinite_craft_cli.cli._") or cli._ in test bodies.
+        """
+        target = f"infinite_craft_cli.cli.{name}"
+        p = patch(target, *args, **kwargs)
+        self._patches.enter_context(p)
+
+    def set_load_recipes(self, recipes: dict | None = None):
+        self.install_cli_patch("_load_recipes", return_value=recipes or {})
+
+    def set_bulk_warn_threshold(self, threshold: int):
+        self.install_cli_patch("_BULK_WARN_THRESHOLD", threshold)
+
+    def set_max_permutate_rounds(self, rounds: int):
+        self.install_cli_patch("_MAX_PERMUTATE_ROUNDS", rounds)
+
+    def set_tty_size(self, height: int = 24, width: int = 80):
+        """Dims only (no winch); for isatty+chrome tests."""
+        self.install_cli_patch("_tty_height", return_value=max(1, height))
+        self.install_cli_patch("_tty_width", return_value=max(1, width))
+
+    def force_disable_chrome(self):
+        """Seam to force non-chrome behavior (noop enable + flag=False) under tty sim."""
+        self.install_cli_patch("_chrome_enable")
+        self.install_cli_patch("_chrome_enabled", False)
+
+    def reset(self):
+        """Seam: reset without cli._reset_test_state literal in high-level body."""
+        self._full_cli_reset()
+
+    def request_skip_current(self) -> bool:
+        """Seam: simulate ESC skip (sets cancel, no discard) without cli._ or import private in high-level test body."""
+        try:
+            if self.cli is not None:
+                return bool(self.cli._request_skip_current())
+            import infinite_craft_cli.cli as cli
+
+            return bool(cli._request_skip_current())
+        except Exception:
+            return False

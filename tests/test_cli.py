@@ -20,7 +20,7 @@ def run_async(coro):
 class TestArgParsing:
     def test_combine_args(self):
         from infinite_craft_cli.cli import main
-        import argparse
+
         with patch("sys.argv", ["infinite-craft", "combine", "Water", "Fire"]):
             with patch("asyncio.run") as mock_run:
                 with patch("infinite_craft_cli.cli.interactive_mode"):
@@ -30,6 +30,7 @@ class TestArgParsing:
 
     def test_search_args(self):
         from infinite_craft_cli.cli import main
+
         with patch("sys.argv", ["infinite-craft", "search", "steam"]):
             with patch("asyncio.run") as mock_run:
                 with patch("infinite_craft_cli.cli.interactive_mode"):
@@ -39,6 +40,7 @@ class TestArgParsing:
 
     def test_list_args(self):
         from infinite_craft_cli.cli import main
+
         with patch("sys.argv", ["infinite-craft", "list"]):
             with patch("asyncio.run") as mock_run:
                 with patch("infinite_craft_cli.cli.interactive_mode"):
@@ -48,6 +50,7 @@ class TestArgParsing:
 
     def test_no_args_interactive(self):
         from infinite_craft_cli.cli import main
+
         with patch("sys.argv", ["infinite-craft"]):
             with patch("asyncio.run") as mock_run:
                 with patch("infinite_craft_cli.cli.interactive_mode"):
@@ -57,6 +60,7 @@ class TestArgParsing:
 
     def test_version_flag(self):
         from infinite_craft_cli.cli import main
+
         with patch("sys.argv", ["infinite-craft", "--version"]):
             with pytest.raises(SystemExit) as exc_info:
                 main()
@@ -64,6 +68,7 @@ class TestArgParsing:
 
     def test_with_args(self):
         from infinite_craft_cli.cli import main
+
         with patch("sys.argv", ["infinite-craft", "with", "Water", "/^fi/"]):
             with patch("asyncio.run") as mock_run:
                 with patch("infinite_craft_cli.cli.interactive_mode"):
@@ -73,6 +78,7 @@ class TestArgParsing:
 
     def test_exhaust_args(self):
         from infinite_craft_cli.cli import main
+
         with patch("sys.argv", ["infinite-craft", "exhaust", "w*"]):
             with patch("asyncio.run") as mock_run:
                 with patch("infinite_craft_cli.cli.interactive_mode"):
@@ -82,6 +88,7 @@ class TestArgParsing:
 
     def test_permutate_args(self):
         from infinite_craft_cli.cli import main
+
         with patch("sys.argv", ["infinite-craft", "permutate", "w*"]):
             with patch("asyncio.run") as mock_run:
                 with patch("infinite_craft_cli.cli.interactive_mode"):
@@ -93,6 +100,7 @@ class TestArgParsing:
 class TestNonInteractiveMode:
     def test_combine_command(self, capsys):
         from infinite_craft_cli.cli import noninteractive_mode
+
         args = MagicMock()
         args.command = "combine"
         args.first = "Water"
@@ -121,6 +129,7 @@ class TestNonInteractiveMode:
 
     def test_search_command(self, capsys):
         from infinite_craft_cli.cli import noninteractive_mode
+
         args = MagicMock()
         args.command = "search"
         args.query = "water"
@@ -137,6 +146,7 @@ class TestNonInteractiveMode:
 
     def test_list_command(self, capsys):
         from infinite_craft_cli.cli import noninteractive_mode
+
         args = MagicMock()
         args.command = "list"
         storage = make_mock_storage()
@@ -152,16 +162,19 @@ class TestNonInteractiveMode:
 
     def test_with_command(self, capsys):
         from infinite_craft_cli.cli import noninteractive_mode
+
         args = MagicMock()
         args.command = "with"
         args.element = "Water"
         args.query = "/^fi/"
         client = make_mock_client()
-        storage = make_mock_storage([
-            MockElement("Water", "💧"),
-            MockElement("Fire", "🔥"),
-            MockElement("Firewall", "🧱"),
-        ])
+        storage = make_mock_storage(
+            [
+                MockElement("Water", "💧"),
+                MockElement("Fire", "🔥"),
+                MockElement("Firewall", "🧱"),
+            ]
+        )
         nothing = MagicMock()
         nothing.name = None
         client.pair.return_value = nothing
@@ -184,16 +197,19 @@ class TestNonInteractiveMode:
 
     def test_cross_command(self, capsys):
         from infinite_craft_cli.cli import noninteractive_mode
+
         args = MagicMock()
         args.command = "cross"
         args.left = "/^fi/"
         args.right = "/^wa/"
         client = make_mock_client()
-        storage = make_mock_storage([
-            MockElement("Water", "💧"),
-            MockElement("Fire", "🔥"),
-            MockElement("Firewall", "🧱"),
-        ])
+        storage = make_mock_storage(
+            [
+                MockElement("Water", "💧"),
+                MockElement("Fire", "🔥"),
+                MockElement("Firewall", "🧱"),
+            ]
+        )
         nothing = MagicMock()
         nothing.name = None
         client.pair.return_value = nothing
@@ -216,6 +232,7 @@ class TestNonInteractiveMode:
 
     def test_exhaust_command(self, capsys):
         from infinite_craft_cli.cli import noninteractive_mode
+
         args = MagicMock()
         args.command = "exhaust"
         args.query = "water"
@@ -244,14 +261,17 @@ class TestNonInteractiveMode:
 
     def test_permutate_command(self, capsys):
         from infinite_craft_cli.cli import noninteractive_mode
+
         args = MagicMock()
         args.command = "permutate"
         args.query = "w*"
         client = make_mock_client()
-        storage = make_mock_storage([
-            MockElement("Water", "💧"),
-            MockElement("Wind", "🌬️"),
-        ])
+        storage = make_mock_storage(
+            [
+                MockElement("Water", "💧"),
+                MockElement("Wind", "🌬️"),
+            ]
+        )
         nothing = MagicMock()
         nothing.name = None
         client.pair.return_value = nothing

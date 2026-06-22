@@ -15,6 +15,9 @@
   const MATCH_SCAN_BUDGET = 500; // ms (Python MATCH_SCAN_BUDGET=0.5s)
   const REGEX_ERROR_INVALID = "Invalid regex pattern";
   const REGEX_ERROR_COMPLEX = "Regex pattern too complex";
+  const REGEX_TIMEOUT_MS = 20;
+  const MAX_QUEUE_DEPTH = 50;
+  const MAX_PERMUTATE_ROUNDS = 50;
   const RE_NESTED_QUANTIFIER = /(\+|\*|\?|\{\d*,?\d*\})\s*(\+|\*|\?|\{)/;
   const RE_DELIMITED_REGEX = /\/[^/]+\//;
 
@@ -26,6 +29,10 @@
   let cancelled = false;
   let running = false;
   let waitingForConfirm = false;
+  let confirmResolve = null;
+  const commandQueue = [];
+  let currentCommand = null;
+  let activeAbort = null;
 
   // ── CSS ──────────────────────────────────────────────────────────────
   const style = document.createElement("style");
@@ -36,6 +43,10 @@
     #ict-body{background:#1a1a2e;color:#e0e0e0;display:flex;flex-direction:column}
     #ict-output{overflow-y:auto;max-height:300px;padding:6px 10px;white-space:pre-wrap;word-break:break-word}
     #ict-output div{margin:1px 0}
+    #ict-queue{display:none;border-top:1px solid #0f3460;padding:4px 10px;background:#12182b;font-size:12px;max-height:80px;overflow-y:auto}
+    #ict-queue .ict-queue-label{color:#ffeb3b;margin-bottom:2px}
+    #ict-queue .ict-queue-item{margin:1px 0;opacity:.85}
+    #ict-queue .ict-queue-running{color:#ffeb3b;margin-bottom:4px}
     #ict-input-row{display:flex;align-items:center;border-top:1px solid #0f3460;padding:4px 10px;background:#16213e}
     #ict-prompt{color:#00bcd4;margin-right:6px;white-space:nowrap}
     #ict-input{flex:1;background:transparent;border:none;outline:none;color:#e0e0e0;font:inherit;caret-color:#00bcd4}
@@ -52,6 +63,7 @@
     <div id="ict-header"><span>⚡ Infinite Craft Trainer</span><button id="ict-toggle" style="background:none;border:none;color:#e0e0e0;cursor:pointer;font-size:16px">▼</button></div>
     <div id="ict-body">
       <div id="ict-output"></div>
+      <div id="ict-queue"></div>
       <div id="ict-input-row">
         <span id="ict-prompt">craft&gt;</span>
         <input id="ict-input" autocomplete="off" spellcheck="false" placeholder="Type /help for commands">
@@ -61,6 +73,7 @@
   document.body.appendChild(container);
 
   const output = document.getElementById("ict-output");
+  const queueEl = document.getElementById("ict-queue");
   const input = document.getElementById("ict-input");
   const body = document.getElementById("ict-body");
   const toggle = document.getElementById("ict-toggle");
@@ -78,19 +91,34 @@
   });
   stopBtn.addEventListener("click", () => {
     cancelled = true;
-    waitingForConfirm = false;
-    endRun();
+    if (activeAbort) activeAbort.abort();
+    if (waitingForConfirm && confirmResolve) {
+      waitingForConfirm = false;
+      const resolve = confirmResolve;
+      confirmResolve = null;
+      resolve("__cancelled__");
+    }
   });
 
-  function endRun() {
-    running = false;
-    try { stopBtn.style.display = "none"; } catch {}
+  function handleTrainerWheel(e) {
+    if (collapsed || body.style.display === "none") return;
+    output.scrollTop += e.deltaY;
+    e.preventDefault();
+    e.stopPropagation();
   }
+  container.addEventListener("wheel", handleTrainerWheel, { passive: false });
 
   function beginRun() {
     cancelled = false;
     running = true;
+    activeAbort = new AbortController();
     try { stopBtn.style.display = "inline"; } catch {}
+  }
+
+  function endRun() {
+    running = false;
+    activeAbort = null;
+    try { stopBtn.style.display = "none"; } catch {}
   }
 
   input.focus();
@@ -103,6 +131,7 @@
     output.scrollTop = output.scrollHeight;
   }
   function esc(s) { const d = document.createElement("span"); d.textContent = s; return d.innerHTML; }
+  // wrap() inserts html into innerHTML — callers must pass pre-escaped text (via esc()).
   function wrap(cls, html) { return `<span class="${cls}">${html}</span>`; }
   function bold(t) { return wrap("ict-bold", t); }
   function green(t) { return wrap("ict-green", t); }
@@ -300,9 +329,25 @@
 
   // ── Rate limiter ─────────────────────────────────────────────────────
   const timestamps = [];
+  function sleepCancellable(ms) {
+    return new Promise((resolve, reject) => {
+      const step = 50;
+      let elapsed = 0;
+      function tick() {
+        if (cancelled) { reject(new Error("Cancelled")); return; }
+        if (elapsed >= ms) { resolve(); return; }
+        const chunk = Math.min(step, ms - elapsed);
+        elapsed += chunk;
+        setTimeout(tick, chunk);
+      }
+      tick();
+    });
+  }
+
   function acquireRate() {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       function tryAcquire() {
+        if (cancelled) { reject(new Error("Cancelled")); return; }
         const now = Date.now();
         while (timestamps.length && timestamps[0] <= now - RATE_WINDOW) timestamps.shift();
         if (timestamps.length < RATE_LIMIT) {
@@ -310,7 +355,7 @@
           resolve();
         } else {
           const wait = timestamps[0] + RATE_WINDOW - now + 10;
-          setTimeout(tryAcquire, wait);
+          sleepCancellable(wait).then(tryAcquire).catch(reject);
         }
       }
       tryAcquire();
@@ -321,18 +366,22 @@
   function pairKey(a, b) { return [a, b].sort().join("\0"); }
 
   async function apiPair(firstName, secondName) {
+    if (cancelled) throw new Error("Cancelled");
     const key = pairKey(firstName, secondName);
     if (pairCache.has(key)) return pairCache.get(key);
     await acquireRate();
+    if (cancelled) throw new Error("Cancelled");
     const url = `/api/infinite-craft/pair?first=${encodeURIComponent(firstName)}&second=${encodeURIComponent(secondName)}`;
     let resp;
     for (let attempt = 0; attempt < 3; attempt++) {
+      if (cancelled) throw new Error("Cancelled");
       try {
-        resp = await fetch(url);
+        resp = await fetch(url, { signal: activeAbort ? activeAbort.signal : undefined });
         if (resp.ok) break;
       } catch (e) { /* retry */ }
-      if (attempt < 2) await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
+      if (attempt < 2) await sleepCancellable(1000 * Math.pow(2, attempt));
     }
+    if (cancelled) throw new Error("Cancelled");
     if (!resp || !resp.ok) throw new Error("API request failed");
     const json = await resp.json();
     let result = null;
@@ -348,7 +397,9 @@
     const a = resolveElement(aName);
     const b = resolveElement(bName);
     try {
+      beginRun();
       const result = await apiPair(a.text, b.text);
+      if (cancelled) return;
       if (result) {
         addElement(a.text, a.emoji, false);
         addElement(b.text, b.emoji, false);
@@ -361,22 +412,25 @@
         print(formatResult(a, b, null));
       }
     } catch (e) {
-      print("  " + red(`Error: ${e.message}`));
+      if (!cancelled) print("  " + red(`Error: ${esc(e.message)}`));
+    } finally {
+      endRun();
     }
   }
 
   // ── Query matching (parity with Python CLI) ───────────────────────────
   function parseQueryFilter(query) {
     let q = query.trim();
+    let exclude = false;
     let onlyNew = false;
     if (q.startsWith("!")) {
-      onlyNew = true;
+      exclude = true;
       q = q.slice(1);
     } else if (q.startsWith("^")) {
       onlyNew = true;
       q = q.slice(1);
     }
-    return { pattern: q, onlyNew };
+    return { pattern: q, exclude, onlyNew };
   }
 
   function isDelimitedRegex(pattern) {
@@ -402,10 +456,24 @@
     }
     try {
       const re = new RegExp(pattern, "i");
-      return { matched: re.test(name), error: null };
+      const start = performance.now();
+      const matched = re.test(name.slice(0, 512));
+      if (performance.now() - start > REGEX_TIMEOUT_MS) {
+        return { matched: null, error: REGEX_ERROR_COMPLEX };
+      }
+      return { matched, error: null };
     } catch {
       return { matched: null, error: REGEX_ERROR_INVALID };
     }
+  }
+
+  function fnmatchIsSafe(pattern) {
+    if (!pattern || pattern.length > MAX_REGEX_BODY_LENGTH) return false;
+    const wildcards = (pattern.match(/[*?]/g) || []).length;
+    if (wildcards > 10) return false;
+    if (/\*{2,}/.test(pattern) || /\*.*\*.*\*/.test(pattern)) return false;
+    if (RE_NESTED_QUANTIFIER.test(pattern)) return false;
+    return true;
   }
 
   function fnmatchToRegex(pattern) {
@@ -457,7 +525,15 @@
     const nameLower = name.toLowerCase();
     const patternLower = pattern.toLowerCase();
     if (/[*?[\]]/.test(patternLower)) {
-      return { matched: fnmatchToRegex(patternLower).test(nameLower), error: null };
+      if (!fnmatchIsSafe(patternLower)) {
+        return { matched: null, error: REGEX_ERROR_COMPLEX };
+      }
+      const start = performance.now();
+      const matched = fnmatchToRegex(patternLower).test(nameLower.slice(0, 512));
+      if (performance.now() - start > REGEX_TIMEOUT_MS) {
+        return { matched: null, error: REGEX_ERROR_COMPLEX };
+      }
+      return { matched, error: null };
     }
     return { matched: nameLower.includes(patternLower), error: null };
   }
@@ -467,8 +543,12 @@
       return { matches: [], error: `Query too long (max ${MAX_QUERY_LENGTH} characters)` };
     }
     const discoveries = getAllElements();
-    const { pattern, onlyNew } = parseQueryFilter(query);
-    if (!pattern.trim()) return { matches: [], error: null };
+    const { pattern, exclude, onlyNew } = parseQueryFilter(query);
+    if (!pattern.trim()) {
+      if (exclude) return { matches: discoveries, error: null };
+      if (onlyNew) return { matches: discoveries.filter(e => e.discovered), error: null };
+      return { matches: [], error: null };
+    }
 
     const matches = [];
     let matchError = null;
@@ -482,7 +562,11 @@
         matchError = error;
         break;
       }
-      if (matched) matches.push(e);
+      if (exclude) {
+        if (!matched) matches.push(e);
+      } else if (matched) {
+        matches.push(e);
+      }
     }
     if (matchError) return { matches: [], error: matchError };
     if (onlyNew) {
@@ -516,10 +600,44 @@
     return [first, second];
   }
 
-  function parseTwoElements(rest) {
+  function splitTwoPositionalArgs(rest) {
     rest = rest.trim();
-    if (rest.includes(" + ")) return splitOnce(rest, " + ");
-    return splitOnFirstWhitespace(rest);
+    if (!rest) return null;
+    const tokens = [];
+    let i = 0;
+    const n = rest.length;
+    while (i < n && tokens.length < 2) {
+      while (i < n && /\s/.test(rest[i])) i++;
+      if (i >= n) break;
+      let token;
+      if (rest[i] === "/") {
+        const j = rest.indexOf("/", i + 1);
+        if (j < 0) {
+          let k = i;
+          while (k < n && !/\s/.test(rest[k])) k++;
+          token = rest.slice(i, k);
+          i = k;
+        } else {
+          token = rest.slice(i, j + 1);
+          i = j + 1;
+        }
+      } else {
+        let j = i;
+        while (j < n && !/\s/.test(rest[j])) j++;
+        token = rest.slice(i, j);
+        i = j;
+      }
+      token = token.trim();
+      if (token) tokens.push(token);
+    }
+    if (tokens.length !== 2) return null;
+    while (i < n && /\s/.test(rest[i])) i++;
+    if (i < n) return null;
+    return tokens;
+  }
+
+  function parseTwoElements(rest) {
+    return splitOnFirstWhitespace(rest.trim());
   }
 
   function parseWithArgs(rest) {
@@ -527,81 +645,225 @@
   }
 
   function parseCrossQueries(rest) {
-    rest = rest.trim();
-    if (rest.includes(" * ")) return splitOnce(rest, " * ");
-    if (containsDelimitedRegex(rest)) return null;
-    return splitOnFirstWhitespace(rest);
+    return splitTwoPositionalArgs(rest);
+  }
+
+  function slashCombineCrawlOperatorError(rest, kind) {
+    if (!rest.includes(" + ")) return null;
+    const parts = rest.split(" + ", 2);
+    const positional = `/${kind} ${parts[0].trim()} ${parts[1].trim()}`;
+    return `  Slash /${kind} uses positional args, not +. Try ${yellow(rest.trim())} (shorthand) or ${yellow(positional)}.`;
+  }
+
+  function slashCrossOperatorError(rest) {
+    if (!rest.includes(" * ")) return null;
+    const parts = rest.split(" * ", 2);
+    const positional = `/cross ${parts[0].trim()} ${parts[1].trim()}`;
+    return `  Slash /cross uses positional args, not *. Try ${yellow(rest.trim())} (shorthand) or ${yellow(positional)}.`;
+  }
+
+  const API_SLASH_COMMANDS = [
+    "/permute", "/permutate", "/import", "/fill", "/prune", "/export",
+    "/exhaust", "/combine", "/crawl", "/with", "/cross",
+  ];
+
+  function isSlashCommandAttempt(line) {
+    if (!line.startsWith("/")) return false;
+    if (/^\/[^/]+\//.test(line)) return false;
+    return /^\/\w/.test(line);
+  }
+
+  function classifyCommandLine(line) {
+    line = line.trim();
+    if (!line) return null;
+    for (const cmd of API_SLASH_COMMANDS) {
+      const rest = slashArgs(line, cmd);
+      if (rest !== null) return [cmd.slice(1), rest];
+    }
+    if (isSlashCommandAttempt(line)) return null;
+    if (/\+\s+\|/.test(line)) return ["bad+|", line];
+    if (line.includes(" ++ ")) return ["++", line];
+    if (line.includes("+|")) return ["+|", line];
+    if (line.includes(" * ")) return ["*", line];
+    if (line.includes(" + ") || / \+$/.test(line.trimEnd())) return ["+", line];
+    return null;
+  }
+
+  function validateQueryAtEnqueue(query) {
+    if (query.length > MAX_QUERY_LENGTH) {
+      return `  Query too long (max ${MAX_QUERY_LENGTH} characters)`;
+    }
+    const { pattern } = parseQueryFilter(query);
+    const q = pattern.trim();
+    if (!isDelimitedRegex(q)) return null;
+    const body = q.slice(1, -1);
+    if (!regexIsSafe(body)) return `  ${REGEX_ERROR_COMPLEX}`;
+    try {
+      new RegExp(body, "i");
+    } catch {
+      return `  ${REGEX_ERROR_INVALID}`;
+    }
+    return null;
+  }
+
+  function slashCombineCrawlPipeError(rest) {
+    if (/\+\s+\|/.test(rest)) {
+      return `  Use <element> +| <query> (no space between + and |). Type ${yellow("/help")} for commands.`;
+    }
+    const parsed = parseTwoElements(rest);
+    if (parsed && parsed[1].startsWith("|")) {
+      return `  Use <element> +| <query> (no space between + and |). Type ${yellow("/help")} for commands.`;
+    }
+    return null;
+  }
+
+  function validateCommandLine(line) {
+    const classified = classifyCommandLine(line);
+    if (!classified) {
+      if (isSlashCommandAttempt(line)) {
+        const cmd = line.trim().split(/\s/)[0];
+        return `  Unknown command: ${esc(cmd)}. Type ${yellow("/help")} for commands.`;
+      }
+      return `  Unknown input. Type ${yellow("/help")} for commands.`;
+    }
+    const [kind, payload] = classified;
+    if (kind === "bad+|") {
+      return `  Use <element> +| <query> (no space between + and |). Type ${yellow("/help")} for commands.`;
+    }
+    if (kind === "permute" || kind === "permutate" || kind === "exhaust") {
+      if (!payload.trim()) return `  Usage: /${kind} <query>`;
+      return validateQueryAtEnqueue(payload.trim());
+    }
+    if (kind === "import") {
+      if (!payload.trim()) return "  Usage: /import <element>";
+      return null;
+    }
+    if (kind === "export" || kind === "fill" || kind === "prune") {
+      return null;
+    }
+    if (kind === "combine" || kind === "crawl") {
+      const pipeErr = slashCombineCrawlPipeError(payload);
+      if (pipeErr) return pipeErr;
+      const opErr = slashCombineCrawlOperatorError(payload, kind);
+      if (opErr) return opErr;
+      if (!parseTwoElements(payload)) return `  Usage: /${kind} <element> <element>`;
+      return null;
+    }
+    if (kind === "with") {
+      const parsed = parseWithArgs(payload);
+      if (!parsed) return "  Usage: /with <element> <query>";
+      return validateQueryAtEnqueue(parsed[1]);
+    }
+    if (kind === "cross") {
+      const opErr = slashCrossOperatorError(payload);
+      if (opErr) return opErr;
+      const parsed = parseCrossQueries(payload);
+      if (!parsed) return "  Usage: /cross <query> <query>";
+      return validateQueryAtEnqueue(parsed[0]) || validateQueryAtEnqueue(parsed[1]);
+    }
+    if (kind === "++") {
+      const parts = payload.split(" ++ ", 2);
+      if (!parts[0].trim() || !parts[1].trim()) return "  Usage: <element> ++ <element>";
+      return null;
+    }
+    if (kind === "+|") {
+      const parts = payload.split("+|", 2);
+      if (!parts[0].trim() || !parts[1].trim()) return "  Usage: <element> +| <query>";
+      return validateQueryAtEnqueue(parts[1].trim());
+    }
+    if (kind === "*") {
+      const parts = payload.split(" * ", 2);
+      if (!parts[0].trim() || !parts[1].trim()) return "  Usage: <query> * <query>";
+      return validateQueryAtEnqueue(parts[0].trim()) || validateQueryAtEnqueue(parts[1].trim());
+    }
+    if (kind === "+") {
+      const parts = payload.includes(" + ")
+        ? payload.split(" + ", 2)
+        : [payload.trimEnd().replace(/ \+$/, ""), ""];
+      if (!parts[0].trim() || !parts[1].trim()) return "  Usage: <element> + <element>";
+      return null;
+    }
+    return null;
   }
 
   // ── Bulk pair processor ──────────────────────────────────────────────
-  async function runPairs(pairs) {
+  async function runPairsInner(pairs) {
     let done = 0, newCount = 0, nothingCount = 0, errors = 0;
     const total = pairs.length;
-    try {
-      beginRun();
-      for (const [a, b] of pairs) {
+    for (const [a, b] of pairs) {
+      if (cancelled) { print("  " + yellow("Cancelled.")); break; }
+      try {
+        const result = await apiPair(a.text, b.text);
         if (cancelled) { print("  " + yellow("Cancelled.")); break; }
-        try {
-          const result = await apiPair(a.text, b.text);
-          done++;
-          if (result) {
-            const isNew = addElement(result.text, result.emoji, result.discovered);
-            recordRecipe(result.text, a.text, b.text);
-            history.push({ a: a.text, b: b.text, result: result.text });
-            if (isNew) {
-              newCount++;
-              print(`  ${dim(`[${done}/${total}]`)} ${formatResult(a, b, result)} ${green("(new)")}`);
-            }
-          } else {
-            nothingCount++;
-            history.push({ a: a.text, b: b.text, result: "Nothing" });
+        done++;
+        if (result) {
+          const isNew = addElement(result.text, result.emoji, result.discovered);
+          recordRecipe(result.text, a.text, b.text);
+          history.push({ a: a.text, b: b.text, result: result.text });
+          if (isNew) {
+            newCount++;
+            print(`  ${dim(`[${done}/${total}]`)} ${formatResult(a, b, result)} ${green("(new)")}`);
           }
-        } catch (e) {
-          done++;
-          errors++;
+        } else {
+          nothingCount++;
+          history.push({ a: a.text, b: b.text, result: "Nothing" });
         }
-        // Yield to UI
-        await new Promise(r => setTimeout(r, 0));
+      } catch (e) {
+        if (cancelled) { print("  " + yellow("Cancelled.")); break; }
+        done++;
+        errors++;
       }
-    } finally {
-      endRun();
+      await new Promise(r => setTimeout(r, 0));
     }
-    print(`  Done: ${green(String(newCount))} new, ${dim(String(nothingCount))} nothing, ${errors ? red(String(errors)) + " errors" : "0 errors"} (${done}/${total})`);
+    if (!cancelled) {
+      print(`  Done: ${green(String(newCount))} new, ${dim(String(nothingCount))} nothing, ${errors ? red(String(errors)) + " errors" : "0 errors"} (${done}/${total})`);
+    }
   }
 
   async function confirmAndRunPairs(pairs) {
-    if (pairs.length > BULK_WARN) {
-      try {
-        beginRun();
+    try {
+      beginRun();
+      if (pairs.length > BULK_WARN) {
         print(`  ${yellow(`${pairs.length} pairs`)} — type ${bold("y")} or ${bold("yes")} to continue, anything else to cancel.`);
         const answer = await waitForInput();
-        if (!["y", "yes"].includes(answer.toLowerCase())) { print("  Cancelled."); return; }
-      } finally {
-        endRun();
+        if (cancelled || answer === "__cancelled__" || !["y", "yes"].includes(answer.toLowerCase())) {
+          print("  Cancelled.");
+          return;
+        }
       }
+      if (cancelled) return;
+      print(`  Running ${bold(String(pairs.length))} combinations...`);
+      await runPairsInner(pairs);
+    } finally {
+      endRun();
     }
-    print(`  Running ${bold(String(pairs.length))} combinations...`);
-    await runPairs(pairs);
   }
 
   function waitForInput() {
     return new Promise((resolve) => {
       waitingForConfirm = true;
+      confirmResolve = resolve;
       function cleanup() {
         waitingForConfirm = false;
+        confirmResolve = null;
         try { input.removeEventListener("keydown", handler, true); } catch {}
       }
       function handler(e) {
         if (e.key === "Enter") {
-          e.stopImmediatePropagation();
           const val = input.value.trim();
+          if (isLocalCommand(val)) return;
+          e.stopImmediatePropagation();
           input.value = "";
-          cleanup();
-          resolve(val);
+          const answer = val.toLowerCase();
+          if (answer === "y" || answer === "yes" || answer === "n" || answer === "no" || answer === "") {
+            cleanup();
+            resolve(val);
+          } else {
+            tryEnqueue(val);
+          }
         }
       }
       try {
-        // Use capture to get this before the main handler
         input.addEventListener("keydown", handler, true);
       } catch (err) {
         cleanup();
@@ -636,7 +898,7 @@
     }
     // BFS to find shortest path from base elements (or terminal constituents
     // that have no recipe entry of their own, e.g. leaves from /fill or /import).
-    // NOTE: Keep this logic in sync with bookmarklet/trainer.js (and vice-versa).
+    // NOTE: Keep this logic in sync with extension/trainer.js (and vice-versa).
     const visited = new Set(BASE_ELEMENTS);
     const layers = [];
     let found = false;
@@ -686,15 +948,31 @@
     }
   }
 
-  async function doExhaust(name) {
-    const target = resolveElement(name);
+  async function doExhaust(query) {
+    const { matches, error } = matchElements(query);
+    if (error) { print("  " + red(error)); return; }
+    if (!matches.length) { print(`  No elements match: ${esc(query)}`); return; }
+
     const all = getAllElements();
-    const pairs = all.filter(e => e.text !== target.text).map(e => [target, e]);
+    const seen = new Set();
+    const pairs = [];
+    for (const target of matches) {
+      for (const other of all) {
+        if (other.text === target.text) continue;
+        const key = pairKey(target.text, other.text);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        pairs.push([target, other]);
+      }
+    }
     if (!pairs.length) {
-      print(`  No other elements to combine with ${bold(esc(target.text))}.`);
+      print(`  No valid pairs for query: ${esc(query)}`);
       return;
     }
-    print(`  Combining ${bold(esc(target.text))} with ${pairs.length} elements...`);
+    print(`  Exhausting ${matches.length} element(s) matching ${yellow(esc(query))} with all discoveries (${pairs.length} pairs)...`);
+    if (matches.length <= 10) {
+      for (const m of matches) print(`    ${formatElement(m)}`);
+    }
     await confirmAndRunPairs(pairs);
   }
 
@@ -709,6 +987,7 @@
       let pool = new Set();
       const tried = new Set();
       const result = await apiPair(a.text, b.text);
+      if (cancelled) { print("  " + yellow("Crawl cancelled.")); return; }
       tried.add(pairKey(a.text, b.text));
       if (result) {
         addElement(a.text, a.emoji, false);
@@ -752,7 +1031,9 @@
                 print(`  ${formatResult(pa, pb, r)} ${green("(new)")}`);
               }
             }
-          } catch { /* skip */ }
+          } catch (e) {
+            if (cancelled) break;
+          }
           await new Promise(r => setTimeout(r, 0));
         }
         print(`  ${dim(`Gen ${gen} done:`)} ${green(String(newInGen))} new elements.`);
@@ -760,7 +1041,7 @@
         gen++;
       }
       if (cancelled) print("  " + yellow("Crawl cancelled."));
-      print(`  Pool size: ${bold(String(pool.size))} elements.`);
+      else print(`  Pool size: ${bold(String(pool.size))} elements.`);
     } finally {
       endRun();
     }
@@ -783,6 +1064,69 @@
     print(`  ${matches.length} elements match, ${pairs.length} unique pairs:`);
     for (const m of matches) print(`    ${formatElement(m)}`);
     await confirmAndRunPairs(pairs);
+  }
+
+  async function doPermutate(query) {
+    let round = 0;
+    let confirmed = false;
+    let stopped = false;
+    print(`  Permutating matches for ${yellow(esc(query))} until no new discoveries...`);
+
+    try {
+      beginRun();
+      while (true) {
+        if (cancelled) { stopped = true; break; }
+        if (round >= MAX_PERMUTATE_ROUNDS) {
+          print(`  Reached max rounds (${MAX_PERMUTATE_ROUNDS}). Stopping.`);
+          break;
+        }
+        round++;
+        const knownBefore = new Set(getAllElements().map(e => e.text));
+        const { matches, error } = matchElements(query);
+        if (error) { print("  " + red(error)); return; }
+        if (!matches.length) { print("  No elements match that query."); return; }
+        if (matches.length === 1) {
+          print(`  Only one match: ${formatElement(matches[0])}. Need at least two.`);
+          return;
+        }
+
+        const pairs = [];
+        for (let i = 0; i < matches.length; i++) {
+          for (let j = i + 1; j < matches.length; j++) {
+            pairs.push([matches[i], matches[j]]);
+          }
+        }
+        print(`  ${dim(`--- Round ${round}:`)} ${matches.length} elements, ${pairs.length} pairs ---`);
+
+        if (!confirmed && pairs.length > BULK_WARN) {
+          print(`  ${yellow(`${pairs.length} pairs per round`)} — type ${bold("y")} or ${bold("yes")} to continue.`);
+          const answer = await waitForInput();
+          if (cancelled || answer === "__cancelled__" || !["y", "yes"].includes(answer.toLowerCase())) {
+            print("  Cancelled.");
+            return;
+          }
+          confirmed = true;
+        }
+
+        await runPairsInner(pairs);
+        if (cancelled) { stopped = true; break; }
+
+        const knownAfter = new Set(getAllElements().map(e => e.text));
+        let newCount = 0;
+        for (const name of knownAfter) {
+          if (!knownBefore.has(name)) newCount++;
+        }
+        print(`  +${newCount} new elements`);
+        if (newCount === 0) {
+          print("  No new discoveries. Stopping.");
+          break;
+        }
+      }
+      if (stopped) print("  " + yellow("Stopped."));
+      else print(`  Permutate done after ${round} round(s).`);
+    } finally {
+      endRun();
+    }
   }
 
   async function doCross(leftQ, rightQ) {
@@ -831,11 +1175,12 @@
   // Fetch with retry + backoff for 429s
   async function fetchRetry(url, maxRetries = 3) {
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
-      const resp = await fetch(url);
+      if (cancelled) throw new Error("Cancelled");
+      const resp = await fetch(url, { signal: activeAbort ? activeAbort.signal : undefined });
       if (resp.ok) return resp;
       if (resp.status === 429 && attempt < maxRetries) {
-        const wait = Math.pow(2, attempt + 1) * 1000; // 2s, 4s, 8s
-        await new Promise(r => setTimeout(r, wait));
+        const wait = Math.pow(2, attempt + 1) * 1000;
+        await sleepCancellable(wait);
         continue;
       }
       return resp;
@@ -873,11 +1218,12 @@
   }
 
   async function doImportFile() {
-    print("  Select a .ic save file...");
-    const file = await pickFile(".ic");
-    if (!file) { print("  " + yellow("Cancelled.")); return; }
-    print(`  Reading ${bold(esc(file.name))}...`);
     try {
+      beginRun();
+      print("  Select a .ic save file...");
+      const file = await pickFile(".ic");
+      if (!file || cancelled) { print("  " + yellow("Cancelled.")); return; }
+      print(`  Reading ${bold(esc(file.name))}...`);
       const arrayBuf = await file.arrayBuffer();
       let json;
       try {
@@ -897,12 +1243,12 @@
       for (const item of items) idToItem[item.id] = item;
       let importedCount = 0, recipeCount = 0;
       for (const item of items) {
+        if (cancelled) break;
         const text = item.text;
         const emoji = item.emoji || "";
         const discovered = !!(item.discovery || item.discovered);
         const isNew = addElement(text, emoji, discovered);
         if (isNew) importedCount++;
-        // Import recipes
         if (item.recipes) {
           for (const pair of item.recipes) {
             if (pair.length === 2 && idToItem[pair[0]] && idToItem[pair[1]]) {
@@ -913,18 +1259,24 @@
         }
       }
       rebuildRecipeIndex();
-      print(`  Loaded ${green(String(items.length))} elements (${importedCount} new) with ${recipeCount} recipes from ${bold(esc(file.name))}.`);
+      if (cancelled) print("  " + yellow("Import cancelled."));
+      else print(`  Loaded ${green(String(items.length))} elements (${importedCount} new) with ${recipeCount} recipes from ${bold(esc(file.name))}.`);
     } catch (e) {
-      print("  " + red(`Error reading save file: ${e.message}`));
+      if (!cancelled) print("  " + red(`Error reading save file: ${esc(e.message)}`));
+    } finally {
+      endRun();
     }
   }
 
   async function doImport(name) {
-    print(`  Importing ${bold(esc(name))} from Infinibrowser...`);
     try {
+      beginRun();
+      print(`  Importing ${bold(esc(name))} from Infinibrowser...`);
       const itemResp = await fetchRetry(`https://infinibrowser.wiki/api/item?id=${encodeURIComponent(name)}`);
+      if (cancelled) return;
       if (!itemResp.ok) { print("  " + red("Element not found on Infinibrowser.")); return; }
       const recipeResp = await fetchRetry(`https://infinibrowser.wiki/api/recipe?id=${encodeURIComponent(name)}`);
+      if (cancelled) return;
       if (!recipeResp.ok) { print("  " + red("No recipe found on Infinibrowser.")); return; }
       const recipeData = await recipeResp.json();
       const steps = recipeData.steps || recipeData.recipe || [];
@@ -933,7 +1285,9 @@
       rebuildRecipeIndex();
       print(`  Imported ${green(String(count))} recipe steps for ${bold(esc(name))}.`);
     } catch (e) {
-      print("  " + red(`Import failed: ${e.message}. CORS may be blocked — try the Python CLI instead.`));
+      if (!cancelled) print("  " + red(`Import failed: ${esc(e.message)}. CORS may be blocked — try the Python CLI instead.`));
+    } finally {
+      endRun();
     }
   }
 
@@ -962,7 +1316,7 @@
         if ((i + 1) % 10 === 0 || i === missing.length - 1) {
           print(`  ${dim(`[${i + 1}/${missing.length}]`)} ${green(String(filled))} filled, ${errors ? red(String(errors)) + " failed" : "0 failed"}`);
         }
-        await new Promise(r => setTimeout(r, 500));
+        await sleepCancellable(500);
       }
     } finally {
       rebuildRecipeIndex();
@@ -1041,7 +1395,7 @@
         if ((i + 1) % 10 === 0 || i === candidates.length - 1) {
           print(`  ${dim(`[${i + 1}/${candidates.length}]`)} ${green(String(pruned))} pruned, ${kept} kept, ${skipped ? yellow(String(skipped)) + " skipped" : "0 skipped"}`);
         }
-        await new Promise(r => setTimeout(r, 500));
+        await sleepCancellable(500);
       }
     } finally {
       rebuildIndexes();
@@ -1084,27 +1438,29 @@
   function doHelp() {
     print(`  ${bold("Combine:")}
     ${cyan("<element> + <element>")}       Combine two elements
-    ${cyan("/combine <el> + <el>")}        Same (also: /combine <el> <el>)
+    ${cyan("/combine <element> <element>")}  Combine two elements
 
   ${bold("Crawl:")}
     ${cyan("<element> ++ <element>")}      Combine & crawl until no new discoveries
-    ${cyan("/crawl <el> + <el>")}          Same as ++ (also: /crawl <el> <el>)
+    ${cyan("/crawl <element> <element>")}  Combine & crawl until no new discoveries
 
   ${bold("Bulk combine (query syntax below):")}
     ${cyan("<element> +| <query>")}        Combine element with all matching discoveries
-    ${cyan("<element> + | <query>")}       Same as +| (spaced variant)
-    ${cyan("/with <element> <query>")}     Same as +|
+    ${cyan("/with <element> <query>")}     Combine element with all matching discoveries
     ${cyan("<query> * <query>")}           Cross-combine matches from both queries
-    ${cyan("/cross <query> * <query>")}    Same as * (also: /cross <q> <q>)
+    ${cyan("/cross <query> <query>")}    Cross-combine matches from both queries
     ${cyan("/permute <query>")}            Combine all matching elements with each other
-    ${cyan("/exhaust <element>")}          Combine element with all discoveries
+    ${cyan("/permutate <query>")}          Permute repeatedly until no new discoveries
+    ${cyan("/exhaust <query>")}            Each match combined with all discoveries
 
-  ${bold("Query syntax (/search, /with, /permute, /cross, shorthands):")}
+  ${bold("Query syntax (/search, /with, /permute, /permutate, /cross, /exhaust, shorthands):")}
     substring                   Default: case-insensitive substring
     * ? []                      fnmatch wildcards (e.g. fire*, mu?)
     /pattern/                   Regex, case-insensitive (no | alternation)
-    !<query>                    First discoveries only (e.g. !fire*)
-    ^<query>                    Legacy alias for !<query>
+    !<query>                    Exclude matches (e.g. !fire* = everything except fire*)
+    !                           All elements (exclude nothing)
+    ^<query>                    First discoveries only (e.g. ^fire* = new fire* matches)
+    ^                           All first discoveries
 
   ${bold("Discoveries & recipes:")}
     ${cyan("/search <query>")}             Search discoveries
@@ -1120,124 +1476,224 @@
     ${cyan("/help")}                       Show this help`);
   }
 
+  function isLocalCommand(line) {
+    if (line === "/help" || line === "/list" || line === "/history" || line === "/clear") return true;
+    if (line === "/unfilled" || line.startsWith("/unfilled ")) return true;
+    if (line === "/search" || line.startsWith("/search ")) return true;
+    if (line === "/recipe" || line.startsWith("/recipe ")) return true;
+    return false;
+  }
+
+  function updateQueueDisplay() {
+    if (!currentCommand && !commandQueue.length) {
+      queueEl.style.display = "none";
+      queueEl.innerHTML = "";
+      return;
+    }
+    queueEl.style.display = "block";
+    let html = "";
+    if (currentCommand) {
+      html += `<div class="ict-queue-running">Running: ${esc(currentCommand)}</div>`;
+    }
+    if (commandQueue.length) {
+      html += `<div class="ict-queue-label">Queue:</div>`;
+      for (const cmd of commandQueue) {
+        html += `<div class="ict-queue-item">${esc(cmd)}</div>`;
+      }
+    }
+    queueEl.innerHTML = html;
+  }
+
+  function enqueueCommand(line) {
+    const deferred = queueWorkerRunning || currentCommand !== null || waitingForConfirm;
+    commandQueue.push(line);
+    updateQueueDisplay();
+    if (deferred) print("  " + dim(`Queued: ${esc(line)}`));
+    ensureQueueWorker();
+  }
+
+  function tryEnqueue(line) {
+    const error = validateCommandLine(line);
+    if (error) {
+      print(error);
+      return false;
+    }
+    if (line === currentCommand || commandQueue.includes(line)) {
+      print("  " + dim("Already queued."));
+      return false;
+    }
+    if (commandQueue.length >= MAX_QUEUE_DEPTH) {
+      print("  " + yellow(`Queue full (max ${MAX_QUEUE_DEPTH}).`));
+      return false;
+    }
+    enqueueCommand(line);
+    return true;
+  }
+
+  let queueWorkerRunning = false;
+
+  async function ensureQueueWorker() {
+    if (queueWorkerRunning) return;
+    queueWorkerRunning = true;
+    try {
+      while (commandQueue.length) {
+        const line = commandQueue.shift();
+        updateQueueDisplay();
+        currentCommand = line;
+        updateQueueDisplay();
+        cancelled = false;
+        try {
+          await executeCommand(line);
+        } catch (err) {
+          endRun();
+          waitingForConfirm = false;
+          confirmResolve = null;
+          print("  " + red("Error: " + esc(err && err.message || String(err))));
+        }
+        currentCommand = null;
+        updateQueueDisplay();
+      }
+    } finally {
+      queueWorkerRunning = false;
+    }
+  }
+
   // ── Command dispatcher ───────────────────────────────────────────────
-  async function dispatch(line) {
-    if (running || waitingForConfirm) {
-      print("  " + yellow("Busy — wait for current operation to finish."));
+  async function executeClassified(kind, payload, line) {
+    if (kind === "permute") {
+      if (!payload.trim()) print("  Usage: /permute <query>");
+      else await doPermute(payload.trim());
       return;
     }
-
-    if (line.startsWith("/")) {
-      let rest;
-      if ((rest = slashArgs(line, "/help")) !== null) { doHelp(); return; }
-      if ((rest = slashArgs(line, "/search")) !== null) {
-        if (!rest) print("  Usage: /search <query>");
-        else doSearch(rest);
-        return;
-      }
-      if ((rest = slashArgs(line, "/recipe")) !== null) {
-        if (!rest) print("  Usage: /recipe <element>");
-        else doRecipe(rest);
-        return;
-      }
-      if ((rest = slashArgs(line, "/list")) !== null) { doList(); return; }
-      if ((rest = slashArgs(line, "/permute")) !== null) {
-        if (!rest) print("  Usage: /permute <query>");
-        else await doPermute(rest);
-        return;
-      }
-      if ((rest = slashArgs(line, "/import")) !== null) {
-        if (!rest) await doImportFile();
-        else if (rest.endsWith(".ic") || rest.includes("/") || rest.includes("\\")) await doImportFile();
-        else await doImport(rest);
-        return;
-      }
-      if ((rest = slashArgs(line, "/unfilled")) !== null) { doUnfilled(); return; }
-      if ((rest = slashArgs(line, "/fill")) !== null) { await doFill(); return; }
-      if ((rest = slashArgs(line, "/prune")) !== null) { await doPrune(); return; }
-      if ((rest = slashArgs(line, "/export")) !== null) { await doExport(); return; }
-      if ((rest = slashArgs(line, "/exhaust")) !== null) {
-        if (!rest) print("  Usage: /exhaust <element>");
-        else await doExhaust(rest);
-        return;
-      }
-      if ((rest = slashArgs(line, "/combine")) !== null) {
-        const parsed = parseTwoElements(rest);
-        if (!parsed) print("  Usage: /combine <element> + <element>");
-        else await doCombine(parsed[0], parsed[1]);
-        return;
-      }
-      if ((rest = slashArgs(line, "/crawl")) !== null) {
-        const parsed = parseTwoElements(rest);
-        if (!parsed) print("  Usage: /crawl <element> + <element>");
-        else await doCrawl(parsed[0], parsed[1]);
-        return;
-      }
-      if ((rest = slashArgs(line, "/with")) !== null) {
-        const parsed = parseWithArgs(rest);
-        if (!parsed) print("  Usage: /with <element> <query>");
-        else await doCombineWithQuery(parsed[0], parsed[1]);
-        return;
-      }
-      if ((rest = slashArgs(line, "/cross")) !== null) {
-        const parsed = parseCrossQueries(rest);
-        if (!parsed) print("  Usage: /cross <query> * <query>");
-        else await doCross(parsed[0], parsed[1]);
-        return;
-      }
-      if ((rest = slashArgs(line, "/history")) !== null) { doHistory(); return; }
-      if ((rest = slashArgs(line, "/clear")) !== null) { output.innerHTML = ""; return; }
-      const spaceIdx = line.indexOf(" ");
-      const cmd = spaceIdx > 0 ? line.slice(0, spaceIdx) : line;
-      print(`  Unknown command: ${esc(cmd)}. Type ${yellow("/help")} for commands.`);
+    if (kind === "permutate") {
+      if (!payload.trim()) print("  Usage: /permutate <query>");
+      else await doPermutate(payload.trim());
       return;
     }
-
-    // Operator parsing (precedence: ++ > +| > * > +; spaced delimiters only)
-    if (line.includes(" ++ ")) {
+    if (kind === "import") {
+      if (!payload.trim()) await doImportFile();
+      else if (payload.endsWith(".ic") || payload.includes("/") || payload.includes("\\")) await doImportFile();
+      else await doImport(payload.trim());
+      return;
+    }
+    if (kind === "fill") { await doFill(); return; }
+    if (kind === "prune") { await doPrune(); return; }
+    if (kind === "export") { await doExport(); return; }
+    if (kind === "exhaust") {
+      if (!payload.trim()) print("  Usage: /exhaust <query>");
+      else await doExhaust(payload.trim());
+      return;
+    }
+    if (kind === "combine" || kind === "crawl") {
+      const pipeErr = slashCombineCrawlPipeError(payload);
+      if (pipeErr) { print(pipeErr); return; }
+      const opErr = slashCombineCrawlOperatorError(payload, kind);
+      if (opErr) { print(opErr); return; }
+      const parsed = parseTwoElements(payload);
+      if (!parsed) print(`  Usage: /${kind} <element> <element>`);
+      else if (kind === "combine") await doCombine(parsed[0], parsed[1]);
+      else await doCrawl(parsed[0], parsed[1]);
+      return;
+    }
+    if (kind === "with") {
+      const parsed = parseWithArgs(payload);
+      if (!parsed) print("  Usage: /with <element> <query>");
+      else await doCombineWithQuery(parsed[0], parsed[1]);
+      return;
+    }
+    if (kind === "cross") {
+      const opErr = slashCrossOperatorError(payload);
+      if (opErr) { print(opErr); return; }
+      const parsed = parseCrossQueries(payload);
+      if (!parsed) print("  Usage: /cross <query> <query>");
+      else await doCross(parsed[0], parsed[1]);
+      return;
+    }
+    if (kind === "++") {
       const [a, b] = line.split(" ++ ", 2).map(s => s.trim());
-      if (a && b) { await doCrawl(a, b); return; }
-      print("  Usage: <element> ++ <element>");
+      if (a && b) await doCrawl(a, b);
+      else print("  Usage: <element> ++ <element>");
       return;
     }
-    if (/\+\s*\|/.test(line)) {
-      const parts = line.split(/\+\s*\|/, 2);
+    if (kind === "bad+|") {
+      print(`  Use <element> +| <query> (no space between + and |). Type ${yellow("/help")} for commands.`);
+      return;
+    }
+    if (kind === "+|") {
+      const parts = line.split("+|", 2);
       const name = parts[0].trim();
       const query = parts[1].trim();
-      if (name && query) { await doCombineWithQuery(name, query); return; }
-      print("  Usage: <element> +| <query>");
+      if (name && query) await doCombineWithQuery(name, query);
+      else print("  Usage: <element> +| <query>");
       return;
     }
-    if (line.includes(" * ")) {
+    if (kind === "*") {
       const [left, right] = line.split(" * ", 2).map(s => s.trim());
-      if (left && right) { await doCross(left, right); return; }
-      print("  Usage: <query> * <query>");
+      if (left && right) await doCross(left, right);
+      else print("  Usage: <query> * <query>");
       return;
     }
-    if (line.includes(" + ")) {
-      const [a, b] = line.split(" + ", 2).map(s => s.trim());
-      if (a && b) { await doCombine(a, b); return; }
-      print("  Usage: <element> + <element>");
-      return;
+    if (kind === "+") {
+      const parts = line.includes(" + ")
+        ? line.split(" + ", 2).map(s => s.trim())
+        : [line.trimEnd().replace(/ \+$/, "").trim(), ""];
+      if (parts[0] && parts[1]) await doCombine(parts[0], parts[1]);
+      else print("  Usage: <element> + <element>");
     }
+  }
 
-    print(`  Unknown input. Type ${yellow("/help")} for commands.`);
+  async function executeCommand(line) {
+    let rest;
+    if ((rest = slashArgs(line, "/help")) !== null) { doHelp(); return; }
+    if ((rest = slashArgs(line, "/search")) !== null) {
+      if (!rest) print("  Usage: /search <query>");
+      else doSearch(rest);
+      return;
+    }
+    if ((rest = slashArgs(line, "/recipe")) !== null) {
+      if (!rest) print("  Usage: /recipe <element>");
+      else doRecipe(rest);
+      return;
+    }
+    if ((rest = slashArgs(line, "/list")) !== null) { doList(); return; }
+    if ((rest = slashArgs(line, "/history")) !== null) { doHistory(); return; }
+    if ((rest = slashArgs(line, "/clear")) !== null) { output.innerHTML = ""; return; }
+    if ((rest = slashArgs(line, "/unfilled")) !== null) { doUnfilled(); return; }
+
+    const classified = classifyCommandLine(line);
+    if (!classified) {
+      const error = validateCommandLine(line);
+      print(error);
+      return;
+    }
+    await executeClassified(classified[0], classified[1], line);
+  }
+
+  async function dispatch(line) {
+    if (isLocalCommand(line)) {
+      await executeCommand(line);
+      return;
+    }
+    tryEnqueue(line);
   }
 
   // ── Input handling ───────────────────────────────────────────────────
   input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !running && !waitingForConfirm) {
+    if (e.key === "Enter") {
       const line = input.value.trim();
       if (!line) return;
+      if (waitingForConfirm && !isLocalCommand(line)) return;
       input.value = "";
       cmdHistory.push(line);
       cmdHistoryIdx = cmdHistory.length;
       print(cyan("craft&gt;") + " " + esc(line));
       dispatch(line).catch((err) => {
-        // Last-ditch recovery: an uncaught error in a command must not leave the UI wedged.
         endRun();
         waitingForConfirm = false;
-        print("  " + red("Error: " + (err && err.message || String(err))));
+        confirmResolve = null;
+        currentCommand = null;
+        updateQueueDisplay();
+        print("  " + red("Error: " + esc(err && err.message || String(err))));
       });
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
@@ -1270,6 +1726,6 @@
     print(`  Type ${yellow("/help")} for commands.`);
     print("");
   }).catch(err => {
-    print(red("Failed to load game data: " + err.message));
+    print(red("Failed to load game data: " + esc(err.message)));
   });
 })();

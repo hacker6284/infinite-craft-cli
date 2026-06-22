@@ -3,6 +3,7 @@
 import json
 import sys
 import pytest
+from unittest.mock import patch
 
 # Run with pytest when invoked directly by Bazel
 if __name__ == "__main__":
@@ -45,6 +46,12 @@ class TestInitialization:
         path = str(tmp_path / "deep" / "nested" / "discoveries.json")
         storage = DiscoveryStorage(path)
         assert len(storage.get_all()) == 4
+
+    def test_corrupt_discoveries_raises_clear_error(self, tmp_path):
+        path = tmp_path / "discoveries.json"
+        path.write_text('[{"name": "Water"')  # truncated (repair heuristic cannot salvage)
+        with pytest.raises(ValueError, match="discoveries file is corrupted"):
+            DiscoveryStorage(str(path))
 
 
 class TestGetByName:
@@ -113,6 +120,33 @@ class TestRemove:
     def test_missing_returns_false(self, tmp_path):
         storage = DiscoveryStorage(str(tmp_path / "d.json"))
         assert storage.remove("Nope") is False
+
+
+class TestAddBatch:
+    def test_skips_duplicates(self, tmp_path):
+        storage = DiscoveryStorage(str(tmp_path / "d.json"))
+        count = storage.add_batch([
+            ("Steam", "💨", False),
+            ("Steam", "💨", False),
+            ("Mud", "🟤", False),
+        ])
+        assert count == 2
+        assert len(storage.get_all()) == 6
+        assert storage.get_by_name("Steam") is not None
+        assert storage.get_by_name("Mud") is not None
+
+    def test_single_disk_write(self, tmp_path):
+        storage = DiscoveryStorage(str(tmp_path / "d.json"))
+        with patch.object(storage, "_save", wraps=storage._save) as mock_save:
+            storage.add_batch([("Steam", "💨", False), ("Mud", "🟤", False)])
+            mock_save.assert_called_once()
+
+    def test_skips_existing_elements(self, tmp_path):
+        storage = DiscoveryStorage(str(tmp_path / "d.json"))
+        with patch.object(storage, "_save", wraps=storage._save) as mock_save:
+            count = storage.add_batch([("Water", "💧", False), ("Steam", "💨", False)])
+        assert count == 1
+        mock_save.assert_called_once()
 
 
 class TestReload:

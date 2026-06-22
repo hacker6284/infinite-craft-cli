@@ -1,5 +1,29 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- `/exhaust <query>` — each element matching the query is combined with all discoveries (generalizes single-element exhaust)
+- `/permutate <query>` — repeatedly runs `/permute` until a round produces no new discoveries
+- Command queue for long-running API commands in the Python REPL and browser trainers: local commands (`/help`, `/search`, `/list`, `/recipe`, `/history`, `/clear`, `/unfilled`, `/queue`) run immediately; other commands queue FIFO with queue displayed above the prompt
+
+### Changed
+- **Breaking:** `!<query>` now excludes matching elements; `^<query>` filters to first discoveries only (previously both `!` and `^` meant first discoveries; delimited regex `/^fi/` unchanged)
+- `exhaust` CLI subcommand now takes a query argument instead of an element name
+
+### Fixed
+- `/queue` with TTY chrome now prints scroll-area status (line-by-line) instead of appearing to do nothing
+- Esc skip during rate-limit acquire/backoff waits is now responsive (~50ms polling) instead of blocking until the window expires
+- Python REPL queue UX: bordered status panel above the prompt (running + numbered pending), `Queued:` acknowledgment when deferred, `[N active]` prompt hint, and TTY in-place panel clear when idle (no stale `Running:` lines)
+- `/fill`, `/prune`, and Infinibrowser `/import` no longer block the REPL event loop (HTTP and rate-limit sleeps run via `asyncio.to_thread` / `await asyncio.sleep`); local commands stay responsive during queued fill/prune/import work
+- Ctrl+C during a queued command now discards remaining queue items instead of continuing to the next one
+- Bulk confirmation (`y`/`n`) no longer gets mis-queued when typed before `Continue? [y/N]` appears; early answers are buffered and the prompt switches to `confirm [y/N]>`
+- `/queue` shows queue status (local, immediate); unknown `/commands` are rejected instead of being enqueued; deferring a command while another runs prints `Queued:`
+- Trainer scroll wheel now works over the trainer GUI, not only over the element library
+- Stop button reliably cancels in-progress commands, including during bulk confirmation prompts
+- `recipes.json` and `discoveries.json` now save atomically (temp file + `os.replace`) so interrupted writes cannot truncate the file
+- Corrupt `recipes.json` / `discoveries.json` surfaces a clear repair message (`RecipeStoreError` / `ValueError`) instead of a raw `JSONDecodeError` during bulk combines
+
 ## [1.3.0] - 2026-06-10
 
 ### Added

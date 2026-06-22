@@ -110,22 +110,22 @@ function switchTab(name) {
   <div class="commands">
     <strong>Combine</strong><br>
     <span class="cmd">&lt;element&gt; + &lt;element&gt;</span> <span class="desc">— Combine two elements</span><br>
-    <span class="cmd">/combine &lt;el&gt; + &lt;el&gt;</span> <span class="desc">— Same (also: /combine &lt;el&gt; &lt;el&gt;)</span><br>
+    <span class="cmd">/combine &lt;element&gt; &lt;element&gt;</span> <span class="desc">— Combine two elements</span><br>
     <br>
     <strong>Crawl</strong><br>
     <span class="cmd">&lt;element&gt; ++ &lt;element&gt;</span> <span class="desc">— Combine &amp; crawl until no new discoveries</span><br>
-    <span class="cmd">/crawl &lt;el&gt; + &lt;el&gt;</span> <span class="desc">— Same as ++ (also: /crawl &lt;el&gt; &lt;el&gt;)</span><br>
+    <span class="cmd">/crawl &lt;element&gt; &lt;element&gt;</span> <span class="desc">— Combine &amp; crawl until no new discoveries</span><br>
     <br>
     <strong>Bulk combine</strong><br>
     <span class="cmd">&lt;element&gt; +| &lt;query&gt;</span> <span class="desc">— Combine with all matching discoveries</span><br>
-    <span class="cmd">&lt;element&gt; + | &lt;query&gt;</span> <span class="desc">— Same as +| (spaced variant)</span><br>
-    <span class="cmd">/with &lt;element&gt; &lt;query&gt;</span> <span class="desc">— Same as +|</span><br>
+    <span class="cmd">/with &lt;element&gt; &lt;query&gt;</span> <span class="desc">— Combine element with all matching discoveries</span><br>
     <span class="cmd">&lt;query&gt; * &lt;query&gt;</span> <span class="desc">— Cross-combine matches from both queries</span><br>
-    <span class="cmd">/cross &lt;query&gt; * &lt;query&gt;</span> <span class="desc">— Same as * (also: /cross &lt;q&gt; &lt;q&gt;)</span><br>
+    <span class="cmd">/cross &lt;query&gt; &lt;query&gt;</span> <span class="desc">— Cross-combine matches from both queries</span><br>
     <span class="cmd">/permute &lt;query&gt;</span> <span class="desc">— Combine all matching elements with each other</span><br>
-    <span class="cmd">/exhaust &lt;element&gt;</span> <span class="desc">— Combine element with all discoveries</span><br>
+    <span class="cmd">/permutate &lt;query&gt;</span> <span class="desc">— Permute repeatedly until no new discoveries</span><br>
+    <span class="cmd">/exhaust &lt;query&gt;</span> <span class="desc">— Each match combined with all discoveries</span><br>
     <br>
-    <strong>Query syntax</strong> (<span class="cmd">/search</span>, <span class="cmd">/with</span>, <span class="cmd">/permute</span>, <span class="cmd">/cross</span>, shorthands) — substring (default), <span class="cmd">* ? []</span> wildcards, <span class="cmd">/pattern/</span> regex, <span class="cmd">!query</span> or <span class="cmd">^query</span> for first discoveries<br>
+    <strong>Query syntax</strong> (<span class="cmd">/search</span>, <span class="cmd">/with</span>, <span class="cmd">/permute</span>, <span class="cmd">/permutate</span>, <span class="cmd">/cross</span>, <span class="cmd">/exhaust</span>, shorthands) — substring (default), <span class="cmd">* ? []</span> wildcards, <span class="cmd">/pattern/</span> regex, <span class="cmd">!&lt;query&gt;</span> to exclude, <span class="cmd">^&lt;query&gt;</span> for first discoveries only<br>
     <br>
     <strong>Discoveries &amp; recipes</strong><br>
     <span class="cmd">/search &lt;query&gt;</span> <span class="desc">— Search discoveries</span><br>
@@ -137,7 +137,7 @@ function switchTab(name) {
     <span class="cmd">/prune</span> <span class="desc">— Remove orphan elements Infinibrowser can't fill</span><br>
     <span class="cmd">/export</span> <span class="desc">— Download discoveries as .ic file</span><br>
     <span class="cmd">/history</span> <span class="desc">— Show combinations this session</span><br>
-    <span class="cmd">/clear</span> <span class="desc">— Clear the terminal</span><br>
+    <span class="cmd">/clear</span> <span class="desc">— Clear output</span><br>
     <span class="cmd">/help</span> <span class="desc">— Show commands in the trainer</span><br>
   </div>
 </div>
