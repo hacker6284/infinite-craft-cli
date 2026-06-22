@@ -1,10 +1,9 @@
 """Tests for recipe functions: _load_recipes, _save_recipes, _record_recipe, do_recipe, do_unfilled."""
 
 import json
-import os
 import sys
 import pytest
-from unittest.mock import patch, mock_open
+from unittest.mock import patch
 
 from tests.conftest import MockElement, make_mock_storage
 
@@ -36,6 +35,14 @@ class TestLoadRecipes:
         with patch("infinite_craft_cli.cli.RECIPES_PATH", str(path)):
             result = _load_recipes()
         assert result == {}
+
+    def test_corrupt_file_raises_recipe_store_error(self, tmp_path):
+        from infinite_craft_cli.cli import RecipeStoreError, _load_recipes
+        path = tmp_path / "recipes.json"
+        path.write_text('{"Steam": [["Fire", "Water"]')  # truncated (repair heuristic cannot salvage)
+        with patch("infinite_craft_cli.cli.RECIPES_PATH", str(path)):
+            with pytest.raises(RecipeStoreError, match="recipes.json is corrupted"):
+                _load_recipes()
 
 
 class TestSaveRecipes:

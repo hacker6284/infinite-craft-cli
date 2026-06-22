@@ -4,7 +4,6 @@ Run with: bazel test //tests:test_integration --test_env=INTEGRATION_TESTS=1
 """
 
 import asyncio
-import json
 import os
 import sys
 import pytest
@@ -20,7 +19,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def run_async(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 class TestClientIntegration:

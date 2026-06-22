@@ -2,10 +2,9 @@
 
 import gzip
 import json
-import os
 import sys
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, AsyncMock
 
 from tests.conftest import MockElement, make_mock_storage
 
@@ -32,9 +31,13 @@ class TestDoImport:
     def test_plain_name_routes_to_infinibrowser(self):
         from infinite_craft_cli.cli import do_import
         storage = make_mock_storage()
-        with patch("infinite_craft_cli.cli._import_from_infinibrowser", return_value="ok") as mock_ib:
+        with patch(
+            "infinite_craft_cli.cli._import_from_infinibrowser_async",
+            new_callable=AsyncMock,
+            return_value="ok",
+        ) as mock_ib:
             result = do_import(storage, "Steam")
-        mock_ib.assert_called_once_with(storage, "Steam")
+        mock_ib.assert_awaited_once_with(storage, "Steam")
 
 
 class TestImportFromInfinibrowser:
@@ -73,17 +76,16 @@ class TestImportFromInfinibrowser:
             "result": {"id": "Steam", "emoji": "💨"},
         }]}
         with patch("infinite_craft_cli.cli._ib_fetch", side_effect=[item_data, lineage_data]):
-            with patch("infinite_craft_cli.cli._record_recipe") as mock_record:
+            with patch("infinite_craft_cli.cli._record_recipes_batch") as mock_record:
                 with patch("sys.stdout") as mock_stdout:
                     mock_stdout.isatty.return_value = False
                     result = _import_from_infinibrowser(storage, "Steam")
         assert "3" in result  # 3 elements imported
         mock_record.assert_called_once()
-        # All 3 elements should be added to storage
-        storage.add.assert_any_call(name='Water', emoji='💧', is_first_discovery=False)
-        storage.add.assert_any_call(name='Fire', emoji='🔥', is_first_discovery=False)
-        storage.add.assert_any_call(name='Steam', emoji='💨', is_first_discovery=False)
-        assert storage.add.call_count == 3
+        storage.add_batch.assert_called_once()
+        batch = storage.add_batch.call_args[0][0]
+        names = {entry[0] for entry in batch}
+        assert names == {"Water", "Fire", "Steam"}
 
 
 class TestImportFromSave:
@@ -102,7 +104,7 @@ class TestImportFromSave:
     def test_valid_save(self, tmp_path):
         from infinite_craft_cli.cli import _import_from_save
         storage = make_mock_storage()
-        storage.add.return_value = MockElement("Water", "💧")
+        storage.add_batch.return_value = 3
         path = tmp_path / "save.ic"
         items = [
             {"id": 0, "text": "Water", "emoji": "💧", "recipes": []},
@@ -110,12 +112,66 @@ class TestImportFromSave:
             {"id": 2, "text": "Steam", "emoji": "💨", "recipes": [[0, 1]]},
         ]
         self._write_save(path, items)
-        with patch("infinite_craft_cli.cli._record_recipe") as mock_record:
+        with patch("infinite_craft_cli.cli._record_recipes_batch") as mock_record:
             with patch("sys.stdout") as mock_stdout:
                 mock_stdout.isatty.return_value = False
                 result = _import_from_save(storage, str(path))
         assert "3" in result  # 3 elements loaded
-        mock_record.assert_called_once_with("Steam", "Water", "Fire")
+        storage.add_batch.assert_called_once()
+        mock_record.assert_called_once_with([("Steam", "Water", "Fire")])
+
+    def test_rejects_oversized_compressed_save(self, tmp_path):
+        from infinite_craft_cli.cli import _import_from_save, _MAX_IC_COMPRESSED_BYTES
+
+        storage = make_mock_storage()
+        path = tmp_path / "big.ic"
+        path.write_bytes(b"x" * (_MAX_IC_COMPRESSED_BYTES + 1))
+        result = _import_from_save(storage, str(path))
+        assert "too large" in result.lower()
+
+    def test_rejects_oversized_decompressed_save(self, tmp_path):
+        from infinite_craft_cli.cli import _import_from_save, _MAX_IC_DECOMPRESSED_BYTES
+
+        storage = make_mock_storage()
+        path = tmp_path / "big_decompressed.ic"
+        big_text = "x" * (_MAX_IC_DECOMPRESSED_BYTES + 1)
+        save = {
+            "name": "Test",
+            "version": "1.0",
+            "created": 0,
+            "updated": 0,
+            "instances": [],
+            "items": [{"id": 0, "text": big_text, "emoji": "", "recipes": []}],
+        }
+        with gzip.open(str(path), "wt", encoding="utf-8") as f:
+            json.dump(save, f)
+        result = _import_from_save(storage, str(path))
+        assert "decompressed save too large" in result.lower()
+
+    def test_rejects_too_many_items(self, tmp_path):
+        from infinite_craft_cli.cli import _import_from_save, _MAX_IC_ITEMS
+
+        storage = make_mock_storage()
+        path = tmp_path / "many.ic"
+        items = [{"id": i, "text": f"Elem{i}", "emoji": ""} for i in range(_MAX_IC_ITEMS + 1)]
+        self._write_save(path, items)
+        result = _import_from_save(storage, str(path))
+        assert "too many items" in result.lower()
+
+    def test_sanitizes_control_chars_in_element_names(self, tmp_path):
+        from infinite_craft_cli.cli import _import_from_save
+
+        storage = make_mock_storage()
+        storage.add_batch.return_value = 1
+        path = tmp_path / "dirty.ic"
+        dirty = "Evil\x1b[31mName"
+        items = [{"id": 0, "text": dirty, "emoji": "💀", "recipes": []}]
+        self._write_save(path, items)
+        with patch("infinite_craft_cli.cli._record_recipes_batch"):
+            _import_from_save(storage, str(path))
+        batch = storage.add_batch.call_args[0][0]
+        assert "\x1b" not in batch[0][0]
+        assert "Evil" in batch[0][0]
 
     def test_empty_items(self, tmp_path):
         from infinite_craft_cli.cli import _import_from_save

@@ -72,29 +72,32 @@ infinite-craft --version
 
 | Shorthand | Slash command | Description |
 |-----------|---------------|-------------|
-| `<element> + <element>` | `/combine <el> + <el>` | Combine two elements (`/combine <el> <el>` also works) |
-| `<element> ++ <element>` | `/crawl <el> + <el>` | Combine & crawl until no new discoveries (`/crawl <el> <el>` also works) |
+| `<element> + <element>` | `/combine <element> <element>` | Combine two elements |
+| `<element> ++ <element>` | `/crawl <element> <element>` | Combine & crawl until no new discoveries |
 
 ### Bulk combine
 
 | Shorthand | Slash command | Description |
 |-----------|---------------|-------------|
-| `<element> + \| <query>` | `/with <element> <query>` | Combine element with all matching discoveries (`+ \|` spaced variant also works) |
-| `<query> * <query>` | `/cross <query> * <query>` | Cross-combine matches from both queries (`/cross <q> <q>` also works for simple queries) |
+| `<element>` then `+|` then `<query>` (adjacent operator) | `/with <element> <query>` | Combine element with all matching discoveries |
+| `<query> * <query>` | `/cross <query> <query>` | Cross-combine matches from both queries |
 | | `/permute <query>` | Combine all matching elements with each other |
-| | `/exhaust <element>` | Combine element with all discoveries |
+| | `/permutate <query>` | Permute repeatedly until no new discoveries |
+| | `/exhaust <query>` | Each match combined with all discoveries |
 
 ### Query syntax
 
-Used by `/search`, `/with`, `/permute`, `/cross`, and the `+|` / `*` shorthands:
+Used by `/search`, `/with`, `/permute`, `/permutate`, `/cross`, `/exhaust`, and the `+|` / `*` shorthands:
 
 | Syntax | Meaning |
 |--------|---------|
 | `substring` | Case-insensitive substring (default) |
 | `*` `?` `[]` | fnmatch wildcards (e.g. `fire*`, `mu?`) |
 | `/pattern/` | Regex, case-insensitive (`/pattern/`; alternation `\|` not supported) |
-| `!<query>` | First discoveries only (e.g. `!fire*`) |
-| `^<query>` | Legacy alias for `!<query>` |
+| `!<query>` | Exclude matches (e.g. `!fire*` = everything except `fire*`) |
+| `!` | All elements (exclude nothing) |
+| `^<query>` | First discoveries only (e.g. `^fire*` = new `fire*` matches) |
+| `^` | All first discoveries |
 
 ### Other commands
 
@@ -109,8 +112,20 @@ Used by `/search`, `/with`, `/permute`, `/cross`, and the `+|` / `*` shorthands:
 | `/prune` | Remove orphan elements Infinibrowser can't fill |
 | `/export [path]` | Export discoveries as `.ic` save file |
 | `/history` | Show combinations tried this session |
+| `/queue` | Show running and pending commands (status also appears above `craft>`) |
 | `/help` | Show help |
 | `/quit` | Exit |
+
+### Background queue (Python REPL)
+
+Long-running API commands queue FIFO. Local commands (`/help`, `/search`, `/list`, `/recipe`, `/history`, `/clear`, `/unfilled`, `/queue`) run immediately — output from a local command may interleave with a running queued command (e.g. `/search` during `/crawl`).
+
+| Key | Action |
+|-----|--------|
+| Esc | Skip current command, continue to next in queue (TTY only) |
+| Ctrl+C | While running: stop and discard remaining queue; at bulk confirm `[y/N]`: decline only |
+
+Deferred commands print `Queued:` when another command is already running.
 
 ## Data storage
 
@@ -122,7 +137,7 @@ Discoveries and recipes are stored in `~/.infinite-craft-cli/`:
 
 ## Browser extension / bookmarklet
 
-The [browser trainers](https://hacker6284.github.io/infinite-craft-cli/) share the same command syntax and query matching as the Python CLI (wildcards, `/regex/`, `!`/`^` first-discovery filters, `/combine`, `/with`, `/cross`, and spaced operator delimiters). Browser-only additions: `/clear` to clear the terminal output, and IndexedDB storage instead of `~/.infinite-craft-cli/`.
+The [browser trainers](https://hacker6284.github.io/infinite-craft-cli/) share the same command syntax and query matching as the Python CLI (wildcards, `/regex/`, `!` exclude, `^` first discoveries, `/combine`, `/with`, `/cross`, and operator shorthands `+`, `++`, `+|`, `*`). Browser-only additions: `/clear` to clear the output panel, and IndexedDB storage instead of `~/.infinite-craft-cli/`. Queue status is shown in the panel above the input (visual-only; no `/queue` command). Local commands such as `/search` may interleave output with a running queued command.
 
 ## Development
 

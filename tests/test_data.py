@@ -3,7 +3,6 @@
 import os
 import sys
 import pytest
-from unittest.mock import patch
 
 # Run with pytest when invoked directly by Bazel
 if __name__ == "__main__":

@@ -1,9 +1,7 @@
 """End-to-end regression tests using real DiscoveryStorage with mock HTTP."""
 
 import asyncio
-import gzip
 import json
-import os
 import sys
 import pytest
 from unittest.mock import patch, AsyncMock, MagicMock
@@ -16,17 +14,23 @@ if __name__ == "__main__":
 
 
 def run_async(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(asyncio.wait_for(coro, timeout=30.0))
 
 
 @pytest.fixture(autouse=True)
-def clear_caches():
+def clear_caches(request):
     import infinite_craft_cli.cli as cli
-    cli._pair_cache.clear()
-    cli._history.clear()
+
+    def _clear():
+        try:
+            cli._reset_test_state()
+        except Exception:
+            pass
+
+    _clear()
+    request.addfinalizer(_clear)
     yield
-    cli._pair_cache.clear()
-    cli._history.clear()
+    _clear()
 
 
 def _make_mock_client_returning(results):
@@ -209,20 +213,24 @@ class TestInfinibrowserImportPersistence:
         storage = DiscoveryStorage(discoveries_path)
 
         item_data = {"text": "Lava", "emoji": "🌋", "depth": 2}
-        lineage_data = {"steps": [
-            {
-                "a": {"id": "Earth", "emoji": "🌍"},
-                "b": {"id": "Fire", "emoji": "🔥"},
-                "result": {"id": "Magma", "emoji": "🔴"},
-            },
-            {
-                "a": {"id": "Magma", "emoji": "🔴"},
-                "b": {"id": "Water", "emoji": "💧"},
-                "result": {"id": "Lava", "emoji": "🌋"},
-            },
-        ]}
+        lineage_data = {
+            "steps": [
+                {
+                    "a": {"id": "Earth", "emoji": "🌍"},
+                    "b": {"id": "Fire", "emoji": "🔥"},
+                    "result": {"id": "Magma", "emoji": "🔴"},
+                },
+                {
+                    "a": {"id": "Magma", "emoji": "🔴"},
+                    "b": {"id": "Water", "emoji": "💧"},
+                    "result": {"id": "Lava", "emoji": "🌋"},
+                },
+            ]
+        }
 
-        with patch("infinite_craft_cli.cli._ib_fetch", side_effect=[item_data, lineage_data]):
+        with patch(
+            "infinite_craft_cli.cli._ib_fetch", side_effect=[item_data, lineage_data]
+        ):
             with patch("infinite_craft_cli.cli.RECIPES_PATH", recipes_path):
                 _import_from_infinibrowser(storage, "Lava")
 
@@ -244,22 +252,30 @@ class TestInfinibrowserImportPersistence:
 
         item_data = {"text": "Licker", "emoji": "👅", "depth": 18}
         empty_recipe = {"steps": [], "missing": {}}
-        full_recipe = {"steps": [{
-            "a": {"id": "Water", "emoji": "💧"},
-            "b": {"id": "Fire", "emoji": "🔥"},
-            "result": {"id": "Licker", "emoji": "👅"},
-        }]}
+        full_recipe = {
+            "steps": [
+                {
+                    "a": {"id": "Water", "emoji": "💧"},
+                    "b": {"id": "Fire", "emoji": "🔥"},
+                    "result": {"id": "Licker", "emoji": "👅"},
+                }
+            ]
+        }
 
         # Simulate a prior fetch that cached an empty recipe
         mock_session = MagicMock()
         empty_resp = MagicMock()
         empty_resp.json.return_value = empty_recipe
         mock_session.get.return_value = empty_resp
-        with patch("infinite_craft_cli.client._get_sync_session", return_value=mock_session):
+        with patch(
+            "infinite_craft_cli.client._get_sync_session", return_value=mock_session
+        ):
             fetch_json("https://infinibrowser.wiki/api/recipe", {"id": "Licker"})
 
         # Now import should bypass the cache and get the full recipe
-        with patch("infinite_craft_cli.cli._ib_fetch", side_effect=[item_data, full_recipe]):
+        with patch(
+            "infinite_craft_cli.cli._ib_fetch", side_effect=[item_data, full_recipe]
+        ):
             with patch("infinite_craft_cli.cli.RECIPES_PATH", recipes_path):
                 result = _import_from_infinibrowser(storage, "Licker")
 

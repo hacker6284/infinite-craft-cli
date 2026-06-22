@@ -15,8 +15,10 @@ import shutil
 import signal
 import sys
 import tempfile
+import unicodedata
 import threading
 import time
+import regex as _regex_module
 from collections.abc import Callable
 
 try:
@@ -69,8 +71,6 @@ REGEX_ERROR_INVALID = "Invalid regex pattern"
 REGEX_ERROR_COMPLEX = "Regex pattern too complex"
 _QUERY_HELP = "Search query (wildcards, /regex/, ! exclude, ^ first discoveries)"
 
-import regex as _regex_module
-
 _RE_NESTED_QUANTIFIER = re.compile(r"(\+|\*|\?|\{\d*,?\d*\})\s*(\+|\*|\?|\{)")
 _RE_DELIMITED_REGEX = re.compile(r"/[^/]+/")
 
@@ -87,6 +87,7 @@ _MAX_PERMUTATE_ROUNDS = 50
 _stdin_lock = asyncio.Lock()
 _cancel_scope_depth = 0
 _sigint_previous: object | None = None
+_winch_previous: object | None = None
 _confirm_future: asyncio.Future[str] | None = None
 _confirm_answer_buffer: str | None = None
 _last_queue_snapshot: str = ""
@@ -105,6 +106,7 @@ _chrome_prompt: str = ""
 _chrome_input_active: bool = False
 _chrome_partial: str = ""
 _chrome_last_reserve: int = 0
+_chrome_last_height: int = 0
 _repl_print_patched: bool = False
 _repl_print_lock = threading.RLock()
 _chrome_last_state: object = None
@@ -113,6 +115,10 @@ _tty_stdin_unread: list[str] = []
 _ESC_SEQUENCE_WAIT_S = 0.3
 _CSI_POLL_INTERVAL_S = 0.02
 _builtin_print = builtins.print
+
+# Prompt strings (extracted consts; used by _craft_prompt and chrome)
+CRAFT_PROMPT = "craft> "
+CONFIRM_PROMPT = "confirm [y/N]> "
 
 # Test-only seams (set by harness in tests; never used in production).
 # Allows deterministic input without real TTY/termios/select, and avoids races.
@@ -136,8 +142,12 @@ def _reset_test_state() -> None:
     global _confirm_expected, _bulk_confirm_pending, _bulk_confirm_resolved
     global _chrome_enabled, _chrome_prompt, _chrome_input_active, _chrome_partial
     global _chrome_last_reserve, _chrome_last_state, _repl_print_patched
-    global _tty_stdin_unread, _cancelled, _cancel_scope_depth
-    global _discard_queue_after_cancel, _skip_summary_shown, _sigint_previous
+    global _tty_stdin_unread, _cancelled, _cancel_scope_depth, _rate_limit_waiting
+    global \
+        _discard_queue_after_cancel, \
+        _skip_summary_shown, \
+        _sigint_previous, \
+        _winch_previous
     global _tty_read_byte_hook, _test_prompt_input_hook
     _pair_cache.clear()
     _history.clear()
@@ -157,30 +167,54 @@ def _reset_test_state() -> None:
     _chrome_input_active = False
     _chrome_partial = ""
     _chrome_last_reserve = 0
+    _chrome_last_height = 0
     _chrome_last_state = None
     if _repl_print_patched:
-        try:
+        with contextlib.suppress(Exception):
             _patch_repl_print(False)
-        except Exception:
-            _repl_print_patched = False
+        _repl_print_patched = False
+    # use central teardown for chrome/tty/winch (idempotent)
+    with contextlib.suppress(Exception):
+        _teardown_tty_and_chrome()
     _tty_stdin_unread = []
     _cancelled = False
     _cancel_scope_depth = 0
+    _rate_limit_waiting = False
     _discard_queue_after_cancel = False
     _skip_summary_shown = False
     _sigint_previous = None
+    _winch_previous = None
     _tty_read_byte_hook = None
     _test_prompt_input_hook = None
-    # ensure no stray worker (cancel before null to avoid leak)
-    if (
-        _api_worker_task is not None
-        and not getattr(_api_worker_task, "done", lambda: True)()
-    ):
-        try:
-            _api_worker_task.cancel()
-        except Exception:
-            pass
-    _api_worker_task = None
+    # ensure no stray worker (full cancel+await via helper if possible from sync ctx; drain to avoid orphan)
+    # Always centralize on _cancel_and_await_worker (idempotent, does cancel+wait_for+set None).
+    # Assumption for reset: called from sync test fixture/finalizer thread. If get_running_loop succeeds,
+    # use threadsafe+await to fully reap worker from the running loop (prevents orphans on test exit/KI).
+    # If no running loop (common), just clear ref (the run_until_quit finally or interactive finally already
+    # awaited the task; task from dead loop would be orphan anyway).
+    try:
+        loop = asyncio.get_running_loop()
+        fut = asyncio.run_coroutine_threadsafe(_cancel_and_await_worker(), loop)
+        fut.result(timeout=1)
+    except RuntimeError:
+        # no running loop: still attempt cancel on the task ref (best-effort, marks cancelled)
+        # before nulling; prevents orphan ref even if loop is dead.
+        t = _api_worker_task
+        if t and not t.done():
+            with contextlib.suppress(Exception):
+                t.cancel()
+        _api_worker_task = None
+        # sweep not possible w/o running loop; harness paths cover asyncio.all_tasks cases
+    except Exception:
+        # best-effort: detach ref, do not let cleanup raise
+        t = _api_worker_task
+        if t and not getattr(t, "done", lambda: True)():
+            with contextlib.suppress(Exception):
+                t.cancel()
+        _api_worker_task = None
+    # helper or above always ensures cleared to prevent re-use/orphans
+    with contextlib.suppress(Exception):
+        _remove_winch_handler()
 
 
 # ---------------------------------------------------------------------------
@@ -202,10 +236,18 @@ def _load_recipes() -> dict[str, list[list[str]]]:
         with open(RECIPES_PATH, encoding="utf-8") as f:
             return json.load(f)
     except json.JSONDecodeError as e:
-        raise RecipeStoreError(
-            f"recipes.json is corrupted ({e}). "
-            f"Back up {RECIPES_PATH}, repair or delete it, then retry."
-        ) from e
+        # Attempt simple repair for common truncation at end (e.g. interrupted write)
+        try:
+            with open(RECIPES_PATH, encoding="utf-8") as f:
+                c = f.read().rstrip()
+            repaired = json.loads(c + "\n}\n")
+            _save_recipes(repaired)
+            return repaired
+        except Exception:
+            raise RecipeStoreError(
+                f"recipes.json is corrupted ({e}). "
+                f"Back up {RECIPES_PATH}, repair or delete it, then retry."
+            ) from e
 
 
 def _save_recipes(recipes: dict[str, list[list[str]]]):
@@ -372,7 +414,13 @@ async def do_combine(client, storage, first_name: str, second_name: str) -> str:
         )
     result_display = result.name if result.name else "Nothing"
     _history.append((first_name.strip(), second_name.strip(), result_display))
-    return format_result(str(first), str(second), result)
+    # Use format_element(...) directly for operands (and result) so FIRST tag color/text
+    # survives; avoid format_result's re-sanitize on pre-rendered names (which strips ANSI).
+    if result.name is None:
+        res = _color("Nothing", DIM)
+    else:
+        res = format_element(result)
+    return f"  {format_element(first)} + {format_element(second)} = {res}"
 
 
 def _slash_args(line: str, command: str) -> str | None:
@@ -562,9 +610,7 @@ def do_recipe(storage, name: str) -> str:
             visited.add(name)
 
     if not found:
-        return (
-            f"  Cannot trace full lineage for {format_element(Element(name=target))} — missing intermediate recipes."
-        )
+        return f"  Cannot trace full lineage for {format_element(Element(name=target))} — missing intermediate recipes."
 
     # Walk back from target to collect steps in order.
     # Terminals (no parent entry) are treated as resolved leaves with no step.
@@ -596,7 +642,11 @@ def do_recipe(storage, name: str) -> str:
             resolved.add(name)
 
     t_elem = storage.get_by_name(target)
-    t_str = format_element(t_elem) if t_elem else _color(format_element(Element(name=target)), BOLD)
+    t_str = (
+        format_element(t_elem)
+        if t_elem
+        else _color(format_element(Element(name=target)), BOLD)
+    )
     lines = [f"  Recipe for {t_str} ({len(steps)} steps):"]
     for a, b, r in steps:
         a_elem = storage.get_by_name(a)
@@ -629,7 +679,9 @@ def do_history(storage=None) -> str:
             else:
                 r_elem = _resolve_element(storage, r)
                 r_str = format_element(r_elem)
-            lines.append(f"  {i}. {format_element(a_elem)} + {format_element(b_elem)} = {r_str}")
+            lines.append(
+                f"  {i}. {format_element(a_elem)} + {format_element(b_elem)} = {r_str}"
+            )
         else:
             lines.append(f"  {i}. {_tty(a)} + {_tty(b)} = {_tty(r)}")
     return "\n".join(lines)
@@ -652,7 +704,7 @@ async def do_crawl(client, storage, first_name: str, second_name: str):
     while True:
         if _cancelled:
             if not _skip_summary_shown:
-                _repl_print_lines("  Stopped.")
+                _repl_print_lines("  Stopped early.")
                 _mark_cancel_notified()
             break
         generation += 1
@@ -669,7 +721,9 @@ async def do_crawl(client, storage, first_name: str, second_name: str):
             _repl_print_lines(f"  Exhausted all pairs. {len(pool)} elements in pool.")
             break
 
-        _repl_print_lines(f"  --- Generation {generation}: {len(new_pairs)} new pairs to try ---")
+        _repl_print_lines(
+            f"  --- Generation {generation}: {len(new_pairs)} new pairs to try ---"
+        )
 
         # Snapshot pool names before running pairs
         before = set(pool.keys())
@@ -690,7 +744,7 @@ async def do_crawl(client, storage, first_name: str, second_name: str):
         if new_count == 0 or _cancelled:
             if _cancelled:
                 if not _skip_summary_shown:
-                    _repl_print_lines("  Stopped.")
+                    _repl_print_lines("  Stopped early.")
                     _mark_cancel_notified()
             else:
                 _repl_print_lines("  No new discoveries. Stopping.")
@@ -876,6 +930,7 @@ _BULK_WARN_THRESHOLD = 200
 _cancelled = False
 _discard_queue_after_cancel = False
 _skip_summary_shown = False
+_rate_limit_waiting = False
 
 
 def _reset_cancelled():
@@ -889,6 +944,21 @@ def _mark_cancel_notified() -> None:
     """Record that the running command already printed a cancel/stop summary."""
     global _skip_summary_shown
     _skip_summary_shown = True
+
+
+def _rate_limit_wait_callback(waiting: bool) -> None:
+    """Sync callback for RateLimiter.acquire (start/end of backoff sleep chunks).
+
+    Sets transient flag read by queue display; forces refresh via existing
+    _chrome_sync / _paint_queue_panel (throttled, non-janky). Clear on exit.
+    """
+    global _rate_limit_waiting
+    if _rate_limit_waiting != waiting:
+        _rate_limit_waiting = waiting
+        if _chrome_enabled:
+            _chrome_sync()
+        else:
+            _paint_queue_panel(force=True)
 
 
 def _request_skip_current() -> bool:
@@ -937,6 +1007,47 @@ def _exit_cancel_scope():
         _sigint_previous = None
 
 
+def _on_sigwinch():
+    """Force chrome repaint on terminal resize (SIGWINCH). Best-effort, non-fatal."""
+    if _chrome_enabled:
+        with contextlib.suppress(Exception):
+            _chrome_refresh(force=True)
+
+
+def _install_winch_handler():
+    """Install SIGWINCH handler for the interactive session (best effort, unix mostly)."""
+    global _winch_previous
+    if _winch_previous is not None or not hasattr(signal, "SIGWINCH"):
+        return
+    try:
+        loop = asyncio.get_running_loop()
+        _winch_previous = signal.getsignal(signal.SIGWINCH)
+        loop.add_signal_handler(signal.SIGWINCH, _on_sigwinch)
+    except (NotImplementedError, ValueError, RuntimeError):
+        try:
+            _winch_previous = signal.getsignal(signal.SIGWINCH)
+            signal.signal(signal.SIGWINCH, lambda *_: _on_sigwinch())
+        except (AttributeError, OSError, ValueError):
+            _winch_previous = None
+
+
+def _remove_winch_handler():
+    """Restore previous SIGWINCH handler."""
+    global _winch_previous
+    if _winch_previous is None or not hasattr(signal, "SIGWINCH"):
+        _winch_previous = None
+        return
+    try:
+        loop = asyncio.get_running_loop()
+        loop.remove_signal_handler(signal.SIGWINCH)
+    except (NotImplementedError, ValueError, RuntimeError):
+        try:
+            signal.signal(signal.SIGWINCH, _winch_previous)
+        except (AttributeError, OSError, ValueError):
+            pass
+    _winch_previous = None
+
+
 _ANSI_ESCAPE_RE = re.compile(r"\033\[[0-9;]*[ -/]*[@-~]")
 
 
@@ -954,13 +1065,73 @@ def _tty_width() -> int:
         return 80
 
 
+def _is_zero_width(ch: str) -> bool:
+    if not ch:
+        return True
+    if unicodedata.combining(ch):
+        return True
+    cat = unicodedata.category(ch)
+    if cat.startswith("M") or cat == "Cf":
+        return True
+    return False
+
+
+def _base_char_width(ch: str) -> int:
+    if _is_zero_width(ch):
+        return 0
+    eaw = unicodedata.east_asian_width(ch)
+    if eaw in ("F", "W"):
+        return 2
+    o = ord(ch)
+    if 0x1F300 <= o <= 0x1F9FF or 0x1FA00 <= o <= 0x1FA6F or 0x2600 <= o <= 0x27BF:
+        return 2
+    if eaw == "A":
+        return 2
+    return 1
+
+
+def _visible_cluster_advance(s: str, i: int) -> tuple[int, int]:
+    """Grapheme cluster step for ZWJ/variant: (chw, new_i)."""
+    n = len(s)
+    if i >= n:
+        return 0, i
+    while i < n and _is_zero_width(s[i]):
+        i += 1
+    if i >= n:
+        return 0, i
+    ch = s[i]
+    chw = _base_char_width(ch)
+    i += 1
+    saw_zwj = False
+    while i < n:
+        c = s[i]
+        if _is_zero_width(c):
+            if c == "\u200d":
+                saw_zwj = True
+            i += 1
+            continue
+        if saw_zwj:
+            saw_zwj = False
+            i += 1
+            continue
+        break
+    return chw, i
+
+
 def _ansi_visible_len(text: str) -> int:
-    """Terminal column count after stripping ANSI SGR sequences."""
-    return len(_ANSI_ESCAPE_RE.sub("", text))
+    """Terminal column count after stripping ANSI SGR sequences.
+    Supports combining/VS/ZWJ graphemes + emoji heuristic (no wcwidth dep)."""
+    stripped = _ANSI_ESCAPE_RE.sub("", text)
+    w = 0
+    i = 0
+    while i < len(stripped):
+        chw, i = _visible_cluster_advance(stripped, i)
+        w += chw
+    return w
 
 
 def _fit_visible(text: str, maxw: int) -> str:
-    """Truncate to <= maxw visible cols; preserve whole ANSI SGRs (for long names/regex in queue/prompt)."""
+    """Truncate to <= maxw visible cols; preserve whole ANSI SGRs and grapheme clusters (ZWJ/variant/emoji)."""
     if maxw <= 0 or not text:
         return ""
     if _ansi_visible_len(text) <= maxw:
@@ -968,16 +1139,47 @@ def _fit_visible(text: str, maxw: int) -> str:
     out_parts: list[str] = []
     vis = 0
     i = 0
-    while i < len(text):
+    n = len(text)
+    while i < n:
         m = _ANSI_ESCAPE_RE.match(text, i)
         if m:
             out_parts.append(m.group(0))
             i = m.end()
             continue
-        if vis < maxw:
-            out_parts.append(text[i])
-            vis += 1
-        i += 1
+        # collect next cluster (to not split ZWJ etc) and decide by its width
+        j = i
+        cluster = ""
+        chw = 0
+        if j < n:
+            if _is_zero_width(text[j]):
+                cluster += text[j]
+                j += 1
+            else:
+                ch0 = text[j]
+                chw = _base_char_width(ch0)
+                cluster += ch0
+                j += 1
+                saw_zwj = False
+                while j < n:
+                    c = text[j]
+                    if _is_zero_width(c):
+                        if c == "\u200d":
+                            saw_zwj = True
+                        cluster += c
+                        j += 1
+                        continue
+                    if saw_zwj:
+                        saw_zwj = False
+                        cluster += c
+                        j += 1
+                        continue
+                    break
+        if vis + chw <= maxw:
+            out_parts.append(cluster)
+            vis += chw
+        else:
+            break
+        i = j
     return "".join(out_parts)
 
 
@@ -1015,14 +1217,18 @@ def _scroll_region_bottom() -> int:
     return max(1, rows - reserve)
 
 
-def _chrome_update_scroll_region(*, reposition: bool = False) -> int:
+def _chrome_update_scroll_region(
+    *, reposition: bool = False, force: bool = False
+) -> int:
     """Pin the bottom chrome; return the last line of the scrolling output region."""
-    global _chrome_last_reserve
+    global _chrome_last_reserve, _chrome_last_height
     rows = _tty_height()
     reserve = _chrome_reserved_lines()
     bottom = max(1, rows - reserve)
-    if reserve != _chrome_last_reserve:
-        if _chrome_last_reserve > reserve:
+    height_changed = rows != _chrome_last_height
+    reserve_changed = reserve != _chrome_last_reserve
+    if force or reserve_changed or height_changed:
+        if reserve_changed and _chrome_last_reserve > reserve:
             # Rows that were chrome are now scrollable; clear stale queue/prompt text.
             clear_from = rows - _chrome_last_reserve + 1
             clear_to = rows - reserve
@@ -1031,8 +1237,9 @@ def _chrome_update_scroll_region(*, reposition: bool = False) -> int:
         sys.stdout.write(f"\033[1;{bottom}r")
         sys.stdout.flush()
         _chrome_last_reserve = reserve
+        _chrome_last_height = rows
         reposition = True
-    if reposition:
+    if force or reposition:
         sys.stdout.write(f"\033[{bottom};1H")
         sys.stdout.flush()
     return bottom
@@ -1040,12 +1247,18 @@ def _chrome_update_scroll_region(*, reposition: bool = False) -> int:
 
 def _chrome_active_prompt() -> str:
     """Prompt shown in the pinned chrome row (live while input is active)."""
-    if _waiting_for_confirm() or _bulk_confirm_pending or _confirm_expected or _chrome_input_active:
+    if (
+        _waiting_for_confirm()
+        or _bulk_confirm_pending
+        or _confirm_expected
+        or _chrome_input_active
+    ):
         return _craft_prompt()
     return _chrome_prompt
 
 
 def _chrome_state_key() -> tuple:
+    # Include height/width so deltas force refresh/region (real size change is a change).
     return (
         _format_queue_display(),
         _chrome_active_prompt(),
@@ -1057,13 +1270,30 @@ def _chrome_state_key() -> tuple:
         _api_worker_task is not None and not _api_worker_task.done()
         if _api_worker_task
         else False,
+        _tty_height(),
+        _tty_width(),
     )
 
 
-def _chrome_draw(*, partial: str = "") -> None:
-    """Draw queue panel and prompt on fixed rows below the scroll region."""
+def _chrome_state_unchanged(force: bool) -> bool:
+    if force:
+        return False
+    state = _chrome_state_key()
+    if state == _chrome_last_state:
+        return True
+    return False
+
+
+def _chrome_draw(*, partial: str = "", force: bool = False) -> None:
+    """Draw queue panel and prompt on fixed rows below the scroll region.
+    Throttled via _chrome_state_unchanged + force.
+    """
     if not _chrome_enabled:
         return
+    global _chrome_last_state
+    if _chrome_state_unchanged(force):
+        return
+    state = _chrome_state_key()
     rows = _tty_height()
     scroll_end = _scroll_region_bottom()
     display = _format_queue_display()
@@ -1082,26 +1312,32 @@ def _chrome_draw(*, partial: str = "") -> None:
     if prompt_text:
         _chrome_write_row(prompt_row, f"{prompt_text}{partial}")
     sys.stdout.flush()
+    _chrome_last_state = state
 
 
 def _chrome_refresh(*, force: bool = False, partial: str | None = None) -> None:
-    """Repaint pinned chrome when queue state changes."""
+    """Repaint pinned chrome when queue state changes.
+    Uses _chrome_state_unchanged + _chrome_state_key + _last_queue_snapshot + force for lightweight throttle:
+    skips unnecessary updates/draws/region sets when identical.
+    """
     global _last_queue_snapshot, _chrome_last_state
     if not _chrome_enabled:
         return
-    state = _chrome_state_key()
-    if not force and state == _chrome_last_state:
+    if _chrome_state_unchanged(force):
         return
+    state = _chrome_state_key()
     _chrome_last_state = state
     _last_queue_snapshot = _format_queue_display()
-    _chrome_update_scroll_region(reposition=True)
+    _chrome_update_scroll_region(reposition=True, force=force)
     if partial is None and _chrome_input_active:
         partial = _chrome_partial
-    _chrome_draw(partial=partial or "")
+    _chrome_draw(partial=partial or "", force=True)
 
 
 def _chrome_sync() -> None:
-    """Refresh chrome after queue/confirm changes while the user may be mid-input."""
+    """Refresh chrome after queue/confirm changes while the user may be mid-input.
+    Uses force path (callers signal real change); throttled downstream via state_key.
+    """
     if not _chrome_enabled:
         return
     with _repl_print_lock:
@@ -1115,6 +1351,7 @@ def _chrome_enable() -> None:
         return
     _chrome_enabled = True
     _chrome_last_reserve = 0
+    _chrome_last_height = 0
     _chrome_update_scroll_region(reposition=True)
     _chrome_refresh(force=True)
 
@@ -1131,7 +1368,29 @@ def _chrome_disable() -> None:
     _chrome_input_active = False
     _chrome_partial = ""
     _chrome_last_reserve = 0
+    _chrome_last_height = 0
     _chrome_last_state = None
+
+
+def _teardown_tty_and_chrome() -> None:
+    """Centralized idempotent teardown for chrome + tty patches + winch + flags.
+    Called from all exit paths (interactive finally, reset, harness, errors).
+    """
+    with contextlib.suppress(Exception):
+        _remove_winch_handler()
+    with contextlib.suppress(Exception):
+        _patch_repl_print(False)
+    with contextlib.suppress(Exception):
+        _chrome_disable()
+    global \
+        _interactive_mode_active, \
+        _confirm_expected, \
+        _bulk_confirm_pending, \
+        _bulk_confirm_resolved
+    _interactive_mode_active = False
+    _confirm_expected = False
+    _bulk_confirm_pending = False
+    _bulk_confirm_resolved = True
 
 
 def _repl_print(*args, **kwargs):
@@ -1151,10 +1410,15 @@ def _repl_print(*args, **kwargs):
         partial = _chrome_partial if _chrome_input_active else ""
 
         bottom = _chrome_update_scroll_region(reposition=True)
-        sys.stdout.write(f"\033[{bottom};1H\033[K{text}{end}")
+        cols = _tty_width()
+        safe = _fit_visible(text, max(0, cols - 1))
+        sys.stdout.write(f"\033[{bottom};1H\033[K{safe}{end}")
+        sys.stdout.write(
+            RESET
+        )  # close attrs if truncated mid-span (long name/emoji/FIRST)
         sys.stdout.flush()
 
-        _chrome_draw(partial=partial)
+        _chrome_draw(partial=partial, force=True)
 
 
 def _repl_print_lines(text: str) -> None:
@@ -1163,6 +1427,19 @@ def _repl_print_lines(text: str) -> None:
         return
     for line in text.split("\n"):
         _repl_print(line)
+
+
+def _echo_submitted_command(line: str) -> None:
+    """Echo the submitted command (dimmed) into the scroll region when chrome is active.
+
+    With pinned chrome the input row is redrawn clean on submit and never emitted
+    by the TTY reader. Echoing here ensures results have visible "what command
+    produced this" context in the scrollback (the queue panel is transient).
+    The echoed line is not indented so it stands out as context/header above
+    the (indented) result output.
+    """
+    if line.strip() and _chrome_enabled:
+        _repl_print_lines(_color(line, DIM))
 
 
 def _tty_input_available() -> bool:
@@ -1406,26 +1683,18 @@ def _tty_apply_arrow_key(
 
 
 def _tty_try_read_orphan_csi(prefix: str) -> str | None:
-    """Parse CSI/SS3 that lost its leading ESC (TextIO read-ahead edge case)."""
+    """Always treat bare [ or O as literal (prefer user data on CSI ambiguity).
+
+    Prevents the orphan CSI handler from misclassifying documented search metachars
+    (e.g. bare [, [A-Z]*, /foo[bar]/, fire*, mu?, !excl, ^first) as arrow/home/CSI.
+    The ESC-lost recovery path is not used; full ESC sequences via
+    _tty_collect_esc_sequence remain supported for arrows.
+    Fast path, no poll delay (common [ / O in queries).
+    """
     pending = [prefix] + _tty_slurp_stdin(stop_on_newline=False)
-    deadline = time.monotonic() + 0.05
-    while time.monotonic() < deadline:
-        seq, used = _tty_try_parse_esc_from_pending(pending)
-        if seq is not None:
-            if used < len(pending):
-                _tty_unread_stdin_many(pending[used:])
-            return seq
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        ch = _tty_read_stdin_byte(min(remaining, _CSI_POLL_INTERVAL_S))
-        if ch is None:
-            break
-        if ch in ("\n", "\r"):
-            _tty_unread_stdin_byte(ch)
-            break
-        pending.append(ch)
-    _tty_unread_stdin_many(pending)
+    extras = pending[1:]
+    if extras:
+        _tty_unread_stdin_many(extras)
     return None
 
 
@@ -1433,7 +1702,8 @@ def _tty_read_line() -> str:
     """Read a line in cbreak mode: arrows, history, and Escape to skip running work."""
     global _tty_stdin_unread
     if _tty_read_byte_hook is None:
-        assert termios is not None and tty is not None
+        if termios is None or tty is None:
+            raise RuntimeError("TTY required but termios/tty unavailable")
     buf: list[str] = []
     pos = 0
     history_items = _input_history_items()
@@ -1501,32 +1771,10 @@ def _tty_read_line() -> str:
                     continue
                 continue
             if ch in ("[", "O"):
-                seq = _tty_try_read_orphan_csi(ch)
-                if seq is not None:
-                    arrow = _tty_arrow_letter(seq)
-                    if arrow is not None:
-                        buf, pos, history_index, history_draft = _tty_apply_arrow_key(
-                            arrow,
-                            buf=buf,
-                            pos=pos,
-                            history_items=history_items,
-                            history_index=history_index,
-                            history_draft=history_draft,
-                        )
-                        continue
-                    if seq in ("[H", "[1~", "OH") and pos > 0:
-                        sys.stdout.write(f"\033[{pos}D")
-                        sys.stdout.flush()
-                        pos = 0
-                        continue
-                    if seq in ("[F", "[4~", "OF"):
-                        tail = len(buf) - pos
-                        if tail > 0:
-                            sys.stdout.write(f"\033[{tail}C")
-                            sys.stdout.flush()
-                            pos = len(buf)
-                        continue
-                    continue
+                # bare [O always literal (orphan fn returns None); slurp+unread extras for prod
+                # fidelity (e.g. "[A-Z]*" etc never hijacked as CSI). Arrows/home only via ESC path.
+                _tty_try_read_orphan_csi(ch)
+                # fallthrough -> isprintable inserts the literal ch
             if ch.isprintable() or ch == "\t":
                 buf.insert(pos, ch)
                 pos += 1
@@ -1535,7 +1783,8 @@ def _tty_read_line() -> str:
                 _tty_refresh_input(buf, pos)
     finally:
         if use_real_tty and old is not None:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            with contextlib.suppress(Exception):
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
 def _patch_repl_print(active: bool) -> None:
@@ -1659,10 +1908,15 @@ def _awaiting_bulk_confirm_setup() -> bool:
 
 
 async def _await_confirmation(prompt: str) -> str:
-    """Request confirmation via the interactive loop (avoids competing craft> prompts)."""
+    """Request confirmation via the interactive loop (avoids competing prompts)."""
     if not _interactive_mode_active:
         return await _prompt_input(prompt)
-    global _confirm_future, _confirm_expected, _confirm_answer_buffer, _chrome_prompt, _chrome_partial
+    global \
+        _confirm_future, \
+        _confirm_expected, \
+        _confirm_answer_buffer, \
+        _chrome_prompt, \
+        _chrome_partial
     loop = asyncio.get_running_loop()
     fut: asyncio.Future[str] = loop.create_future()
     _confirm_future = fut
@@ -1833,7 +2087,9 @@ async def do_permute(client, storage, query: str):
         _repl_print_lines("  No elements match that query.")
         return
     if len(matches) == 1:
-        _repl_print_lines(f"  Only one match: {format_element(matches[0])}. Need at least two.")
+        _repl_print_lines(
+            f"  Only one match: {format_element(matches[0])}. Need at least two."
+        )
         return
 
     n = len(matches)
@@ -1852,7 +2108,7 @@ async def do_permutate(client, storage, query: str):
     stopped = False
     try:
         _repl_print_lines(
-            f"  Permutating matches for {_color(query, YELLOW)} until no new discoveries..."
+            f"  Permuting matches for {_color(query, YELLOW)} until no new discoveries..."
         )
         _repl_print_lines("  (Ctrl+C to stop)")
 
@@ -1861,7 +2117,9 @@ async def do_permutate(client, storage, query: str):
                 stopped = True
                 break
             if round_num >= _MAX_PERMUTATE_ROUNDS:
-                _repl_print_lines(f"  Reached max rounds ({_MAX_PERMUTATE_ROUNDS}). Stopping.")
+                _repl_print_lines(
+                    f"  Reached max rounds ({_MAX_PERMUTATE_ROUNDS}). Stopping."
+                )
                 break
             round_num += 1
             known_before = {e.name for e in storage.get_all()}
@@ -1882,7 +2140,9 @@ async def do_permutate(client, storage, query: str):
             pairs = [
                 (matches[i], matches[j]) for i in range(n) for j in range(i + 1, n)
             ]
-            _repl_print_lines(f"  --- Round {round_num}: {n} elements, {len(pairs)} pairs ---")
+            _repl_print_lines(
+                f"  --- Round {round_num}: {n} elements, {len(pairs)} pairs ---"
+            )
 
             if not confirmed and len(pairs) > _BULK_WARN_THRESHOLD:
                 if sys.stdin.isatty():
@@ -1931,7 +2191,7 @@ async def do_permutate(client, storage, query: str):
 
         if stopped:
             if not _skip_summary_shown:
-                _repl_print_lines("  Stopped.")
+                _repl_print_lines("  Stopped early.")
                 _mark_cancel_notified()
         else:
             _repl_print_lines(f"  Permutate done after {round_num} round(s).")
@@ -2169,7 +2429,9 @@ async def _fill_missing_recipes_async(storage):
         return
 
     total = len(missing)
-    _repl_print_lines(f"  {total} elements missing recipes. Fetching from Infinibrowser...")
+    _repl_print_lines(
+        f"  {total} elements missing recipes. Fetching from Infinibrowser..."
+    )
     _repl_print_lines("  (Ctrl+C to stop early)")
     fetched = 0
     skipped = 0
@@ -2226,7 +2488,9 @@ async def _fill_missing_recipes_async(storage):
         _repl_print_lines("  Stopped early.")
     _mark_cancel_notified()
     storage.reload()
-    summary = f"  Fetched {fetched} lineages, {skipped} already filled by prior lineages."
+    summary = (
+        f"  Fetched {fetched} lineages, {skipped} already filled by prior lineages."
+    )
     if failed:
         summary += f" {_color(str(len(failed)), YELLOW)} not found on Infinibrowser."
     _repl_print_lines(summary)
@@ -2337,9 +2601,7 @@ async def _prune_orphans_async(storage):
                 _repl_print_lines("  Stopped early.")
                 _mark_cancel_notified()
                 break
-            _repl_print_lines(
-                f"  [{i}/{total}] {format_element(elem)}..."
-            )
+            _repl_print_lines(f"  [{i}/{total}] {format_element(elem)}...")
             fillable = await _ib_can_fill_async(elem.name)
             if fillable is None:
                 skipped += 1
@@ -2355,7 +2617,9 @@ async def _prune_orphans_async(storage):
     except KeyboardInterrupt:
         _repl_print_lines("  Stopped early.")
     _mark_cancel_notified()
-    summary = f"  Pruned {_color(str(pruned), GREEN)} element{'s' if pruned != 1 else ''}."
+    summary = (
+        f"  Pruned {_color(str(pruned), GREEN)} element{'s' if pruned != 1 else ''}."
+    )
     if kept:
         summary += f" {kept} fillable on Infinibrowser (kept)."
     if skipped:
@@ -2464,13 +2728,15 @@ def do_help() -> str:
     /prune                      Remove orphan elements Infinibrowser can't fill
     /export [path]              Export discoveries as .ic save file
     /history                    Show combinations tried this session
-    /queue                      Show running and pending commands (status also appears above craft>)
+    /clear                      Clear output (browser only)
+    /queue                      Show running and pending commands (status also appears above the prompt)
     /help                       Show this help
     /quit                       Exit
 
   Background queue (long API commands):
     Esc                         Skip current command, continue to next in queue
-                                (TTY only; skips during rate-limit/backoff waits,
+                                (TTY only; skips during rate-limit/backoff waits
+                                (⏳ rate limit shows in queue panel),
                                 not during an active network request; bulk
                                 commands may finish in-flight pairs first)
     Ctrl+C                      While running: stop and discard remaining queue
@@ -2683,8 +2949,13 @@ def do_queue_status() -> str:
         )
     lines: list[str] = []
     if _current_command:
-        lines.append(f"  Running: {_sanitize_queue_line(_current_command)}")
-    for i, cmd in enumerate(_command_queue, 1):
+        line = f"  Running: {_sanitize_queue_line(_current_command)}"
+        if _rate_limit_waiting:
+            line += " ⏳ rate limit"
+        lines.append(line)
+    for i, cmd in enumerate(
+        list(_command_queue), 1
+    ):  # snapshot copy (thread/race safe)
         lines.append(f"  {i}. pending: {_sanitize_queue_line(cmd)}")
     return "\n".join(lines)
 
@@ -2707,26 +2978,32 @@ def _format_queue_display() -> str:
     if running:
         cmd = _sanitize_queue_line(running)
         prefix = f"  {_color('▶', YELLOW)} {_color('running', DIM)}  "
+        suffix = ""
+        if _rate_limit_waiting:
+            suffix = f" {_color('⏳ rate limit', DIM)}"
         pvis = _ansi_visible_len(prefix)
-        avail = max(1, width - pvis - 1)
+        suffix_vis = _ansi_visible_len(suffix)
+        avail = max(1, width - pvis - suffix_vis - 1)
         if _ansi_visible_len(cmd) > avail:
-            cmd = cmd[: max(0, avail - 1)] + "…"
-        content.append(f"{prefix}{_color(cmd, YELLOW)}")
+            cmd = _fit_visible(cmd, max(0, avail - 1)) + "…"
+        content.append(f"{prefix}{_color(cmd, YELLOW)}{suffix}")
     for i, cmd in enumerate(pending, 1):
         safe = _sanitize_queue_line(cmd)
         prefix = f"  {_color(f'{i}.', DIM)} {_color('pending', DIM)}  "
         pvis = _ansi_visible_len(prefix)
         avail = max(1, width - pvis - 1)
         if _ansi_visible_len(safe) > avail:
-            safe = safe[: max(0, avail - 1)] + "…"
+            safe = _fit_visible(safe, max(0, avail - 1)) + "…"
         content.append(f"{prefix}{safe}")
     if _waiting_for_confirm():
-        prefix = f"  {_color('◆', YELLOW)} {_color('awaiting confirm', BOLD + YELLOW)}  "
+        prefix = (
+            f"  {_color('◆', YELLOW)} {_color('awaiting confirm', BOLD + YELLOW)}  "
+        )
         plain = "answer y/n at prompt below"
         pvis = _ansi_visible_len(prefix)
         avail = max(1, width - pvis - 1)
         if _ansi_visible_len(plain) > avail:
-            plain = plain[: max(0, avail - 1)] + "…"
+            plain = _fit_visible(plain, max(0, avail - 1)) + "…"
         desc = _color(plain, DIM)
         content.append(f"{prefix}{desc}")
     elif _bulk_confirm_pending:
@@ -2735,7 +3012,7 @@ def _format_queue_display() -> str:
         pvis = _ansi_visible_len(prefix)
         avail = max(1, width - pvis - 1)
         if _ansi_visible_len(plain) > avail:
-            plain = plain[: max(0, avail - 1)] + "…"
+            plain = _fit_visible(plain, max(0, avail - 1)) + "…"
         desc = _color(plain, DIM)
         content.append(f"{prefix}{desc}")
     if not content:
@@ -2752,11 +3029,11 @@ def _format_queue_display() -> str:
         rule = _color("─" * sep_len, DIM)
         lines[0] = f"  {rule} {_color('queue', BOLD + CYAN)} {rule}"
     lines.extend(content)
-    foot_len = max(3, min(50, width - 2))
-    foot = f"  {_color('─' * foot_len, DIM)}"
-    if _ansi_visible_len(foot) > width:
-        foot_len = max(3, width - 2)
-        foot = f"  {_color('─' * foot_len, DIM)}"
+    # Make the footer the same visible width as the header for visual consistency.
+    # Header already computed a balanced (capped) rule length around the label.
+    header_vis = _ansi_visible_len(lines[0])
+    foot_bar = "─" * max(3, header_vis - 2)
+    foot = f"  {_color(foot_bar, DIM)}"
     lines.append(foot)
     return "\n".join(lines)
 
@@ -2772,30 +3049,40 @@ def _erase_queue_panel():
 
 
 def _paint_queue_panel(force: bool = False):
-    """Redraw the queue panel above the prompt; clear it when idle."""
+    """Redraw the queue panel above the prompt; clear it when idle.
+    Lightweight throttle for chrome path using _chrome_state_unchanged / state_key / snapshot + force.
+    """
     global _last_queue_snapshot, _queue_panel_height
     if _chrome_enabled:
+        if not force:
+            # early throttle using _chrome_state_unchanged (covers queue/prompt/confirm/height/width deltas etc)
+            if _chrome_state_unchanged(force):
+                return
         with _repl_print_lock:
             _chrome_refresh(force=force)
         return
     display = _format_queue_display()
     if display == _last_queue_snapshot and not force:
         return
-    _erase_queue_panel()
-    if display:
-        print(display, flush=True)
-        _queue_panel_height = display.count("\n") + 1  # auto 1 for compact single; 3+ for multi
+    with _repl_print_lock:
+        _erase_queue_panel()
+        if display:
+            print(display, flush=True)
+            _queue_panel_height = (
+                display.count("\n") + 1
+            )  # auto 1 for compact single; 3+ for multi
     _last_queue_snapshot = display
 
 
 def _craft_prompt() -> str:
     """Prompt string; hints when background work is active."""
     if _waiting_for_confirm() or _bulk_confirm_pending or _confirm_expected:
-        return _color("confirm [y/N]> ", YELLOW)
-    base = _color("craft> ", CYAN)
+        return _color(CONFIRM_PROMPT, YELLOW)
+    base = _color(CRAFT_PROMPT, CYAN)
     if not (_current_command or _command_queue):
         return base
-    pending = len(_command_queue) + (1 if _current_command else 0)
+    cq = list(_command_queue)  # snapshot for race safety (reads from chrome/repl paths)
+    pending = len(cq) + (1 if _current_command else 0)
     hint = _color(f"[{pending} active] ", DIM)
     if _current_command and _tty_input_available():
         hint += _color("[Esc skip] ", DIM)
@@ -2806,7 +3093,7 @@ def _queue_enqueue_deferred() -> bool:
     """True when a new command will wait behind in-flight or queued work."""
     return (
         _current_command is not None
-        or bool(_command_queue)
+        or bool(list(_command_queue))  # snapshot copy for cross-thread safety w/ worker
         or _waiting_for_confirm()
         or _bulk_confirm_pending
     )
@@ -2913,7 +3200,9 @@ async def _dispatch_line(client, storage, line: str) -> None:
         _repl_print_lines(do_history(storage))
     elif line == "/queue":
         _paint_queue_panel(force=True)
-        if not _chrome_enabled and not _current_command and not _command_queue:
+        if (
+            not _chrome_enabled and not _current_command and not list(_command_queue)
+        ):  # snapshot
             _repl_print_lines(do_queue_status())
     elif line == "/clear":
         if not _chrome_enabled:
@@ -2964,7 +3253,9 @@ async def _dispatch_line(client, storage, line: str) -> None:
             res = await do_combine(client, storage, first, second)
             _repl_print_lines(res)
     else:
-        _repl_print_lines(f"  Unknown input. Type {_color('/help', YELLOW)} for commands.")
+        _repl_print_lines(
+            f"  Unknown input. Type {_color('/help', YELLOW)} for commands."
+        )
 
 
 async def _api_worker(client, storage):
@@ -3019,11 +3310,12 @@ def _enqueue_command_line(line: str, client, storage) -> bool:
     if error:
         _repl_print_lines(error)
         return False
-    if line in _command_queue or line == _current_command:
+    q = list(_command_queue)  # snapshot to avoid concurrent mod race from worker thread
+    if line in q or line == _current_command:
         msg = f"  {_color('Already queued.', DIM)}"
         _repl_print_lines(msg)
         return False
-    if len(_command_queue) >= _MAX_QUEUE_DEPTH:
+    if len(q) >= _MAX_QUEUE_DEPTH:
         msg = f"  {_color(f'Queue full (max {_MAX_QUEUE_DEPTH}).', YELLOW)}"
         _repl_print_lines(msg)
         return False
@@ -3034,7 +3326,7 @@ def _enqueue_command_line(line: str, client, storage) -> bool:
     _ensure_api_worker(client, storage)
     if deferred and not _chrome_enabled:
         msg = f"  {_color(f'Queued: {_sanitize_queue_line(line)}', DIM)}"
-        print(msg)
+        _repl_print_lines(msg)
     _chrome_sync()
     return True
 
@@ -3045,24 +3337,34 @@ async def _shutdown_interactive() -> int:
     _cancelled = True
     discarded = len(_command_queue)
     _command_queue.clear()
-    if _api_worker_task is not None and not _api_worker_task.done():
-        _api_worker_task.cancel()
-        try:
-            await asyncio.wait_for(_api_worker_task, timeout=5.0)
-        except (asyncio.CancelledError, asyncio.TimeoutError):
-            pass
+    await _cancel_and_await_worker(timeout=5.0)
     if discarded:
-        msg = f"  Discarded {discarded} queued command(s)."
+        msg = f"  Cancelled. Discarded {discarded} queued command(s)."
         _repl_print_lines(msg)
     _repl_print_lines("Goodbye!")
     return discarded
+
+
+async def _cancel_and_await_worker(timeout: float = 2.0) -> None:
+    """Cancel the api worker (if running) and await its completion. Idempotent.
+    Sets the global to None. Used by finally/exit paths and harness to ensure full reap.
+    """
+    global _api_worker_task
+    t = _api_worker_task
+    if t and not t.done():
+        t.cancel()
+        try:
+            await asyncio.wait_for(t, timeout=timeout)
+        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+            pass
+    _api_worker_task = None
 
 
 async def interactive_mode():
     global _command_queue, _current_command, _api_worker_task, _cancelled
     global _confirm_future, _last_queue_snapshot, _queue_panel_height
     global _interactive_mode_active, _confirm_expected, _bulk_confirm_pending
-    global _bulk_confirm_resolved
+    global _bulk_confirm_resolved, _confirm_answer_buffer
     _interactive_mode_active = True
     _tty_reset_stdin_reader()
     _confirm_expected = False
@@ -3081,11 +3383,13 @@ async def interactive_mode():
     storage = DiscoveryStorage(DISCOVERIES_PATH)
     _patch_repl_print(True)
     _chrome_enable()
+    _install_winch_handler()
     try:
         async with InfiniteCraftClient(
             rate_limit=API_RATE_LIMIT,
             cancel_check=lambda: _cancelled,
             rate_limit_sleep_step=_RATE_LIMIT_SLEEP_STEP,
+            _rate_limit_wait_callback=_rate_limit_wait_callback,
         ) as client:
             starters = "  ".join(format_element(e) for e in storage.get_all()[:4])
             _repl_print_lines(f"  Starting elements: {starters}")
@@ -3096,7 +3400,9 @@ async def interactive_mode():
             while True:
                 _paint_queue_panel()
 
-                if _command_queue and _current_command is None:
+                if (
+                    list(_command_queue) and _current_command is None
+                ):  # snapshot for race safety
                     await asyncio.sleep(0)
                     continue
 
@@ -3115,6 +3421,7 @@ async def interactive_mode():
                             await _shutdown_interactive()
                             break
                         if _is_local_command(line):
+                            _echo_submitted_command(line)
                             await _dispatch_line(client, storage, line)
                             continue
                         if _route_confirm_input(line):
@@ -3124,6 +3431,7 @@ async def interactive_mode():
                                     _chrome_refresh(force=True)
                             pass
                         elif line.strip():
+                            _echo_submitted_command(line)
                             _enqueue_command_line(line, client, storage)
                     continue
 
@@ -3144,17 +3452,21 @@ async def interactive_mode():
                     break
 
                 if _is_local_command(line):
+                    _echo_submitted_command(line)
                     await _dispatch_line(client, storage, line)
                     continue
 
                 if _route_confirm_input(line):
                     continue
 
+                _echo_submitted_command(line)
                 _enqueue_command_line(line, client, storage)
     finally:
-        _patch_repl_print(False)
-        _chrome_disable()
-        _interactive_mode_active = False
+        # Best-effort cleanup of worker on any exit (including uncaught exceptions or KI
+        # during input) to avoid lingering high-memory processes/threads.
+        await _cancel_and_await_worker()
+        _teardown_tty_and_chrome()
+        _confirm_future = None
 
 
 # ---------------------------------------------------------------------------

@@ -1,7 +1,9 @@
 """HTTP clients for Infinite Craft and Infinibrowser APIs."""
 
 from infinite_craft_cli.element import Element
-from infinite_craft_cli.ratelimit import RateLimiter
+from typing import Callable
+
+from infinite_craft_cli.ratelimit import RateLimiter, RateLimitCancelled, RateLimitToken
 
 _BASE_URL = "https://neal.fun"
 _PAIR_ENDPOINT = "/api/infinite-craft/pair"
@@ -42,11 +44,14 @@ def _get_sync_session():
     global _sync_session
     if _sync_session is None:
         from curl_cffi.requests import Session
+
         _sync_session = Session(impersonate=_IMPERSONATE)
     return _sync_session
 
 
-def fetch_json(url: str, params: dict | None = None, timeout: int = 15, use_cache: bool = True) -> dict | None:
+def fetch_json(
+    url: str, params: dict | None = None, timeout: int = 15, use_cache: bool = True
+) -> dict | None:
     """Sync GET returning parsed JSON, with caching. Returns None on error.
 
     Uses curl_cffi with Chrome impersonation for Cloudflare bypass.
@@ -71,8 +76,18 @@ def clear_fetch_cache():
 class InfiniteCraftClient:
     """Async client for the neal.fun Infinite Craft pairing API."""
 
-    def __init__(self, rate_limit: int = 60):
+    def __init__(
+        self,
+        rate_limit: int = 60,
+        cancel_check: Callable[[], bool] | None = None,
+        *,
+        rate_limit_sleep_step: float = 0.1,
+        _rate_limit_wait_callback: Callable[[bool], None] | None = None,
+    ):
         self._rate_limiter = RateLimiter(max_requests=rate_limit)
+        self._cancel_check = cancel_check
+        self._rate_limit_sleep_step = rate_limit_sleep_step
+        self._rate_limit_wait_callback = _rate_limit_wait_callback
         self._session = None
 
     async def __aenter__(self):
@@ -101,7 +116,14 @@ class InfiniteCraftClient:
 
         Returns Element(name=None) if the combination produces nothing.
         """
-        await self._rate_limiter.acquire()
+        token: RateLimitToken = await self._rate_limiter.acquire(
+            cancel_check=self._cancel_check,
+            sleep_step=self._rate_limit_sleep_step,
+            _wait_callback=self._rate_limit_wait_callback,
+        )
+        if self._cancel_check and self._cancel_check():
+            await self._rate_limiter.release(token)
+            raise RateLimitCancelled()
 
         resp = await self._session.get(
             _PAIR_ENDPOINT,
