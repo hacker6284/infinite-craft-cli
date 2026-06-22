@@ -6,13 +6,10 @@ import pytest
 from unittest.mock import patch, AsyncMock, MagicMock
 
 from tests.conftest import MockElement, make_mock_storage
+from tests.help_utils import _run_interactive, run_async
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
-
-
-def run_async(coro):
-    return asyncio.run(asyncio.wait_for(coro, timeout=30.0))
 
 
 @pytest.fixture(autouse=True)
@@ -33,23 +30,6 @@ def clear_caches(tmp_path, request):
     ):
         yield
     _clear()
-
-
-def _run_interactive(inputs):
-    """Run interactive_mode with a sequence of input lines, return captured output.
-    (Harness available via repl_harness fixture for new strong UI tests.)
-    """
-    from infinite_craft_cli.cli import interactive_mode
-
-    input_iter = iter(inputs + ["/quit"])
-    # Patch isatty False to force non-chrome + builtins.input path (legacy compat;
-    # tty/chromium path would bypass the input mock and hit _tty_read_line on captured fd)
-    with (
-        patch("builtins.input", side_effect=input_iter),
-        patch("sys.stdout.isatty", return_value=False),
-        patch("sys.stdin.isatty", return_value=False),
-    ):
-        run_async(interactive_mode())
 
 
 class TestInteractiveCombine:

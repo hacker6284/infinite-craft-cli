@@ -2503,7 +2503,7 @@ class TestREPLHarnessEdges:
 
     def test_harness_vs_legacy_equiv_smoke(self, capsys):
         # parity smoke: harness drive produces similar goodbye as legacy _run (sequential reads isolate deltas)
-        from tests.test_interactive import _run_interactive
+        from tests.help_utils import _run_interactive
         from tests.conftest import REPLTestHarness
 
         _run_interactive(["/quit"])
