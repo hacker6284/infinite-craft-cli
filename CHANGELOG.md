@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.4.2] - 2026-06-22
+
+### Fixed
+- Eliminated the last remaining brittleness in the high-level test framework. The `test_streaming_bulk_slow_pairs_interleaved_local_and_queue_status_via_harness` test (and similar) no longer depended on fragile global `rfind` position ordering between output lines and chrome/queue status redraws. Replaced with suffix checks after specific output markers + explicit yields to guarantee interleaving. All `TestREPLHarnessEdges` tests remain strictly behavioral using only `in`/`rfind`, `prompt_calls[-1]`, `Events`, and capsys — no `cli._*` access, no counts, no exact string matches.
+
 ## [1.4.1] - 2026-06-22
 
 ### Fixed
