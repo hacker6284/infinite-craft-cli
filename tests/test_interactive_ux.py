@@ -4766,6 +4766,7 @@ class TestREPLHarnessEdges:
             # interleaved locals during running bulk (streaming outputs via slow pairs)
             repl_harness.feed("/list")
             repl_harness.feed("/search Bulk")
+            await asyncio.sleep(0.02)  # yield so local commands are processed + chrome redraws happen while bulk still "running"
             release.set()
             repl_harness.feed("/quit")
             await t
@@ -4801,11 +4802,13 @@ class TestREPLHarnessEdges:
 
         # phrases appear after output lines (verifies force redraw of chrome after scroll writes)
         # /list output (contains "Discovered") + bulk progress from slow pairs; status re-emitted after
+        # the local output via _repl_print + _chrome_draw(force=True)
         list_pos = max((out.rfind(p) for p in ("Discovered", "elements:")), default=-1)
-        status_last = max((out.rfind(p) for p in ("▶", "running")), default=-1)
         assert list_pos >= 0, "expected output lines from /list during running"
-        assert status_last > list_pos, (
-            "queue/prompt status (▶ running etc) must appear after output lines; no stale panel after scroll writes"
+        tail = out[list_pos:]
+        assert any(p in tail for p in ("▶", "running")), (
+            "queue/prompt status (▶ running etc) must appear after /list output lines; "
+            "no stale panel (chrome must force redraw panel after scroll writes from local cmds)"
         )
         # bulk progress lines (emitted via _repl during streaming) also followed by status redraw
         bulk_pos = max(
@@ -4813,7 +4816,8 @@ class TestREPLHarnessEdges:
             default=-1,
         )
         if bulk_pos >= 0:
-            assert status_last >= bulk_pos or out.rfind("▶") >= bulk_pos, (
+            tail_after_bulk = out[bulk_pos:]
+            assert any(p in tail_after_bulk for p in ("▶", "running")) or "▶" in tail_after_bulk, (
                 "status after bulk streaming output"
             )
 
