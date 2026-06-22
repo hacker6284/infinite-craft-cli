@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [1.4.0] - 2026-06-22
 
 ### Added
 - `/exhaust <query>` — each element matching the query is combined with all discoveries (generalizes single-element exhaust)
