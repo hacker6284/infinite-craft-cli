@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.4.1] - 2026-06-22
+
+### Fixed
+- CI (Bazel) tests now pass: shared test utilities (`tests/help_utils.py`, legacy runner helpers) are properly declared as `py_library` and wired as dependencies for all `py_test` targets. This unblocks publishing after the v1.4.0 tag.
+- Moved `_run_interactive` / `run_async` helpers to `help_utils` to support cross-test imports under Bazel's hermetic runfiles without breaking legacy direct-drive tests.
+
 ## [1.4.0] - 2026-06-22
 
 ### Added
