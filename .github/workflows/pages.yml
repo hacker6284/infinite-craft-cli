@@ -1,9 +1,11 @@
 name: Deploy Bookmarklet to GitHub Pages
 
+# Deploys are release-gated: the site (which live extensions/userscripts
+# fetch) updates only when a v* tag is pushed — the same gate as PyPI —
+# or on explicit manual dispatch. Merges to main never auto-deploy.
 on:
   push:
-    branches: [main]
-    paths: [bookmarklet/**, sudo/**, scripts/**, .github/workflows/pages.yml]
+    tags: ["v*"]
   workflow_dispatch:
 
 permissions:

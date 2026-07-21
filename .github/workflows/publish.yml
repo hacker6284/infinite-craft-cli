@@ -13,6 +13,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The kernel is generated code and gitignored — the package is
+      # incomplete (ImportError on infinite_craft_cli._sudo) unless the
+      # sudo sources are transpiled before building.
+      - name: Check out sudocode (transpiler)
+        uses: actions/checkout@v4
+        with:
+          repository: hacker6284/sudocode
+          path: .sudocode
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .sudocode/sudoc
+      - name: Build sudoc
+        working-directory: .sudocode/sudoc
+        run: cargo build --release
+      - name: Generate kernel adapters
+        run: SUDOC_BIN="$PWD/.sudocode/sudoc/target/release/sudoc" bash scripts/generate.sh
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -22,6 +39,11 @@ jobs:
 
       - name: Build package
         run: python -m build
+
+      - name: Wheel actually contains the kernel
+        run: |
+          pip install dist/*.whl
+          python -c "import infinite_craft_cli._sudo.craft; print('kernel import OK')"
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
