@@ -1,0 +1,5 @@
+filegroup(
+    name = "trainer_srcs",
+    srcs = ["trainer.src.mjs"] + glob(["_sudo/**"]),
+    visibility = ["//visibility:public"],
+)

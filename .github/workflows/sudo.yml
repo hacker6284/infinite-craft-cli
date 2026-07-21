@@ -1,5 +1,11 @@
 name: sudo kernel
 
+# Division of labor: Bazel (.github/workflows/test.yml) owns host Python
+# tests, including host-parity lockstep (//tests/parity:parity_test).
+# This workflow owns toolchain integration — building sudoc, generating
+# kernel adapters, kernel py/js lockstep, node smoke, and the bookmarklet
+# bundle/artifact.
+
 on:
   push:
     branches: [main, sudo-kernel]
@@ -32,15 +38,6 @@ jobs:
       # this repo consumes — divergence fails the build.
       - name: Kernel lockstep (py vs js)
         run: ./.sudocode/sudoc/target/release/sudoc test --target py --target js sudo/craft.sudo
-
-      - uses: astral-sh/setup-uv@v5
-      # pytest is not a pyproject dependency (the repo's canonical runner is
-      # Bazel, which brings its own) — inject it ephemerally.
-      - name: Python tests
-        run: uv run --with pytest --with pytest-asyncio pytest tests/ -q
-
-      - name: Host parity lockstep
-        run: bash tests/parity/run_parity.sh
 
       - name: Kernel smoke (node, ex-bug behaviors)
         run: node bookmarklet/test_kernel_smoke.mjs

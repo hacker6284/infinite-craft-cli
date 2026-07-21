@@ -24,5 +24,4 @@ code changes needed in most cases.
 | `record_recipe` | `{"initial_recipes": {...}, "calls": [{"result","a","b"}, ...]}` | `{result: [[a,b], ...]}` | |
 | `trace` | `{"name": str}` + elements/recipes/`chain` | `{"status", "target", "steps"}` | |
 | `export` | elements/recipes | `[[name, emoji, first], ...]` (sorted by name) | |
-| `classify` | `{"line": str}` | `[kind, payload] \| null` | **New.** Drives `_classify_command_line` (Python) directly on a bare command-line string; no elements/recipes involved. **JS-side (`run_js.mjs` / `trainer.src.mjs`) support is pending — another lane's task.** Until it lands, `run_parity.sh` will fail on `classify`/`validate` scenario ids with "unknown op" on the JS side; this is expected, not a regression. |
 | `validate` | `{"line": str}` | `str \| null` | **New.** Drives `_validate_command_line` (Python) directly on a bare command-line string. Same JS-pending caveat as `classify` above. |

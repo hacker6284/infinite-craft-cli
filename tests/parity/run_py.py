@@ -123,10 +123,17 @@ def _run_scenario(scenario: dict, fixtures: dict, scratch_root: str):
         cli.RECIPES_PATH = old_recipes_path
 
 
-def main() -> int:
-    with open(FIXTURES_PATH, encoding="utf-8") as f:
-        fixtures = json.load(f)
+def run_all_scenarios(fixtures_path: str = FIXTURES_PATH) -> dict:
+    """Run every scenario in fixtures_path against Python host wiring
+    (cli.py) and return {scenario_id: result} for all of them.
 
+    Raises RuntimeError (chained from the original exception) on the first
+    scenario that errors — callers that want partial results or different
+    error handling should catch RuntimeError, not rely on partial dict
+    contents.
+    """
+    with open(fixtures_path, encoding="utf-8") as f:
+        fixtures = json.load(f)
     results = {}
     with tempfile.TemporaryDirectory(prefix="parity-py-") as scratch_root:
         for scenario in fixtures["scenarios"]:
@@ -134,12 +141,17 @@ def main() -> int:
             try:
                 results[sid] = _run_scenario(scenario, fixtures, scratch_root)
             except Exception as exc:
-                print(f"ERROR in scenario {sid!r}: {exc}", file=sys.stderr)
-                return 1
+                raise RuntimeError(f"ERROR in scenario {sid!r}: {exc}") from exc
+    return results
 
-    print(
-        json.dumps(results, indent=2, sort_keys=True, ensure_ascii=False)
-    )
+
+def main() -> int:
+    try:
+        results = run_all_scenarios()
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(json.dumps(results, indent=2, sort_keys=True, ensure_ascii=False))
     return 0
 
 

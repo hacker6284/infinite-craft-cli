@@ -1,0 +1,27 @@
+load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "parity_test",
+    srcs = [
+        "parity_test.py",
+        "run_py.py",
+    ],
+    main = "parity_test.py",
+    data = [
+        "fixtures.json",
+        "run_js.mjs",
+        "//bookmarklet:trainer_srcs",
+    ],
+    deps = [
+        "//src/infinite_craft_cli",
+        "@pip//pytest",
+    ],
+    # Node.js comes from the system PATH — this repo has no JS ruleset and
+    # a single bookmarklet script doesn't justify adding one. `local`
+    # disables sandboxing so `node` (and the filesystem paths run_js.mjs's
+    # own relative imports resolve to) are reachable; documented
+    # compromise, not an oversight.
+    tags = ["local"],
+    # Inherit PATH so `node` is found; tags=["local"] alone does not forward it.
+    env_inherit = ["PATH"],
+)
