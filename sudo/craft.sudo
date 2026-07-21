@@ -1189,6 +1189,14 @@ test "element_matches_pattern real alternation cat or dog"
     assert err.is_none()
     assert not m
 
+test "element_matches_pattern backslash escape digits"
+    m, err = element_matches_pattern("Area 51", "/\\d+/")
+    assert err.is_none()
+    assert m
+    m, err = element_matches_pattern("AreaX", "/\\d+/")
+    assert err.is_none()
+    assert not m
+
 test "trace_recipe unbounded depth over 200 layers"
     els: List<Element> = []
     recipes: Map<text, List<(text, text)>> = Map()

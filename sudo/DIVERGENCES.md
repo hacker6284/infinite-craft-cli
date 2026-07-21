@@ -126,6 +126,28 @@ coverage: `"element_matches_pattern real alternation cat or dog"` —
 also covers `/a|b/` now matching bare `"a"` and `"b"` (previously
 literal-pipe-only, matched neither).
 
+**Second gap closed — backslash escapes:** upstream (both the CLI and the
+JS trainer) accept `/\d+/`, `/\./`, and similar backslash-escaped patterns
+through their safety gates (they only special-cased `|` and length/wildcard
+counts, never backslash). `regex.sudo` previously treated `\` as an
+ordinary literal character, so `/\d+/` meant "a literal backslash followed
+by one or more 'd' characters" (the `+` was always a real quantifier, just
+applied to a literal `d` instead of a digit class), not "one or more
+digits" — a real behavioral gap against upstream. `regex.sudo` now implements
+backslash escapes: metacharacter escapes (`\.` `\*` `\+` `\?` `\[` `\]`
+`\^` `\$` `\|` `\\` `\/` `\{` `\}` `\(` `\)`) and predefined classes `\d`
+`\D` `\w` `\W` `\s` `\S`. **Caveat, also documented in `regex.sudo`'s own
+header:** the predefined classes are ASCII-only subsets (this engine has
+no Unicode tables, same family as the existing ASCII-only case folding) —
+python's `\d`/`\w` are Unicode-aware and match e.g. the Arabic-indic digit
+`٣` or the letter `É`; this engine's `\d`/`\w` do not. `\b`/`\B` word
+boundaries are recognized but not implemented (a parse error, not a silent
+no-op) — a deliberate, reported scope cut, not a compatibility gap, since
+upstream's own regex engines support `\b` but the kernel's delimited-query
+use case has not needed it yet. Test coverage:
+`"element_matches_pattern backslash escape digits"` — `/\d+/` matches
+`"Area 51"` (contains digits), does not match `"AreaX"` (contains none).
+
 ---
 
 ## Residual JS-side behavior changes (post-kernel integration)
