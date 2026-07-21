@@ -2,11 +2,10 @@ load("@rules_python//python:defs.bzl", "py_library")
 
 py_library(
     name = "infinite_craft_cli",
-    srcs = glob(["*.py"]),
+    srcs = glob(["*.py", "_sudo/**/*.py"]),
     imports = [".."],
     visibility = ["//visibility:public"],
     deps = [
         "@pip//curl_cffi",
-        "@pip//regex",
     ],
 )
