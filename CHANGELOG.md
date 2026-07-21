@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Extension loader hardening (was drafted as 1.3.1)
+
+### Fixed
+- Chrome extension loader failed on neal.fun because inline `script.textContent` injection is blocked by the site's Content Security Policy. Added a tiny extension-origin `page-bridge.js` that loads via `chrome.runtime.getURL` (CSP-exempt) and executes the fetched trainer with `eval` in the page world so IndexedDB access still works.
+
+### Extension fetches hosted trainer (was drafted as 1.3.0)
+
+### Changed
+- Chrome extension is now a thin loader that fetches `trainer.min.js` from GitHub Pages and injects it into the page context, instead of bundling a local copy of `trainer.js`. Trainer updates ship via the hosted bookmarklet without requiring a Chrome Web Store release. Removed `web_accessible_resources` for the bundled trainer; added `host_permissions` for `hacker6284.github.io`. Loader hardening: fetch timeout, bounded retries with backoff, payload validation (size, Content-Type, sentinel), injection error handling, UI init verification, `cache: 'no-store'`. Regenerated `trainer.min.js` from current `trainer.js`; CI test prevents minified artifact drift. Userscript aligned to `trainer.min.js`. Extension manifest version `1.3.0` matches changelog.
+
 ## [1.4.2] - 2026-06-22
 
 ### Fixed

@@ -473,11 +473,6 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 class TestTrainerSourceParity:
-    def test_bookmarklet_extension_trainer_identical(self):
-        bookmarklet = (ROOT / "bookmarklet" / "trainer.js").read_text(encoding="utf-8")
-        extension = (ROOT / "extension" / "trainer.js").read_text(encoding="utf-8")
-        assert bookmarklet == extension
-
     def test_wait_for_input_uses_try_enqueue(self):
         source = (ROOT / "bookmarklet" / "trainer.js").read_text(encoding="utf-8")
         assert "function tryEnqueue(line)" in source
