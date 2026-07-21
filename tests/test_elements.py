@@ -141,23 +141,36 @@ class TestMatchElements:
         assert matches == []
         assert "too long" in err
 
-    def test_unsafe_nested_quantifier_regex(self, mock_storage_with_extras):
-        from infinite_craft_cli.cli import _match_elements, REGEX_ERROR_COMPLEX
+    def test_nested_quantifier_regex_now_matches_literally(self, mock_storage_with_extras):
+        # DIVERGENCES.md ruling 7: kernel drops the "too complex"
+        # nested-quantifier gate entirely, and regex.sudo has no capture
+        # groups (parens are literal characters, not grouping) — "/(a+)+/"
+        # now parses as literal '(' + one-or-more 'a' + one-or-more ')',
+        # which simply doesn't match any fixture name here.
+        from infinite_craft_cli.cli import _match_elements
         matches, err = _match_elements(mock_storage_with_extras, "/(a+)+/")
         assert matches == []
-        assert err == REGEX_ERROR_COMPLEX
+        assert err is None
 
-    def test_unsafe_alternation_quantifier_regex(self, mock_storage_with_extras):
-        from infinite_craft_cli.cli import _match_elements, REGEX_ERROR_COMPLEX
+    def test_alternation_quantifier_regex_now_matches_literally(self, mock_storage_with_extras):
+        # DIVERGENCES.md ruling 7: "|" is now real top-level alternation
+        # and there is no "too complex" gate. "/(a|aa)+/" has one
+        # top-level "|", splitting into two literal branches "(a" and
+        # "aa)+" (parens are literal, not grouping) — neither matches any
+        # fixture name here.
+        from infinite_craft_cli.cli import _match_elements
         matches, err = _match_elements(mock_storage_with_extras, "/(a|aa)+/")
         assert matches == []
-        assert err == REGEX_ERROR_COMPLEX
+        assert err is None
 
-    def test_nested_paren_alternation_regex_rejected(self, mock_storage_with_extras):
-        from infinite_craft_cli.cli import _match_elements, REGEX_ERROR_COMPLEX
+    def test_nested_paren_alternation_regex_now_matches_literally(self, mock_storage_with_extras):
+        # DIVERGENCES.md ruling 7: same as above — "/(a|(?:aa))+b/" splits
+        # on its one top-level "|" into literal branches "(a" and
+        # "(?:aa))+b"; neither matches any fixture name here.
+        from infinite_craft_cli.cli import _match_elements
         matches, err = _match_elements(mock_storage_with_extras, "/(a|(?:aa))+b/")
         assert matches == []
-        assert err == REGEX_ERROR_COMPLEX
+        assert err is None
 
     def test_no_matches(self, mock_storage_with_extras):
         from infinite_craft_cli.cli import _match_elements
@@ -283,10 +296,14 @@ class TestDoSearch:
         assert "Invalid regex pattern" in result
         assert "No matches found" not in result
 
-    def test_complex_regex_message(self, mock_storage):
-        from infinite_craft_cli.cli import do_search, REGEX_ERROR_COMPLEX
+    def test_complex_regex_now_no_match_message(self, mock_storage):
+        # DIVERGENCES.md ruling 7: no "too complex" gate; "/(a|aa)+/"
+        # parses to two literal branches ("(a" / "aa)+") that match
+        # nothing among the base elements, so this is now a plain
+        # no-match, not an error.
+        from infinite_craft_cli.cli import do_search
         result = do_search(mock_storage, "/(a|aa)+/")
-        assert REGEX_ERROR_COMPLEX in result
+        assert "No matches found." in result
         assert "Invalid regex pattern" not in result
 
     def test_single_match(self, mock_storage):

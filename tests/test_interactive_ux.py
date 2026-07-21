@@ -5040,10 +5040,17 @@ class TestREPLHarnessEdges:
         # (no counts, no internals)
 
     def test_tty_bare_metachars_and_regex_errors_via_tty(self, repl_harness, capsys):
-        """Bare [ ] * ? / ( ) | . ^ $ O + /complex/ (with |) via *pure* tty_bytes.
+        """Bare [ ] * ? / ( ) | . ^ $ O + /invalid/ regex via *pure* tty_bytes.
 
         Hits real _tty_read_line (bare [O + error). All via tty_bytes;
         Event coord. Proves per-char + regex safety.
+
+        DIVERGENCES.md ruling 7: the kernel has no "too complex" gate and
+        performs real top-level `|` alternation, so `/a|b/` (formerly
+        rejected as "too complex") now matches successfully instead of
+        erroring. Drive an actually-invalid pattern instead (`/[abc/`, an
+        unclosed character class) so the regex-error path this test proves
+        still triggers.
         """
         # per-phrase Events for stricter proof (bare [O vs regex error)
         bracket_ready = asyncio.Event()
@@ -5073,10 +5080,12 @@ class TestREPLHarnessEdges:
 
         async def drive():
             repl_harness.enable_tty_mode()
-            # pure tty_bytes: bare [ ] O * ? / ( ) | . ^ $ + /a|b/ + /quit
-            # (hits [O path + regex err)
+            # pure tty_bytes: bare [ ] O * ? / ( ) | . ^ $ + /[abc/ + /quit
+            # (hits [O path + regex err; DIVERGENCES.md ruling 7 — /a|b/ no
+            # longer errors under the kernel, so drive an unclosed
+            # character class instead to still exercise the error path)
             repl_harness.feed_tty_bytes(  # noqa: E501
-                b"[\nO\n]\n*\n?\n/\n(\n)\n|\n.\n^\n$\n/search /a|b/\n/quit\n"
+                b"[\nO\n]\n*\n?\n/\n(\n)\n|\n.\n^\n$\n/search /[abc/\n/quit\n"
             )
             t = asyncio.create_task(repl_harness.run_until_quit(auto_feed_quit=False))
             await bracket_ready.wait()

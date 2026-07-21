@@ -319,14 +319,19 @@ class TestDoCross:
         captured = capsys.readouterr()
         assert "Invalid regex pattern" in captured.out
 
-    def test_complex_regex(self, capsys):
-        from infinite_craft_cli.cli import do_cross, REGEX_ERROR_COMPLEX
+    def test_complex_regex_now_no_match(self, capsys):
+        # DIVERGENCES.md ruling 7: no "too complex" gate; "/(a|aa)+/"
+        # parses fine (parens are literal, "|" splits into literal
+        # branches "(a" / "aa)+") and matches nothing among the default
+        # base elements, so the left query now simply has no matches
+        # instead of erroring.
+        from infinite_craft_cli.cli import do_cross
 
         client = make_mock_client()
         storage = make_mock_storage()
         run_async(do_cross(client, storage, "/(a|aa)+/", "water"))
         captured = capsys.readouterr()
-        assert REGEX_ERROR_COMPLEX in captured.out
+        assert "No elements match: /(a|aa)+/" in captured.out
 
     def test_left_no_matches(self, capsys):
         from infinite_craft_cli.cli import do_cross

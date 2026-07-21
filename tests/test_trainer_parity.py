@@ -11,9 +11,7 @@ from pathlib import Path
 import pytest
 
 from infinite_craft_cli.cli import (
-    MATCH_SCAN_BUDGET,
     MAX_QUERY_LENGTH,
-    REGEX_ERROR_COMPLEX,
     _classify_command_line,
     _element_matches_pattern,
     _is_local_command,
@@ -41,6 +39,14 @@ from tests.help_utils import (
 
 RE_NESTED_QUANTIFIER = re.compile(r"(\+|\*|\?|\{\d*,?\d*\})\s*(\+|\*|\?|\{)")
 MAX_REGEX_BODY_LENGTH = 200
+# DIVERGENCES.md ruling 7: cli.py no longer defines these — the kernel has
+# no scan-time budget / regex timeout and no "too complex" error at all
+# (real top-level `|` alternation just executes now; the only regex error
+# is "Invalid regex pattern"). These two constants now describe ONLY
+# match_elements_js_mirror() below, which still documents trainer.js's
+# current (not-yet-kernel-wired) scan-budget/complexity behavior.
+MATCH_SCAN_BUDGET = 0.5
+REGEX_ERROR_COMPLEX = "Regex pattern too complex"
 
 
 def fnmatch_is_safe(pattern: str) -> bool:

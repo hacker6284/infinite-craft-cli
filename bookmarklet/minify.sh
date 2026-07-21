@@ -11,3 +11,5 @@ npx --yes "esbuild@${ESBUILD_VERSION}" trainer.src.mjs --bundle --format=iife --
 echo "Wrote trainer.js ($(wc -c < trainer.js) bytes) with esbuild@${ESBUILD_VERSION}"
 npx --yes "terser@${TERSER_VERSION}" trainer.js -c -m -o trainer.min.js
 echo "Wrote trainer.min.js ($(wc -c < trainer.min.js) bytes) with terser@${TERSER_VERSION}"
+cp trainer.js ../extension/trainer.js
+echo "Synced extension/trainer.js (parity-enforced identical copy)"

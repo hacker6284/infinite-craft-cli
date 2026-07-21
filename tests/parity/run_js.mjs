@@ -16,6 +16,12 @@ import {
   _resetStateForParity,
   _getRecipeIndexForParity,
 } from "../../bookmarklet/trainer.src.mjs";
+// Pure command helpers: the trainer imports these from the kernel unchanged,
+// so driving the kernel adapter directly exercises the same code path.
+import {
+  classify_command_line,
+  validate_command_line,
+} from "../../bookmarklet/_sudo/craft.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIXTURES_PATH = join(__dirname, "fixtures.json");
@@ -86,7 +92,7 @@ function runScenario(scenario, fixtures) {
   _resetStateForParity(elements, recipes);
 
   if (op === "match") {
-    const matches = matchElements(scenario.query);
+    const { matches } = matchElements(scenario.query);
     return matches.map((e) => [e.text, e.emoji || "", !!e.discovered]);
   }
 
@@ -109,6 +115,16 @@ function runScenario(scenario, fixtures) {
     return included
       .map(([n, em, f]) => [n, em || "", !!f])
       .sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
+  }
+
+  if (op === "classify") {
+    const r = classify_command_line(scenario.line);
+    return r === null || r === undefined ? null : Array.from(r);
+  }
+
+  if (op === "validate") {
+    const r = validate_command_line(scenario.line);
+    return r === undefined ? null : r;
   }
 
   throw new Error(`unknown op: ${op}`);

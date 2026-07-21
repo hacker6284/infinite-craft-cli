@@ -77,6 +77,15 @@
         ["Mystery Gas", "", false],
         ["Dust", "", false]
       ],
-      "recipes": {"Steam": [["Mystery Gas", "Water"]], "Cloud": [["Steam", "Wind"]]} }
+      "recipes": {"Steam": [["Mystery Gas", "Water"]], "Cloud": [["Steam", "Wind"]]} },
+    { "id": "match-alternation-pipe", "op": "match", "elements_set": "basic", "query": "/mud|dust/" },
+    { "id": "match-escape-digit-class", "op": "match", "elements_set": "basic", "query": "/\\d+/" },
+    { "id": "match-exclude-filter", "op": "match", "elements_set": "basic", "query": "!fire*" },
+    { "id": "match-exclude-bare", "op": "match", "elements_set": "basic", "query": "!" },
+    { "id": "classify-combine-shorthand-plus", "op": "classify", "line": "Water + Fire" },
+    { "id": "classify-slash-combine-operator", "op": "classify", "line": "/combine Water + Fire" },
+    { "id": "validate-slash-combine-operator-error", "op": "validate", "line": "/combine Water + Fire" },
+    { "id": "validate-plus-shorthand-ok", "op": "validate", "line": "Water + Fire" },
+    { "id": "validate-unknown-command", "op": "validate", "line": "/notacommand" }
   ]
 }

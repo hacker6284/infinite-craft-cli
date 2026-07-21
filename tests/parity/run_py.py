@@ -79,7 +79,7 @@ def _run_scenario(scenario: dict, fixtures: dict, scratch_root: str):
         storage = DiscoveryStorage(discoveries_path)
 
         if op == "match":
-            elems = _match_elements(storage, scenario["query"])
+            elems, _err = _match_elements(storage, scenario["query"])
             return [
                 [e.name, e.emoji or "", bool(e.is_first_discovery)] for e in elems
             ]
@@ -110,6 +110,13 @@ def _run_scenario(scenario: dict, fixtures: dict, scratch_root: str):
                 ([n, em, bool(f)] for n, em, f in included),
                 key=lambda t: t[0],
             )
+
+        if op == "classify":
+            result = cli._classify_command_line(scenario["line"])
+            return list(result) if result is not None else None
+
+        if op == "validate":
+            return cli._validate_command_line(scenario["line"])
 
         raise ValueError(f"unknown op: {op!r}")
     finally:

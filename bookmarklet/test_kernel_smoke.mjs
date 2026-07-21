@@ -1,14 +1,13 @@
 import assert from "node:assert/strict";
 import {
-  glob_match,
-  glob_match_js,
+  element_matches_pattern,
   match_elements_boundary,
-  match_elements_js_boundary,
   trace_recipe_boundary,
-  trace_recipe_js_boundary,
   export_elements_boundary,
-  export_elements_js_boundary,
+  get_by_name_boundary,
+  resolve_element_boundary,
 } from "./_sudo/craft.mjs";
+import { glob_match } from "./_sudo/regex.mjs";
 
 let passed = 0;
 let failed = 0;
@@ -25,33 +24,69 @@ function check(name, fn) {
   }
 }
 
-check("Glob character classes work", () => {
-  assert.equal(glob_match("a[bc]d", "abd"), true);
-  assert.equal(glob_match("a[bc]d", "acd"), true);
-  assert.equal(glob_match("a[bc]d", "aed"), false);
-  // Old JS: brackets fall through to literal chars
-  assert.equal(glob_match_js("a[bc]d", "abd"), false);
-  assert.equal(glob_match_js("a[bc]d", "a[bc]d"), true);
+check("Real alternation", () => {
+  let [matched, error] = element_matches_pattern("Watchdog", "/cat|dog/");
+  assert.equal(error, null);
+  assert.equal(matched, true);
+
+  [matched, error] = element_matches_pattern("Elephant", "/cat|dog/");
+  assert.equal(error, null);
+  assert.equal(matched, false);
 });
 
-check("^ filtering applies through the shared matcher", () => {
+check("Backslash escape \\d", () => {
+  let [matched, error] = element_matches_pattern("Area 51", "/\\d+/");
+  assert.equal(error, null);
+  assert.equal(matched, true);
+
+  [matched, error] = element_matches_pattern("AreaX", "/\\d+/");
+  assert.equal(error, null);
+  assert.equal(matched, false);
+});
+
+check("Glob character classes", () => {
+  assert.equal(glob_match("a[bc]d", "abd", true), true);
+  assert.equal(glob_match("a[bc]d", "acd", true), true);
+  assert.equal(glob_match("a[bc]d", "aed", true), false);
+});
+
+check("! exclude filter", () => {
+  const elements = [
+    ["Water", "💧", false],
+    ["Fire", "🔥", false],
+    ["Wind", "🌬️", false],
+    ["Earth", "🌍", false],
+    ["Firewall", "🧱", true],
+  ];
+  const [matches, error] = match_elements_boundary(elements, "!fire*");
+  assert.equal(error, null);
+  const names = matches.map((t) => t[0]);
+  assert.ok(names.includes("Water"));
+  assert.ok(names.includes("Wind"));
+  assert.ok(names.includes("Earth"));
+  assert.ok(!names.includes("Fire"));
+  assert.ok(!names.includes("Firewall"));
+});
+
+check("^ first-discovery filter through shared matcher", () => {
   const elements = [
     ["Water", "", false],
     ["Fire", "", true],
     ["Steam", "", true],
   ];
-  const allFirst = match_elements_boundary(elements, "^");
+  const [allFirst, err1] = match_elements_boundary(elements, "^");
+  assert.equal(err1, null);
   assert.deepEqual(allFirst, [
     ["Fire", "", true],
     ["Steam", "", true],
   ]);
-  const steamOnly = match_elements_boundary(elements, "^ea");
+
+  const [steamOnly, err2] = match_elements_boundary(elements, "^ea");
+  assert.equal(err2, null);
   assert.deepEqual(steamOnly, [["Steam", "", true]]);
-  // Old JS treats ^ as a literal outside doSearch
-  assert.deepEqual(match_elements_js_boundary(elements, "^ea"), []);
 });
 
-check("Recipe lineage deeper than 200 layers traces successfully", () => {
+check(">200-layer trace succeeds (unbounded BFS)", () => {
   const recipes = {};
   recipes["C0"] = [["Fire", "Water"]];
   for (let i = 1; i <= 250; i++) {
@@ -68,12 +103,9 @@ check("Recipe lineage deeper than 200 layers traces successfully", () => {
   const [status, , steps] = trace_recipe_boundary(elements, recipes, "C250");
   assert.equal(status, 4);
   assert.equal(steps.length, 251);
-
-  const [jsStatus] = trace_recipe_js_boundary(elements, recipes, "C250");
-  assert.equal(jsStatus, 3); // Unreachable — old 200-layer cap
 });
 
-check("Export closure excludes an orphan", () => {
+check("Export closure excludes a pure orphan", () => {
   const elements = [
     ["Water", "", false],
     ["Steam", "", false],
@@ -88,9 +120,24 @@ check("Export closure excludes an orphan", () => {
   assert.ok(names.includes("Steam"));
   assert.ok(names.includes("Mystery Gas"));
   assert.ok(!names.includes("Orphan"));
+});
 
-  const jsExported = export_elements_js_boundary(elements);
-  assert.equal(jsExported.length, 4);
+check("Exact-case lookup with title-case fallback", () => {
+  const elements = [["Fire", "🔥", false]];
+
+  assert.equal(get_by_name_boundary(elements, "fire"), null);
+  assert.deepEqual(get_by_name_boundary(elements, "Fire"), ["Fire", "🔥", false]);
+
+  assert.deepEqual(resolve_element_boundary(elements, "fire"), [
+    "Fire",
+    "🔥",
+    false,
+  ]);
+  assert.deepEqual(resolve_element_boundary(elements, "unicorn dust"), [
+    "Unicorn Dust",
+    "",
+    false,
+  ]);
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);
