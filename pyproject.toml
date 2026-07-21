@@ -18,7 +18,6 @@ classifiers = [
 ]
 dependencies = [
     "curl-cffi>=0.15",
-    "regex>=2024.0.0",
 ]
 
 [project.urls]
@@ -30,6 +29,16 @@ source = "vcs"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/infinite_craft_cli"]
+
+# The generated kernel is gitignored; hatchling's VCS-based file selection
+# skips it, so it is force-included at BOTH stages (build tools build the
+# wheel from the sdist, so the sdist must carry it too). Without this the
+# wheel ships without infinite_craft_cli._sudo and the CLI dies on import.
+[tool.hatch.build.targets.sdist.force-include]
+"src/infinite_craft_cli/_sudo" = "src/infinite_craft_cli/_sudo"
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/infinite_craft_cli/_sudo" = "infinite_craft_cli/_sudo"
 
 [project.scripts]
 infinite-craft = "infinite_craft_cli.cli:main"

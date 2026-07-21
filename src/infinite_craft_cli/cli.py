@@ -5,7 +5,6 @@ import asyncio
 import argparse
 import builtins
 import contextlib
-import fnmatch
 import gzip
 import re
 import json
@@ -18,7 +17,6 @@ import tempfile
 import unicodedata
 import threading
 import time
-import regex as _regex_module
 from collections.abc import Callable
 
 try:
@@ -44,6 +42,7 @@ from infinite_craft_cli.storage import DiscoveryStorage
 from infinite_craft_cli import __version__
 
 from infinite_craft_cli.data import DISCOVERIES_PATH, RECIPES_PATH, EXPORT_PATH
+from infinite_craft_cli._sudo import craft
 
 # ---------------------------------------------------------------------------
 # ANSI colors
@@ -60,19 +59,11 @@ RED = "\033[31m"
 API_RATE_LIMIT = 60  # requests per minute — conservative to avoid Cloudflare blocks
 API_CONCURRENCY = 2  # parallel workers for bulk operations
 MAX_QUERY_LENGTH = 512
-MAX_REGEX_BODY_LENGTH = 200
 _MAX_IC_COMPRESSED_BYTES = 32 * 1024 * 1024
 _MAX_IC_DECOMPRESSED_BYTES = 64 * 1024 * 1024
 _MAX_IC_ITEMS = 50_000
 _RATE_LIMIT_SLEEP_STEP = 0.05
-REGEX_TIMEOUT = 0.02
-MATCH_SCAN_BUDGET = 0.5
-REGEX_ERROR_INVALID = "Invalid regex pattern"
-REGEX_ERROR_COMPLEX = "Regex pattern too complex"
 _QUERY_HELP = "Search query (wildcards, /regex/, ! exclude, ^ first discoveries)"
-
-_RE_NESTED_QUANTIFIER = re.compile(r"(\+|\*|\?|\{\d*,?\d*\})\s*(\+|\*|\?|\{)")
-_RE_DELIMITED_REGEX = re.compile(r"/[^/]+/")
 
 # Session-only history
 _history: list[tuple[str, str, str]] = []
@@ -276,15 +267,10 @@ def _record_recipes_batch(entries: list[tuple[str, str, str]]):
     if not entries:
         return
     recipes = _load_recipes()
-    changed = False
-    for result_name, a_name, b_name in entries:
-        pair = sorted([a_name, b_name])
-        if result_name not in recipes:
-            recipes[result_name] = []
-        if pair not in recipes[result_name]:
-            recipes[result_name].append(pair)
-            changed = True
-    if changed:
+    total_before = sum(len(v) for v in recipes.values())
+    craft.record_recipes_batch(recipes, entries)
+    total_after = sum(len(v) for v in recipes.values())
+    if total_after != total_before:
         _save_recipes(recipes)
 
 
@@ -343,18 +329,24 @@ def format_result(first_name: str, second_name: str, result) -> str:
 # ---------------------------------------------------------------------------
 # Core operations
 # ---------------------------------------------------------------------------
+def _elements_to_boundary(elements) -> list[tuple[str, str, bool]]:
+    """Convert Element/MockElement objects to the (name, emoji, first)
+    3-tuples the generated kernel adapter expects at the host boundary.
+    emoji/first are coerced from None to "" / False (the kernel has no
+    nullable fields); this never changes display behavior since both call
+    sites treat None and ""/False as equivalently falsy."""
+    return [(e.name, e.emoji or "", bool(e.is_first_discovery)) for e in elements]
+
+
 def _resolve_element(storage, name: str):
     """Look up an element by name in discoveries; fall back to bare Element."""
-    found = storage.get_by_name(name)
+    resolved_name, _emoji, _first = craft.resolve_element_boundary(
+        _elements_to_boundary(storage.get_all()), name
+    )
+    found = storage.get_by_name(resolved_name)
     if found is not None:
         return found
-    # Also try title-cased version
-    title = name.strip().title()
-    if title != name:
-        found = storage.get_by_name(title)
-        if found is not None:
-            return found
-    return Element(name=name.strip().title())
+    return Element(name=resolved_name)
 
 
 # Runtime cache for pair results — avoids re-hitting the API for the same combo
@@ -369,7 +361,7 @@ def _raise_if_cancelled() -> None:
 async def _cached_pair(client, storage, a, b):
     """Wrapper around client.pair that caches results by sorted element names."""
     _raise_if_cancelled()
-    key = tuple(sorted([a.name, b.name]))
+    key = craft.pair_key(a.name, b.name)
     if key in _pair_cache:
         return _pair_cache[key]
     for attempt in range(3):
@@ -425,12 +417,7 @@ async def do_combine(client, storage, first_name: str, second_name: str) -> str:
 
 def _slash_args(line: str, command: str) -> str | None:
     """Return arguments after a slash command, or None if the line is not that command."""
-    if line == command:
-        return ""
-    prefix = command + " "
-    if line.startswith(prefix):
-        return line[len(prefix) :]
-    return None
+    return craft.slash_args(line, command)
 
 
 def _parse_query_filter(query: str) -> tuple[str, bool, bool]:
@@ -439,107 +426,28 @@ def _parse_query_filter(query: str) -> tuple[str, bool, bool]:
     Prefix ``!`` excludes matching elements (negation).
     Prefix ``^`` limits results to first discoveries among pattern matches.
     """
-    q = query.strip()
-    exclude = False
-    only_new = False
-    if q.startswith("!"):
-        exclude = True
-        q = q[1:]
-    elif q.startswith("^"):
-        only_new = True
-        q = q[1:]
-    return q, exclude, only_new
+    return craft.parse_query_filter(query)
 
 
 def _is_delimited_regex(pattern: str) -> bool:
-    pattern = pattern.strip()
-    return len(pattern) >= 2 and pattern.startswith("/") and pattern.endswith("/")
-
-
-def _contains_delimited_regex(text: str) -> bool:
-    return _RE_DELIMITED_REGEX.search(text) is not None
-
-
-def _regex_is_safe(regex_body: str) -> bool:
-    if not regex_body or len(regex_body) > MAX_REGEX_BODY_LENGTH:
-        return False
-    # Alternation is not supported — nested groups bypass simpler safety checks.
-    if "|" in regex_body:
-        return False
-    if _RE_NESTED_QUANTIFIER.search(regex_body):
-        return False
-    # Reject grouped quantifiers followed by quantifiers, e.g. (a+)+ or (a*)*
-    if re.search(r"\([^)]*[+*?][^)]*\)[+*?{]", regex_body):
-        return False
-    return True
-
-
-def _regex_search(pattern: str, name: str) -> tuple[bool | None, str | None]:
-    """Search with regex. Returns (matched, error_message)."""
-    if not _regex_is_safe(pattern):
-        return None, REGEX_ERROR_COMPLEX
-    try:
-        found = _regex_module.search(
-            pattern, name, _regex_module.IGNORECASE, timeout=REGEX_TIMEOUT
-        )
-        return (found is not None), None
-    except TimeoutError:
-        return None, REGEX_ERROR_COMPLEX
-    except _regex_module.error:
-        return None, REGEX_ERROR_INVALID
+    return craft.is_delimited_regex(pattern)
 
 
 def _element_matches_pattern(name: str, pattern: str) -> tuple[bool, str | None]:
     """Match an element name against a query pattern."""
-    pattern = pattern.strip()
-    if not pattern:
-        return False, None
-    if _is_delimited_regex(pattern):
-        regex_body = pattern[1:-1]
-        if not regex_body:
-            return False, None
-        matched, err = _regex_search(regex_body, name)
-        if err:
-            return False, err
-        return matched, None
-    name_lower = name.lower()
-    pattern_lower = pattern.lower()
-    if any(c in pattern_lower for c in "*?[]"):
-        return fnmatch.fnmatch(name_lower, pattern_lower), None
-    return pattern_lower in name_lower, None
+    return craft.element_matches_pattern(name, pattern)
 
 
 def _match_elements(storage, query: str) -> tuple[list[Element], str | None]:
     """Return (matches, error_message) for discovered elements matching a query."""
-    if len(query) > MAX_QUERY_LENGTH:
-        return [], f"Query too long (max {MAX_QUERY_LENGTH} characters)"
     discoveries = storage.get_all()
-    q, exclude, only_new = _parse_query_filter(query)
-    if not q.strip():
-        if exclude:
-            return list(discoveries), None
-        if only_new:
-            return [e for e in discoveries if e.is_first_discovery], None
-        return [], None
-    matches: list[Element] = []
-    match_error: str | None = None
-    deadline = time.monotonic() + MATCH_SCAN_BUDGET
-    for e in discoveries:
-        if time.monotonic() > deadline:
-            return [], REGEX_ERROR_COMPLEX
-        matched, err = _element_matches_pattern(e.name, q)
-        if err:
-            match_error = err
-            break
-        if exclude:
-            if not matched:
-                matches.append(e)
-        elif matched:
-            matches.append(e)
-    if match_error:
-        return [], match_error
-    if only_new:
-        matches = [e for e in matches if e.is_first_discovery]
+    match_tuples, err = craft.match_elements_boundary(
+        _elements_to_boundary(discoveries), query
+    )
+    if err:
+        return [], err
+    by_name = {e.name: e for e in discoveries}
+    matches = [by_name[n] for (n, _emoji, _first) in match_tuples]
     return matches, None
 
 
@@ -552,95 +460,30 @@ def do_search(storage, query: str) -> str:
     return "\n".join(f"  {format_element(e)}" for e in matches)
 
 
+def _trace_recipe(storage, name: str) -> tuple[int, str, list[tuple[str, str, str]]]:
+    """Pure trace-recipe core: kernel BFS result as (status, target, steps).
+    status: 0=NotFound 1=IsBase 2=NoRecipe 3=Unreachable 4=Steps (see
+    craft.sudo RecipeResult / recipe_result_to_tuple). Also used directly by
+    tests/parity/run_py.py's host-parity harness — keep this exact name and
+    signature."""
+    recipes = _load_recipes()
+    elements = _elements_to_boundary(storage.get_all())
+    return craft.trace_recipe_boundary(elements, recipes, name)
+
+
 def do_recipe(storage, name: str) -> str:
     """Show shortest recipe tree for an element via BFS on local recipes."""
-    recipes = _load_recipes()
-    target = name.strip()
-
-    # Find exact match in discoveries
-    elem = storage.get_by_name(target)
-    if elem is None:
-        elem = storage.get_by_name(target.title())
-    if elem is None:
-        return f"  {format_element(Element(name=target))} not found in discoveries."
-    target = elem.name
-
-    if target in _BASE_ELEMENTS:
+    status, target, steps = _trace_recipe(storage, name)
+    if status == 0:  # NotFound
+        return f"  {format_element(Element(name=name.strip()))} not found in discoveries."
+    if status == 1:  # IsBase
         return f"  {format_element(Element(name=target))} is a base element."
-
-    if target not in recipes or not recipes.get(target):
+    if status == 2:  # NoRecipe
         return f"  No recipe known for {format_element(Element(name=target))}. Try /fill or /import."
-
-    # BFS to find all elements needed, tracking shortest path
-    # parent[name] = (a_name, b_name) that produces it
-    # Terminals (elements with no recipe entry or empty recipe list,
-    # introduced by /fill or /import) are treated as additional roots so
-    # that lineages with unmakeable constituents can still be traced.
-    parent = {}
-    visited = set(_BASE_ELEMENTS)
-    found = False
-
-    def _is_available(n: str) -> bool:
-        # A name is available (usable as input without further crafting in
-        # this layer) if already visited, a base, or has no (truthy) recipe
-        # entry. The latter treats both absent keys and empty lists as
-        # terminals (constituents that cannot be made via known recipes).
-        return n in visited or n in _BASE_ELEMENTS or not recipes.get(n)
-
-    while not found:
-        # Find everything we can make using previously visited elements
-        # OR terminal constituents (no recipe of their own).
-        new_this_layer = {}
-        for result_name, pairs in recipes.items():
-            if result_name in visited or result_name in new_this_layer:
-                continue
-            for pair in pairs:
-                a_ok = _is_available(pair[0])
-                b_ok = _is_available(pair[1])
-                if a_ok and b_ok:
-                    new_this_layer[result_name] = (pair[0], pair[1])
-                    if result_name == target:
-                        found = True
-                    break
-        if not new_this_layer:
-            break
-        # Commit entire layer at once
-        for name, recipe in new_this_layer.items():
-            parent[name] = recipe
-            visited.add(name)
-
-    if not found:
+    if status == 3:  # Unreachable
         return f"  Cannot trace full lineage for {format_element(Element(name=target))} — missing intermediate recipes."
 
-    # Walk back from target to collect steps in order.
-    # Terminals (no parent entry) are treated as resolved leaves with no step.
-    steps = []
-    to_resolve = [target]
-    resolved = set(_BASE_ELEMENTS)
-    while to_resolve:
-        name = to_resolve.pop()
-        if name in resolved:
-            continue
-        if name not in parent:
-            # Terminal leaf (constituent from /fill or /import with no recipe;
-            # bases are pre-seeded in resolved/visited and never appear in parent).
-            resolved.add(name)
-            continue
-        a, b = parent[name]
-        # Ensure dependencies are resolved first
-        for dep in (a, b):
-            if dep in resolved:
-                continue
-            if dep not in parent and dep not in _BASE_ELEMENTS:
-                resolved.add(dep)  # terminal leaf — no step emitted
-                continue
-            to_resolve.append(name)  # re-queue
-            to_resolve.append(dep)
-            break
-        else:
-            steps.append((a, b, name))
-            resolved.add(name)
-
+    # status == 4: Steps
     t_elem = storage.get_by_name(target)
     t_str = (
         format_element(t_elem)
@@ -712,7 +555,7 @@ async def do_crawl(client, storage, first_name: str, second_name: str):
         new_pairs = []
         for i in range(len(names)):
             for j in range(i, len(names)):
-                key = tuple(sorted([names[i], names[j]]))
+                key = craft.pair_key(names[i], names[j])
                 if key not in tried:
                     new_pairs.append((pool[names[i]], pool[names[j]]))
                     tried.add(key)
@@ -732,7 +575,7 @@ async def do_crawl(client, storage, first_name: str, second_name: str):
         # Check pair cache for new elements produced this generation
         new_elements = []
         for a, b in new_pairs:
-            key = tuple(sorted([a.name, b.name]))
+            key = craft.pair_key(a.name, b.name)
             result = _pair_cache.get(key)
             if result and result.name and result.name not in pool:
                 pool[result.name] = result
@@ -766,16 +609,13 @@ async def do_exhaust(client, storage, query: str):
         return
 
     all_elements = list(storage.get_all())
-    seen: set[tuple[str, str]] = set()
-    pairs: list[tuple] = []
-    for target in matches:
-        for other in all_elements:
-            if other.name == target.name:
-                continue
-            key = tuple(sorted([target.name, other.name]))
-            if key not in seen:
-                seen.add(key)
-                pairs.append((target, other))
+    pair_tuples = craft.exhaust_pairs_boundary(
+        _elements_to_boundary(matches), _elements_to_boundary(all_elements)
+    )
+    by_name = {e.name: e for e in all_elements}
+    pairs: list[tuple] = [
+        (by_name[an], by_name[bn]) for an, _ae, _af, bn, _be, _bf in pair_tuples
+    ]
     if not pairs:
         _repl_print_lines(f"  No valid pairs for query: {query}")
         return
@@ -813,23 +653,17 @@ async def do_with(client, storage, element_name: str, query: str):
 
 def _slash_combine_crawl_pipe_error(rest: str) -> str | None:
     """Reject slash combine/crawl payloads that use spaced ``+ |`` instead of ``+|``."""
-    if re.search(r"\+\s+\|", rest):
-        return (
-            "  Use <element> +| <query> "
-            f"(no space between + and |). Type {_color('/help', YELLOW)} for commands."
-        )
-    parsed = _parse_two_elements(rest)
-    if parsed and parsed[1].startswith("|"):
-        return (
-            "  Use <element> +| <query> "
-            f"(no space between + and |). Type {_color('/help', YELLOW)} for commands."
-        )
-    return None
+    if craft.slash_combine_crawl_pipe_error(rest) is None:
+        return None
+    return (
+        "  Use <element> +| <query> "
+        f"(no space between + and |). Type {_color('/help', YELLOW)} for commands."
+    )
 
 
 def _slash_combine_crawl_operator_error(rest: str, kind: str) -> str | None:
     """Reject slash combine/crawl payloads that still use `` + `` operator syntax."""
-    if " + " not in rest:
+    if craft.slash_combine_crawl_operator_error(rest, kind) is None:
         return None
     parts = rest.split(" + ", 1)
     positional = f"/{kind} {parts[0].strip()} {parts[1].strip()}"
@@ -842,7 +676,7 @@ def _slash_combine_crawl_operator_error(rest: str, kind: str) -> str | None:
 
 def _slash_cross_operator_error(rest: str) -> str | None:
     """Reject slash cross payloads that still use `` * `` operator syntax."""
-    if " * " not in rest:
+    if craft.slash_cross_operator_error(rest) is None:
         return None
     parts = rest.split(" * ", 1)
     positional = f"/cross {parts[0].strip()} {parts[1].strip()}"
@@ -855,73 +689,22 @@ def _slash_cross_operator_error(rest: str) -> str | None:
 
 def _split_two_positional_args(rest: str) -> tuple[str, str] | None:
     """Split into two positional args, respecting ``/regex/`` tokens."""
-    rest = rest.strip()
-    if not rest:
-        return None
-    tokens: list[str] = []
-    i = 0
-    n = len(rest)
-    while i < n and len(tokens) < 2:
-        while i < n and rest[i].isspace():
-            i += 1
-        if i >= n:
-            break
-        if rest[i] == "/":
-            j = rest.find("/", i + 1)
-            if j < 0:
-                j = i
-                while j < n and not rest[j].isspace():
-                    j += 1
-                token = rest[i:j]
-                i = j
-            else:
-                token = rest[i : j + 1]
-                i = j + 1
-        else:
-            j = i
-            while j < n and not rest[j].isspace():
-                j += 1
-            token = rest[i:j]
-            i = j
-        token = token.strip()
-        if token:
-            tokens.append(token)
-    if len(tokens) != 2:
-        return None
-    while i < n and rest[i].isspace():
-        i += 1
-    if i < n:
-        return None
-    return tokens[0], tokens[1]
+    return craft.split_two_positional_args(rest)
 
 
 def _parse_two_elements(rest: str) -> tuple[str, str] | None:
     """Parse two element names from positional slash combine/crawl args."""
-    rest = rest.strip()
-    parts = rest.split(None, 1)
-    if len(parts) != 2:
-        return None
-    first, second = parts[0].strip(), parts[1].strip()
-    if not first or not second:
-        return None
-    return first, second
+    return craft.parse_two_elements(rest)
 
 
 def _parse_with_args(rest: str) -> tuple[str, str] | None:
     """Parse ``<element> <query>`` for /with."""
-    rest = rest.strip()
-    parts = rest.split(None, 1)
-    if len(parts) != 2:
-        return None
-    element, query = parts[0].strip(), parts[1].strip()
-    if not element or not query:
-        return None
-    return element, query
+    return craft.parse_with_args(rest)
 
 
 def _parse_cross_queries(rest: str) -> tuple[str, str] | None:
     """Parse two positional queries for slash /cross (supports ``/regex/`` tokens)."""
-    return _split_two_positional_args(rest)
+    return craft.parse_cross_queries(rest)
 
 
 _BULK_WARN_THRESHOLD = 200
@@ -2226,7 +2009,7 @@ async def do_cross(client, storage, left_query: str, right_query: str):
         for b in right:
             if a.name == b.name:
                 continue
-            key = tuple(sorted([a.name, b.name]))
+            key = craft.pair_key(a.name, b.name)
             if key not in seen:
                 seen.add(key)
                 pairs.append((a, b))
@@ -2521,24 +2304,7 @@ def _included_element_names(
     """Names in the export/prune closure: bases, recipe results, and their constituents."""
     if recipes is None:
         recipes = _load_recipes()
-    included = set(_BASE_ELEMENTS)
-    for name, pairs in recipes.items():
-        if pairs:
-            included.add(name)
-    changed = True
-    while changed:
-        changed = False
-        for name in list(included):
-            if name not in recipes:
-                continue
-            for a, b in recipes[name]:
-                if a not in included:
-                    included.add(a)
-                    changed = True
-                if b not in included:
-                    included.add(b)
-                    changed = True
-    return included
+    return set(craft.included_element_names_boundary(recipes))
 
 
 def _orphan_candidates(storage) -> list:
@@ -2631,6 +2397,17 @@ def _prune_orphans(storage):
     _run_sync(_prune_orphans_async(storage))
 
 
+def _export_included(storage) -> list[tuple[str, str, bool]]:
+    """Pure export-selection core: kernel's export/prune closure applied to
+    this storage's current discoveries, as (name, emoji, first) triples in
+    input (discoveries) order. Also used directly by
+    tests/parity/run_py.py's host-parity harness — keep this exact name and
+    signature."""
+    recipes = _load_recipes()
+    elements = _elements_to_boundary(storage.get_all())
+    return craft.export_elements_boundary(elements, recipes)
+
+
 def do_export(storage, path: str = EXPORT_PATH) -> str:
     """Export discoveries to an Infinite Craft .ic save file.
 
@@ -2641,18 +2418,16 @@ def do_export(storage, path: str = EXPORT_PATH) -> str:
     """
     recipes = _load_recipes()
     discoveries = storage.get_all()
-    included = _included_element_names(recipes)
+    selected = _export_included(storage)
 
     # Build export items for the closure
     name_to_id = {}
     items = []
     idx = 0
-    for elem in discoveries:
-        if elem.name not in included:
-            continue
-        name_to_id[elem.name] = idx
-        item = {"id": idx, "text": elem.name, "emoji": elem.emoji or ""}
-        if elem.is_first_discovery:
+    for name, emoji, is_first in selected:
+        name_to_id[name] = idx
+        item = {"id": idx, "text": name, "emoji": emoji or ""}
+        if is_first:
             item["discovery"] = True
         items.append(item)
         idx += 1
@@ -2712,7 +2487,7 @@ def do_help() -> str:
   Query syntax (/search, /with, /permute, /permutate, /cross, /exhaust, shorthands):
     substring                   Default: case-insensitive substring
     * ? []                      fnmatch wildcards (e.g. fire*, mu?)
-    /pattern/                   Regex, case-insensitive (no | alternation)
+    /pattern/                   Regex, case-insensitive (| alternation, \d escapes)
     !<query>                    Exclude matches (e.g. !fire* = everything except fire*)
     !                           All elements (exclude nothing)
     ^<query>                    First discoveries only (e.g. ^fire* = new fire* matches)
@@ -2763,71 +2538,22 @@ _API_SLASH_COMMANDS = (
 
 def _is_local_command(line: str) -> bool:
     """Commands that run immediately without queuing behind API work."""
-    if line in ("/help", "/list", "/history", "/clear", "/queue"):
-        return True
-    if line == "/unfilled" or line.startswith("/unfilled "):
-        return True
-    if line == "/search" or line.startswith("/search "):
-        return True
-    if line == "/recipe" or line.startswith("/recipe "):
-        return True
-    return False
+    return craft.is_local_command(line)
 
 
 def _is_slash_command_attempt(line: str) -> bool:
     """True when input looks like a mistyped /command, not a regex cross query."""
-    if not line.startswith("/"):
-        return False
-    if re.match(r"/[^/]+/", line):
-        return False
-    return bool(re.match(r"/\w", line))
+    return craft.is_slash_command_attempt(line)
 
 
 def _classify_command_line(line: str) -> tuple[str, str] | None:
     """Classify a queuable command. Returns (kind, payload) or None if unrecognized."""
-    line = line.strip()
-    if not line:
-        return None
-
-    for cmd in _API_SLASH_COMMANDS:
-        rest = _slash_args(line, cmd)
-        if rest is not None:
-            return cmd.lstrip("/"), rest
-
-    if _is_slash_command_attempt(line):
-        return None
-
-    if re.search(r"\+\s+\|", line):
-        return "bad+|", line
-
-    if " ++ " in line:
-        return "++", line
-    if "+|" in line:
-        return "+|", line
-    if " * " in line:
-        return "*", line
-    if " + " in line or re.search(r" \+$", line.rstrip()):
-        return "+", line
-    return None
+    return craft.classify_command_line(line)
 
 
 def _validate_query_at_enqueue(query: str) -> str | None:
     """Return an error message if a with/cross query is invalid before enqueue."""
-    if len(query) > MAX_QUERY_LENGTH:
-        return f"  Query too long (max {MAX_QUERY_LENGTH} characters)"
-    q, _, _ = _parse_query_filter(query)
-    if not _is_delimited_regex(q):
-        return None
-    body = q[1:-1]
-    if not _regex_is_safe(body):
-        return f"  {REGEX_ERROR_COMPLEX}"
-    try:
-        _regex_module.search(body, "", _regex_module.IGNORECASE, timeout=REGEX_TIMEOUT)
-    except TimeoutError:
-        return f"  {REGEX_ERROR_COMPLEX}"
-    except _regex_module.error:
-        return f"  {REGEX_ERROR_INVALID}"
-    return None
+    return craft.validate_query_at_enqueue(query)
 
 
 def _validate_command_line(line: str) -> str | None:

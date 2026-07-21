@@ -1,0 +1,58 @@
+name: sudo kernel
+
+on:
+  push:
+    branches: [main, sudo-kernel]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The transpiler is a build dependency, not a vendored artifact:
+      # generated code is never committed here.
+      - name: Check out sudocode (transpiler)
+        uses: actions/checkout@v4
+        with:
+          repository: hacker6284/sudocode
+          path: .sudocode
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .sudocode/sudoc
+      - name: Build sudoc
+        working-directory: .sudocode/sudoc
+        run: cargo build --release
+
+      - name: Generate kernel adapters (py + js)
+        run: SUDOC_BIN="$PWD/.sudocode/sudoc/target/release/sudoc" bash scripts/generate.sh
+
+      # The kernel's own tests, lockstep across exactly the two targets
+      # this repo consumes — divergence fails the build.
+      - name: Kernel lockstep (py vs js)
+        run: ./.sudocode/sudoc/target/release/sudoc test --target py --target js sudo/craft.sudo
+
+      - uses: astral-sh/setup-uv@v5
+      - name: Python tests
+        run: uv run pytest tests/ -q
+
+      - name: Host parity lockstep
+        run: bash tests/parity/run_parity.sh
+
+      - name: Kernel smoke (node, ex-bug behaviors)
+        run: node bookmarklet/test_kernel_smoke.mjs
+
+      - name: Bundle bookmarklet
+        run: bash bookmarklet/minify.sh
+
+      - name: Upload built bookmarklet
+        uses: actions/upload-artifact@v4
+        with:
+          name: bookmarklet
+          path: |
+            bookmarklet/trainer.js
+            bookmarklet/trainer.min.js
+
+  # Pages deployment lives in pages.yml, which rebuilds the site from
+  # source (kernel transpile + bundle) on every main push.
