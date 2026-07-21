@@ -1159,14 +1159,20 @@ test "ex-gate pathological patterns now work"
     m, err = element_matches_pattern(repeat_char('a', 200), pat)
     assert err.is_none()
     assert not m
-    // /a|b/ is literal pipe, not alternation
+    // /a|b/ is now real alternation (a OR b), not a literal 3-char pipe
+    // run — see DIVERGENCES.md ruling: upstream both hosts reject any '|'
+    // as "too complex"; kernel's linear-time NFA engine makes that fear
+    // obsolete, so it performs real alternation instead.
     m, err = element_matches_pattern("xa|by", "/a|b/")
     assert err.is_none()
     assert m
     m, err = element_matches_pattern("a", "/a|b/")
     assert err.is_none()
-    assert not m
+    assert m
     m, err = element_matches_pattern("b", "/a|b/")
+    assert err.is_none()
+    assert m
+    m, err = element_matches_pattern("xyz", "/a|b/")
     assert err.is_none()
     assert not m
     // validate_query accepts long/pipe patterns (no "too complex")
@@ -1174,6 +1180,14 @@ test "ex-gate pathological patterns now work"
     assert validate_query_at_enqueue(pat).is_none()
     assert validate_query_at_enqueue("/[abc/").is_some()
     assert validate_query_at_enqueue("/[abc/").unwrap() == "  Invalid regex pattern"
+
+test "element_matches_pattern real alternation cat or dog"
+    m, err = element_matches_pattern("Watchdog", "/cat|dog/")
+    assert err.is_none()
+    assert m
+    m, err = element_matches_pattern("Elephant", "/cat|dog/")
+    assert err.is_none()
+    assert not m
 
 test "trace_recipe unbounded depth over 200 layers"
     els: List<Element> = []

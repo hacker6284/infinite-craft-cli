@@ -48,7 +48,7 @@ against `sudo/craft.sudo` and upstream `src/infinite_craft_cli/`.
 | 4 | **Export/prune filter = transitive recipe closure** (`included_element_names(recipes)` only) | Matches v1.4.2 `_included_element_names` (cli.py ~2518–2547); pure orphans are export-excluded and prune targets. |
 | 5 | **No fnmatch/glob safety gate** | Vendored `regex.sudo` is Thompson-NFA / Pike-VM, linear in input length — wildcard-count / consecutive-star heuristics are unnecessary. |
 | 6 | **No 512-char name truncation** | Only the **query** is capped at 512; names match in full. JS `name.slice(0, 512)` existed only to bound in-browser `RegExp` cost. |
-| 7 | **No scan budget / regex timeout**; only error is `"Invalid regex pattern"` | Same linear-time engine; CLI `MATCH_SCAN_BUDGET` / `REGEX_TIMEOUT` and JS `REGEX_TIMEOUT_MS` guard PCRE/backtracking the NFA cannot exhibit. |
+| 7 | **No scan budget / regex timeout**; only error is `"Invalid regex pattern"`; real `\|` alternation | Same linear-time engine; CLI `MATCH_SCAN_BUDGET` / `REGEX_TIMEOUT` and JS `REGEX_TIMEOUT_MS` guard PCRE/backtracking the NFA cannot exhibit. Kernel now also performs real `\|` alternation (native NFA `Split` fan-out) — upstream's blanket "any `\|` is too complex" rejection has no counterpart at all. |
 
 ### 1. Unbounded trace BFS
 
@@ -107,13 +107,24 @@ Hosts (CLI, browser trainer) **may** still wrap kernel calls with an outer
 wall-clock guard as defense-in-depth; the kernel itself is deterministic and
 linear-time, so none is built in.
 
-**Behavior change (testable):** upstream `_regex_is_safe` rejected any pattern
-containing `|` as "too complex" even though Python's `regex` module supports
-alternation. `regex.sudo` has no alternation either, but for a different
-reason: `|` is an ordinary literal (same for parentheses — see `regex.sudo`
-header). So `/a|b/` is a **valid** kernel regex matching the three-character
-substring `"a|b"`, not "a or b". Test coverage: matches `"xa|by"`, does not
-match bare `"a"` or `"b"`.
+**Behavior change (testable) — kernel INTENTIONALLY EXCEEDS upstream here:**
+upstream `_regex_is_safe` rejected *any* pattern containing `|` outright as
+"too complex", even though Python's `regex` module supports real
+alternation — the rejection was a backtracking-blowup safety gate, not a
+feature gap. `regex.sudo`'s Thompson-NFA/Pike-VM engine is linear-time by
+construction and cannot exhibit catastrophic backtracking, so that fear is
+obsolete: `regex.sudo` now implements real flat top-level alternation (`|`
+splits the pattern into whole-branch alternatives via the engine's native
+NFA `Split` fan-out; `^`/`$` anchors bind per-branch). `/cat|dog/` is a
+valid kernel regex meaning "cat" OR "dog", not the seven-character literal
+run `"cat|dog"`. This is a deliberate widening beyond upstream, not a
+compatibility requirement — the CLI and JS trainer still hard-reject any
+`|` as "too complex" and would need separate porting to gain this. Test
+coverage: `"element_matches_pattern real alternation cat or dog"` —
+`/cat|dog/` matches `"Watchdog"` (contains "dog"), does not match
+`"Elephant"` (contains neither). `"ex-gate pathological patterns now work"`
+also covers `/a|b/` now matching bare `"a"` and `"b"` (previously
+literal-pipe-only, matched neither).
 
 ---
 
@@ -338,7 +349,7 @@ is specifically record/enum nesting, not all composite types.
 | Source | Count | Status in kernel |
 |--------|-------|------------------|
 | Carried from v1 (canonicalized) | 4 | Unbounded BFS; no flag promotion; case-sensitive + title fallback; export/prune closure |
-| New in v2 extraction | 3 | No glob safety gate; no name truncation; no scan budget / timeout (`\|` literal) |
+| New in v2 extraction | 3 | No glob safety gate; no name truncation; no scan budget / timeout (real `\|` alternation) |
 | Dual `_js` implementations | 0 | Deleted; one CLI-aligned kernel only |
 
 When `bookmarklet/trainer.js` switches to the kernel, residual items 3–6 and the
