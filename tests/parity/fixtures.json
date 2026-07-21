@@ -1,0 +1,82 @@
+{
+  "element_sets": {
+    "basic": [
+      ["Water", "💧", false],
+      ["Fire", "🔥", false],
+      ["Wind", "🌬️", false],
+      ["Earth", "🌍", false],
+      ["Steam", "💨", true],
+      ["Lava", "🌋", true],
+      ["Mud", "", false],
+      ["Dust", "", false],
+      ["Baking Soda", "🧂", false],
+      ["3d Printer", "🖨️", false],
+      ["O'Brien's Farm", "🚜", true],
+      ["Ünïcode Ünicorn", "🦄", true],
+      ["co2 Gas", "💨", false],
+      ["under_score name", "", false]
+    ]
+  },
+  "scenarios": [
+    { "id": "match-substring", "op": "match", "elements_set": "basic", "query": "er" },
+    { "id": "match-glob-star", "op": "match", "elements_set": "basic", "query": "*a*" },
+    { "id": "match-glob-question", "op": "match", "elements_set": "basic", "query": "?ud" },
+    { "id": "match-class", "op": "match", "elements_set": "basic", "query": "[sl]*" },
+    { "id": "match-class-negate", "op": "match", "elements_set": "basic", "query": "[!wf]*" },
+    { "id": "match-caret-filtered", "op": "match", "elements_set": "basic", "query": "^" },
+    { "id": "match-caret-glob-combined", "op": "match", "elements_set": "basic", "query": "^*a*" },
+    { "id": "match-empty", "op": "match", "elements_set": "basic", "query": "" },
+    { "id": "match-no-match", "op": "match", "elements_set": "basic", "query": "zzzzz9" },
+
+    { "id": "resolve-exact-hit", "op": "resolve", "elements_set": "basic", "name": "Fire" },
+    { "id": "resolve-case-variant-title-hit", "op": "resolve", "elements_set": "basic", "name": "fire" },
+    { "id": "resolve-multiword-title-hit", "op": "resolve", "elements_set": "basic", "name": "baking soda" },
+    { "id": "resolve-total-miss-synthesized", "op": "resolve", "elements_set": "basic", "name": "unicorn dust" },
+    { "id": "resolve-digit-title-miss-synthesized", "op": "resolve", "elements_set": "basic", "name": "3d printer" },
+
+    { "id": "record-recipe-new", "op": "record_recipe", "initial_recipes": {}, "calls": [
+      {"result": "Steam2", "a": "Fire", "b": "Water"}
+    ] },
+    { "id": "record-recipe-duplicate-unordered", "op": "record_recipe",
+      "initial_recipes": {"Steam2": [["Fire", "Water"]]}, "calls": [
+      {"result": "Steam2", "a": "Water", "b": "Fire"}
+    ] },
+    { "id": "record-recipe-multi-pairs-same-result", "op": "record_recipe", "initial_recipes": {}, "calls": [
+      {"result": "Cloud", "a": "Steam", "b": "Wind"},
+      {"result": "Cloud", "a": "Rain", "b": "Fog"}
+    ] },
+
+    { "id": "trace-base", "op": "trace",
+      "elements": [["Water", "💧", false]], "recipes": {}, "name": "Water" },
+    { "id": "trace-not-found", "op": "trace",
+      "elements": [], "recipes": {}, "name": "Nope" },
+    { "id": "trace-no-recipe", "op": "trace",
+      "elements": [["Mystery", "", false]], "recipes": {}, "name": "Mystery" },
+    { "id": "trace-unreachable-cycle", "op": "trace",
+      "elements": [["A", "", false], ["B", "", false]],
+      "recipes": {"A": [["B", "Water"]], "B": [["A", "Fire"]]}, "name": "A" },
+    { "id": "trace-multilayer-success", "op": "trace",
+      "elements": [["Steam", "", false], ["Cloud", "", false]],
+      "recipes": {"Steam": [["Fire", "Water"]], "Cloud": [["Steam", "Wind"]]}, "name": "Cloud" },
+    { "id": "trace-chain-250", "op": "trace", "chain": 250, "name": "C250" },
+
+    { "id": "export-orphan-excluded", "op": "export",
+      "elements": [
+        ["Water", "💧", false],
+        ["Steam", "💨", false],
+        ["Mystery Gas", "", false],
+        ["Orphan", "", false]
+      ],
+      "recipes": {"Steam": [["Mystery Gas", "Water"]]} },
+    { "id": "export-transitive-ingredient-kept", "op": "export",
+      "elements": [
+        ["Water", "💧", false],
+        ["Wind", "🌬️", false],
+        ["Steam", "💨", false],
+        ["Cloud", "☁️", false],
+        ["Mystery Gas", "", false],
+        ["Dust", "", false]
+      ],
+      "recipes": {"Steam": [["Mystery Gas", "Water"]], "Cloud": [["Steam", "Wind"]]} }
+  ]
+}

@@ -1,0 +1,1080 @@
+// Pure host-adapter-free Infinite Craft kernel.
+// Wired/provisional path = Python CLI behavior; `_js` siblings isolate JS divergences.
+
+import strings
+
+record Element
+    name: text
+    emoji: text
+    first: bool
+
+record RecipeStep
+    a: text
+    b: text
+    result: text
+
+enum RecipeResult
+    NotFound
+    IsBase(name: text)
+    NoRecipe(name: text)
+    Unreachable(name: text)
+    Steps(target: text, steps: List<RecipeStep>)
+
+// ---------------------------------------------------------------------------
+// Base elements
+// ---------------------------------------------------------------------------
+
+func is_base_element(name: text) -> bool
+    return name == "Water" or name == "Fire" or name == "Wind" or name == "Earth"
+
+// ---------------------------------------------------------------------------
+// ASCII char helpers
+// ---------------------------------------------------------------------------
+
+func upper_char(c: int) -> int
+    if c >= 'a' and c <= 'z'
+        return c - 32
+    return c
+
+func lower_char(c: int) -> int
+    if c >= 'A' and c <= 'Z'
+        return c + 32
+    return c
+
+func is_alpha_ascii(c: int) -> bool
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z')
+
+func is_word_char_js(c: int) -> bool
+    // JS regex \w = [A-Za-z0-9_]
+    return is_alpha_ascii(c) or (c >= '0' and c <= '9') or c == '_'
+
+// ---------------------------------------------------------------------------
+// strip / substring helpers (stdlib has no trim/slice)
+// ---------------------------------------------------------------------------
+
+func is_ascii_space(c: int) -> bool
+    return c == 32 or c == 9 or c == 10 or c == 13 or c == 11 or c == 12
+
+func strip_spaces(s: text) -> text
+    start = 0
+    end = s.length
+    while start < end and is_ascii_space(s[start])
+        start = start + 1
+    while end > start and is_ascii_space(s[end - 1])
+        end = end - 1
+    out: text = ""
+    for i = start to end - 1
+        out.append(s[i])
+    return out
+
+func strip_prefix_one(s: text) -> text
+    // drop first character (used after detecting a leading '^')
+    out: text = ""
+    for i = 1 to s.length - 1
+        out.append(s[i])
+    return out
+
+// Hand-rolled base-10 conversion — sudo has no built-in int-to-text.
+func int_to_text(n: int) -> text
+    if n == 0
+        return "0"
+    if n < 0
+        return "-" + int_to_text(0 - n)
+    digits: List<int> = []
+    x = n
+    while x > 0
+        digits.append(x mod 10)
+        x = x / 10
+    out: text = ""
+    for i = digits.length - 1 downto 0
+        out.append('0' + digits[i])
+    return out
+
+// ---------------------------------------------------------------------------
+// Title-casing — DIVERGENCE #5a
+// ---------------------------------------------------------------------------
+
+export func title_case(s: text) -> text
+    out: text = ""
+    prev_cased = false
+    for c in s
+        if is_alpha_ascii(c)
+            if prev_cased
+                out.append(lower_char(c))
+            else
+                out.append(upper_char(c))
+            prev_cased = true
+        else
+            out.append(c)
+            prev_cased = false
+    return out
+
+export func title_case_js(s: text) -> text
+    out: text = ""
+    for i = 0 to s.length - 1
+        c = s[i]
+        prev_is_word = false
+        if i > 0
+            prev_is_word = is_word_char_js(s[i - 1])
+        if is_word_char_js(c) and not prev_is_word
+            out.append(upper_char(c))
+        else
+            out.append(c)
+    return out
+
+// ---------------------------------------------------------------------------
+// Name lookup — DIVERGENCE #5b
+// ---------------------------------------------------------------------------
+
+func get_by_name(elements: List<Element>, name: text) -> Option<Element>
+    // Python storage.get_by_name: exact, case-sensitive.
+    for e in elements
+        if e.name == name
+            return Some(e)
+    return None
+
+func get_by_name_js(elements: List<Element>, name: text) -> Option<Element>
+    // JS getByName: case-insensitive (both sides lowercased).
+    lowered = strings.to_lower(name)
+    for e in elements
+        if strings.to_lower(e.name) == lowered
+            return Some(e)
+    return None
+
+// ---------------------------------------------------------------------------
+// resolve_element — provisional = Python
+// ---------------------------------------------------------------------------
+
+func resolve_element(elements: List<Element>, name: text) -> Element
+    found = get_by_name(elements, name)
+    if found.is_some()
+        return found.unwrap()
+    title = title_case(strip_spaces(name))
+    if not (title == name)
+        found2 = get_by_name(elements, title)
+        if found2.is_some()
+            return found2.unwrap()
+    return Element(name = title, emoji = "", first = false)
+
+func resolve_element_js(elements: List<Element>, name: text) -> Element
+    found = get_by_name_js(elements, name)
+    if found.is_some()
+        return found.unwrap()
+    title = title_case_js(name)
+    found2 = get_by_name_js(elements, title)
+    if found2.is_some()
+        return found2.unwrap()
+    return Element(name = title_case_js(strip_spaces(name)), emoji = "", first = false)
+
+// ---------------------------------------------------------------------------
+// Glob / substring matching — DIVERGENCE #1 and #2
+// ---------------------------------------------------------------------------
+
+export func is_glob_trigger(q: text) -> bool
+    for c in q
+        if c == '*' or c == '?' or c == '[' or c == ']'
+            return true
+    return false
+
+export func is_glob_trigger_js(q: text) -> bool
+    for c in q
+        if c == '*' or c == '?'
+            return true
+    return false
+
+func find_class_end(pattern: text, start: int) -> int
+    // start = index of '['. Returns index of the matching ']', or -1 if none.
+    i = start + 1
+    if i < pattern.length and pattern[i] == '!'
+        i = i + 1
+    if i < pattern.length and pattern[i] == ']'
+        i = i + 1
+    while i < pattern.length and pattern[i] != ']'
+        i = i + 1
+    if i >= pattern.length
+        return -1
+    return i
+
+func class_matches(pattern: text, start: int, end: int, c: int) -> bool
+    // start = index of '[', end = index of the matching ']'.
+    i = start + 1
+    negate = false
+    if pattern[i] == '!'
+        negate = true
+        i = i + 1
+    matched = false
+    while i < end
+        if i + 2 < end and pattern[i + 1] == '-'
+            lo = pattern[i]
+            hi = pattern[i + 2]
+            if c >= lo and c <= hi
+                matched = true
+            i = i + 3
+        else
+            if pattern[i] == c
+                matched = true
+            i = i + 1
+    if negate
+        return not matched
+    return matched
+
+export func glob_match(pattern: text, name: text) -> bool
+    pi = 0
+    ni = 0
+    star_pi = -1
+    star_ni = -1
+    while ni < name.length
+        if pi < pattern.length and pattern[pi] == '*'
+            star_pi = pi
+            star_ni = ni
+            pi = pi + 1
+            continue
+        if pi < pattern.length and pattern[pi] == '?'
+            pi = pi + 1
+            ni = ni + 1
+            continue
+        if pi < pattern.length and pattern[pi] == '['
+            class_end = find_class_end(pattern, pi)
+            if class_end != -1
+                if class_matches(pattern, pi, class_end, name[ni])
+                    pi = class_end + 1
+                    ni = ni + 1
+                    continue
+                if star_pi != -1
+                    star_ni = star_ni + 1
+                    ni = star_ni
+                    pi = star_pi + 1
+                    continue
+                return false
+            // class_end == -1: unmatched '[' falls through to literal compare.
+        if pi < pattern.length and pattern[pi] == name[ni]
+            pi = pi + 1
+            ni = ni + 1
+            continue
+        if star_pi != -1
+            star_ni = star_ni + 1
+            ni = star_ni
+            pi = star_pi + 1
+            continue
+        return false
+    while pi < pattern.length and pattern[pi] == '*'
+        pi = pi + 1
+    return pi == pattern.length
+
+export func glob_match_js(pattern: text, name: text) -> bool
+    pi = 0
+    ni = 0
+    star_pi = -1
+    star_ni = -1
+    while ni < name.length
+        if pi < pattern.length and pattern[pi] == '*'
+            star_pi = pi
+            star_ni = ni
+            pi = pi + 1
+            continue
+        if pi < pattern.length and pattern[pi] == '?'
+            pi = pi + 1
+            ni = ni + 1
+            continue
+        if pi < pattern.length and pattern[pi] == name[ni]
+            pi = pi + 1
+            ni = ni + 1
+            continue
+        if star_pi != -1
+            star_ni = star_ni + 1
+            ni = star_ni
+            pi = star_pi + 1
+            continue
+        return false
+    while pi < pattern.length and pattern[pi] == '*'
+        pi = pi + 1
+    return pi == pattern.length
+
+func filter_first_discoveries(elements: List<Element>, only_new: bool) -> List<Element>
+    if not only_new
+        return elements
+    out: List<Element> = []
+    for e in elements
+        if e.first
+            out.append(e)
+    return out
+
+func match_elements(elements: List<Element>, query: text) -> List<Element>
+    // Python _match_elements: strip, peel leading '^' BEFORE lowering, lower,
+    // dispatch glob vs substring, then apply the '^' filter inside this function.
+    q = strip_spaces(query)
+    only_new = false
+    if q.length > 0 and q[0] == '^'
+        only_new = true
+        q = strip_prefix_one(q)
+    q = strings.to_lower(q)
+    matches: List<Element> = []
+    if is_glob_trigger(q)
+        for e in elements
+            if glob_match(q, strings.to_lower(e.name))
+                matches.append(e)
+    else
+        for e in elements
+            if strings.contains(strings.to_lower(e.name), q)
+                matches.append(e)
+    return filter_first_discoveries(matches, only_new)
+
+func match_elements_js(elements: List<Element>, query: text) -> List<Element>
+    // JS matchElements: no strip, no '^' handling (that lives only in doSearch).
+    q = strings.to_lower(query)
+    matches: List<Element> = []
+    if is_glob_trigger_js(q)
+        for e in elements
+            if glob_match_js(q, strings.to_lower(e.name))
+                matches.append(e)
+    else
+        for e in elements
+            if strings.contains(strings.to_lower(e.name), q)
+                matches.append(e)
+    return matches
+
+// ---------------------------------------------------------------------------
+// record_recipe — sorted-pair dedupe (Python and JS agree)
+// ---------------------------------------------------------------------------
+
+func sort_pair(a: text, b: text) -> (text, text)
+    if strings.lex_compare(a, b) <= 0
+        return (a, b)
+    return (b, a)
+
+func pair_in_list(pairs: List<(text, text)>, pair: (text, text)) -> bool
+    for p in pairs
+        if p == pair
+            return true
+    return false
+
+export func record_recipe(recipes: inout Map<text, List<(text, text)>>, result_name: text, a_name: text, b_name: text)
+    pair = sort_pair(a_name, b_name)
+    existing = recipes.get(result_name).get_or([])
+    if not pair_in_list(existing, pair)
+        existing.append(pair)
+        recipes[result_name] = existing
+
+// ---------------------------------------------------------------------------
+// add_element — DIVERGENCE #4
+// ---------------------------------------------------------------------------
+
+func find_index_by_name(elements: List<Element>, name: text) -> Option<int>
+    for i = 0 to elements.length - 1
+        if elements[i].name == name
+            return Some(i)
+    return None
+
+func add_element(elements: inout List<Element>, name: text, emoji: text, first: bool) -> bool
+    // Python storage.add: if the name already exists, return false and
+    // NEVER touch the existing record, even if `first` disagrees with it.
+    idx = find_index_by_name(elements, name)
+    if idx.is_some()
+        return false
+    elements.append(Element(name = name, emoji = emoji, first = first))
+    return true
+
+func add_element_js(elements: inout List<Element>, name: text, emoji: text, first: bool) -> bool
+    // JS addElement: if the name exists and `first` is true while the
+    // existing record's flag is false, upgrade it in place. Still returns
+    // false either way (only a brand-new element returns true).
+    idx = find_index_by_name(elements, name)
+    if idx.is_some()
+        i = idx.unwrap()
+        e = elements[i]
+        if first and not e.first
+            e.first = true
+            elements[i] = e
+        return false
+    elements.append(Element(name = name, emoji = emoji, first = first))
+    return true
+
+// ---------------------------------------------------------------------------
+// trace_recipe — DIVERGENCE #3 (depth cap)
+// ---------------------------------------------------------------------------
+
+func is_available(n: text, visited: Set<text>, recipes: Map<text, List<(text, text)>>) -> bool
+    if visited.has(n)
+        return true
+    if is_base_element(n)
+        return true
+    entry = recipes.get(n)
+    if entry.is_none()
+        return true
+    return entry.unwrap().length == 0
+
+func sort_texts(items: inout List<text>)
+    for j = 1 to items.length - 1
+        i = j
+        while i > 0 and strings.lex_compare(items[i], items[i - 1]) < 0
+            items.swap(i, i - 1)
+            i = i - 1
+
+func sorted_text_list(items: List<text>) -> List<text>
+    out = items
+    sort_texts(out)
+    return out
+
+func compute_layers(target: text, recipes: Map<text, List<(text, text)>>, max_layers: int) -> (bool, Map<text, (text, text)>)
+    parent: Map<text, (text, text)> = Map()
+    visited: Set<text> = Set()
+    found = false
+    layer_count = 0
+    while not found and layer_count < max_layers
+        layer_count = layer_count + 1
+        new_names: List<text> = []
+        new_pairs: Map<text, (text, text)> = Map()
+        keys = sorted_text_list(recipes.keys())
+        for result_name in keys
+            if visited.has(result_name)
+                continue
+            if new_pairs.has(result_name)
+                continue
+            pairs = recipes[result_name]
+            for pair in pairs
+                pa, pb = pair
+                a_ok = is_available(pa, visited, recipes)
+                b_ok = is_available(pb, visited, recipes)
+                if a_ok and b_ok
+                    new_pairs[result_name] = pair
+                    new_names.append(result_name)
+                    if result_name == target
+                        found = true
+                    break
+        if new_names.length == 0
+            break
+        for rn in new_names
+            pr = new_pairs[rn]
+            parent[rn] = pr
+            visited.add(rn)
+    return (found, parent)
+
+func backtrack_steps(target: text, parent: Map<text, (text, text)>) -> List<RecipeStep>
+    resolved: Set<text> = Set()
+    resolved.add("Water")
+    resolved.add("Fire")
+    resolved.add("Wind")
+    resolved.add("Earth")
+    to_resolve: List<text> = [target]
+    steps: List<RecipeStep> = []
+    while to_resolve.length > 0
+        nm = to_resolve.pop()
+        if resolved.has(nm)
+            continue
+        if not parent.has(nm)
+            resolved.add(nm)
+            continue
+        pr = parent[nm]
+        a, b = pr
+        deferred = false
+        for dep in [a, b]
+            if resolved.has(dep)
+                continue
+            if not parent.has(dep) and not is_base_element(dep)
+                resolved.add(dep)
+                continue
+            to_resolve.append(nm)
+            to_resolve.append(dep)
+            deferred = true
+            break
+        if not deferred
+            steps.append(RecipeStep(a = a, b = b, result = nm))
+            resolved.add(nm)
+    return steps
+
+func trace_recipe(elements: List<Element>, recipes: Map<text, List<(text, text)>>, name: text) -> RecipeResult
+    stripped = strip_spaces(name)
+    elem = get_by_name(elements, stripped)
+    if elem.is_none()
+        elem = get_by_name(elements, title_case(stripped))
+    if elem.is_none()
+        return NotFound
+    target = elem.unwrap().name
+    if is_base_element(target)
+        return IsBase(target)
+    target_pairs = recipes.get(target).get_or([])
+    if target_pairs.length == 0
+        return NoRecipe(target)
+    found, parent = compute_layers(target, recipes, 1000000000)
+    if not found
+        return Unreachable(target)
+    steps = backtrack_steps(target, parent)
+    return Steps(target, steps)
+
+func trace_recipe_js(elements: List<Element>, recipes: Map<text, List<(text, text)>>, name: text) -> RecipeResult
+    elem = get_by_name_js(elements, name)
+    if elem.is_none()
+        return NotFound
+    target = elem.unwrap().name
+    if is_base_element(target)
+        return IsBase(target)
+    target_pairs = recipes.get(target).get_or([])
+    if target_pairs.length == 0
+        return NoRecipe(target)
+    found, parent = compute_layers(target, recipes, 200)
+    if not found
+        return Unreachable(target)
+    steps = backtrack_steps(target, parent)
+    return Steps(target, steps)
+
+// ---------------------------------------------------------------------------
+// export_elements — DIVERGENCE #6 (transitive closure vs no filtering)
+// ---------------------------------------------------------------------------
+
+func export_included_names(elements: List<Element>, recipes: Map<text, List<(text, text)>>) -> Set<text>
+    included: Set<text> = Set()
+    included.add("Water")
+    included.add("Fire")
+    included.add("Wind")
+    included.add("Earth")
+    for e in elements
+        // Python do_export uses bare key-presence (`elem.name in recipes`),
+        // not the truthiness check do_recipe uses — deliberately preserved.
+        if recipes.has(e.name)
+            included.add(e.name)
+    changed = true
+    while changed
+        changed = false
+        names = sorted_text_list(included.items())
+        for nm in names
+            if recipes.has(nm)
+                for pair in recipes[nm]
+                    pa, pb = pair
+                    if not included.has(pa)
+                        included.add(pa)
+                        changed = true
+                    if not included.has(pb)
+                        included.add(pb)
+                        changed = true
+    return included
+
+func export_included_names_js(elements: List<Element>) -> Set<text>
+    included: Set<text> = Set()
+    for e in elements
+        included.add(e.name)
+    return included
+
+func export_elements(elements: List<Element>, recipes: Map<text, List<(text, text)>>) -> List<Element>
+    included = export_included_names(elements, recipes)
+    out: List<Element> = []
+    for e in elements
+        if included.has(e.name)
+            out.append(e)
+    return out
+
+func export_elements_js(elements: List<Element>) -> List<Element>
+    included = export_included_names_js(elements)
+    out: List<Element> = []
+    for e in elements
+        if included.has(e.name)
+            out.append(e)
+    return out
+
+// ---- boundary adapters: tuple/primitive-only shapes for export funcs ----
+// See DIVERGENCES.md "sudo language friction" for why this layer exists:
+// a record/enum reached through a NAMED type in an export signature loses
+// its `text` fields at the JS host boundary. Everything above this comment
+// is the internal engine (records/enums, full expressiveness); everything
+// below is the flattened, boundary-safe surface a host adapter actually
+// calls.
+
+func element_from_tuple(t: (text, text, bool)) -> Element
+    n, em, f = t
+    return Element(name = n, emoji = em, first = f)
+
+func element_to_tuple(e: Element) -> (text, text, bool)
+    return (e.name, e.emoji, e.first)
+
+func elements_from_tuples(ts: List<(text, text, bool)>) -> List<Element>
+    out: List<Element> = []
+    for t in ts
+        out.append(element_from_tuple(t))
+    return out
+
+func elements_to_tuples(es: List<Element>) -> List<(text, text, bool)>
+    out: List<(text, text, bool)> = []
+    for e in es
+        out.append(element_to_tuple(e))
+    return out
+
+func recipe_result_to_tuple(r: RecipeResult) -> (int, text, List<(text, text, text)>)
+    match r
+        case NotFound
+            empty: List<(text, text, text)> = []
+            return (0, "", empty)
+        case IsBase(n)
+            empty: List<(text, text, text)> = []
+            return (1, n, empty)
+        case NoRecipe(n)
+            empty: List<(text, text, text)> = []
+            return (2, n, empty)
+        case Unreachable(n)
+            empty: List<(text, text, text)> = []
+            return (3, n, empty)
+        case Steps(t, steps)
+            out: List<(text, text, text)> = []
+            for s in steps
+                out.append((s.a, s.b, s.result))
+            return (4, t, out)
+
+export func match_elements_boundary(elements: List<(text, text, bool)>, query: text) -> List<(text, text, bool)>
+    return elements_to_tuples(match_elements(elements_from_tuples(elements), query))
+
+export func match_elements_js_boundary(elements: List<(text, text, bool)>, query: text) -> List<(text, text, bool)>
+    return elements_to_tuples(match_elements_js(elements_from_tuples(elements), query))
+
+export func resolve_element_boundary(elements: List<(text, text, bool)>, name: text) -> (text, text, bool)
+    return element_to_tuple(resolve_element(elements_from_tuples(elements), name))
+
+export func resolve_element_js_boundary(elements: List<(text, text, bool)>, name: text) -> (text, text, bool)
+    return element_to_tuple(resolve_element_js(elements_from_tuples(elements), name))
+
+export func get_by_name_boundary(elements: List<(text, text, bool)>, name: text) -> Option<(text, text, bool)>
+    found = get_by_name(elements_from_tuples(elements), name)
+    match found
+        case Some(e)
+            return Some(element_to_tuple(e))
+        case None
+            return None
+
+export func get_by_name_js_boundary(elements: List<(text, text, bool)>, name: text) -> Option<(text, text, bool)>
+    found = get_by_name_js(elements_from_tuples(elements), name)
+    match found
+        case Some(e)
+            return Some(element_to_tuple(e))
+        case None
+            return None
+
+export func find_index_by_name_boundary(elements: List<(text, text, bool)>, name: text) -> Option<int>
+    return find_index_by_name(elements_from_tuples(elements), name)
+
+export func add_element_boundary(elements: inout List<(text, text, bool)>, name: text, emoji: text, first: bool) -> bool
+    es = elements_from_tuples(elements)
+    result = add_element(es, name, emoji, first)
+    elements = elements_to_tuples(es)
+    return result
+
+export func add_element_js_boundary(elements: inout List<(text, text, bool)>, name: text, emoji: text, first: bool) -> bool
+    es = elements_from_tuples(elements)
+    result = add_element_js(es, name, emoji, first)
+    elements = elements_to_tuples(es)
+    return result
+
+export func trace_recipe_boundary(elements: List<(text, text, bool)>, recipes: Map<text, List<(text, text)>>, name: text) -> (int, text, List<(text, text, text)>)
+    r = trace_recipe(elements_from_tuples(elements), recipes, name)
+    return recipe_result_to_tuple(r)
+
+export func trace_recipe_js_boundary(elements: List<(text, text, bool)>, recipes: Map<text, List<(text, text)>>, name: text) -> (int, text, List<(text, text, text)>)
+    r = trace_recipe_js(elements_from_tuples(elements), recipes, name)
+    return recipe_result_to_tuple(r)
+
+export func export_elements_boundary(elements: List<(text, text, bool)>, recipes: Map<text, List<(text, text)>>) -> List<(text, text, bool)>
+    return elements_to_tuples(export_elements(elements_from_tuples(elements), recipes))
+
+export func export_elements_js_boundary(elements: List<(text, text, bool)>) -> List<(text, text, bool)>
+    return elements_to_tuples(export_elements_js(elements_from_tuples(elements)))
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+test "glob_match star question basic"
+    assert glob_match("a*d", "abcd")
+    assert not glob_match("a*d", "abce")
+    assert glob_match("a?d", "abd")
+    assert not glob_match("a?d", "abcd")
+    assert glob_match("", "")
+    assert not glob_match("", "x")
+    assert glob_match("*", "")
+    assert glob_match("*", "anything")
+
+test "glob_match character classes"
+    assert glob_match("a[bc]d", "abd")
+    assert glob_match("a[bc]d", "acd")
+    assert not glob_match("a[bc]d", "aed")
+    assert glob_match("a[!bc]d", "aed")
+    assert not glob_match("a[!bc]d", "abd")
+    assert glob_match("a[b-d]e", "ace")
+    assert not glob_match("a[b-d]e", "afe")
+    assert glob_match("[", "[")
+    assert glob_match("a[", "a[")
+    assert glob_match("*", "")
+    assert glob_match("*", "anything")
+    assert glob_match("?", "a")
+    assert not glob_match("?", "")
+    assert glob_match("", "")
+    assert not glob_match("", "x")
+
+test "glob_match vs glob_match_js character class diverge"
+    assert glob_match("a[bc]d", "abd")
+    assert not glob_match_js("a[bc]d", "abd")
+    assert glob_match_js("a[bc]d", "a[bc]d")
+
+test "is_glob_trigger bracket-only diverge"
+    assert is_glob_trigger("[abc]")
+    assert not is_glob_trigger_js("[abc]")
+    assert is_glob_trigger("a*b")
+    assert is_glob_trigger_js("a*b")
+
+test "match_elements substring case-insensitive"
+    els: List<Element> = []
+    els.append(Element(name = "Water", emoji = "", first = false))
+    els.append(Element(name = "Fire", emoji = "", first = false))
+    els.append(Element(name = "Steam", emoji = "", first = false))
+    m = match_elements(els, "tea")
+    assert m.length == 1
+    assert m[0].name == "Steam"
+    // "r" matches Water and Fire (not Steam)
+    m2 = match_elements(els, "r")
+    assert m2.length == 2
+    assert m2[0].name == "Water"
+    assert m2[1].name == "Fire"
+
+test "match_elements empty query matches all"
+    els: List<Element> = []
+    els.append(Element(name = "Water", emoji = "", first = false))
+    els.append(Element(name = "Fire", emoji = "", first = true))
+    m = match_elements(els, "")
+    assert m.length == 2
+    mjs = match_elements_js(els, "")
+    assert mjs.length == 2
+
+test "match_elements no match"
+    els: List<Element> = []
+    els.append(Element(name = "Water", emoji = "", first = false))
+    m = match_elements(els, "zzzz")
+    assert m.length == 0
+
+test "match_elements caret first-discovery filter diverge"
+    els: List<Element> = []
+    els.append(Element(name = "Water", emoji = "", first = false))
+    els.append(Element(name = "Fire", emoji = "", first = true))
+    els.append(Element(name = "Steam", emoji = "", first = true))
+    py = match_elements(els, "^")
+    assert py.length == 2
+    assert py[0].name == "Fire"
+    assert py[1].name == "Steam"
+    py2 = match_elements(els, "^ea")
+    assert py2.length == 1
+    assert py2[0].name == "Steam"
+    // JS leaves the literal '^' in the pattern — no first-discovery filter.
+    js = match_elements_js(els, "^ea")
+    assert js.length == 0
+    js2 = match_elements_js(els, "^")
+    assert js2.length == 0
+
+test "title_case and title_case_js"
+    assert title_case("baker's dozen") == "Baker'S Dozen"
+    assert title_case_js("baker's dozen") == "Baker'S Dozen"
+    assert title_case("co2 gas") == "Co2 Gas"
+    assert title_case_js("co2 gas") == "Co2 Gas"
+    assert title_case("3d printer") == "3D Printer"
+    assert title_case_js("3d printer") == "3d Printer"
+    assert title_case("HELLO world") == "Hello World"
+    assert title_case_js("HELLO world") == "HELLO World"
+    assert title_case("under_score name") == "Under_Score Name"
+    assert title_case_js("under_score name") == "Under_score Name"
+
+test "resolve_element exact title-case miss"
+    els: List<Element> = []
+    els.append(Element(name = "Baking Soda", emoji = "🧂", first = false))
+    els.append(Element(name = "Fire", emoji = "🔥", first = false))
+    hit = resolve_element(els, "Fire")
+    assert hit.name == "Fire"
+    assert hit.emoji == "🔥"
+    titled = resolve_element(els, "baking soda")
+    assert titled.name == "Baking Soda"
+    assert titled.emoji == "🧂"
+    miss = resolve_element(els, "unicorn dust")
+    assert miss.name == "Unicorn Dust"
+    assert miss.emoji == ""
+    assert miss.first == false
+
+test "get_by_name case sensitivity diverge"
+    els: List<Element> = []
+    els.append(Element(name = "Fire", emoji = "", first = false))
+    assert get_by_name(els, "fire").is_none()
+    assert get_by_name_js(els, "fire").is_some()
+    assert get_by_name(els, "Fire").is_some()
+
+test "is_base_element"
+    assert is_base_element("Water")
+    assert is_base_element("Fire")
+    assert is_base_element("Wind")
+    assert is_base_element("Earth")
+    assert not is_base_element("Steam")
+
+test "record_recipe sorted-pair dedupe"
+    recipes: Map<text, List<(text, text)>> = Map()
+    record_recipe(recipes, "R", "A", "B")
+    record_recipe(recipes, "R", "B", "A")
+    pairs = recipes.get("R").unwrap()
+    assert pairs.length == 1
+    pa, pb = pairs[0]
+    assert pa == "A"
+    assert pb == "B"
+
+test "add_element no upgrade"
+    els: List<Element> = []
+    assert add_element(els, "Lava", "🌋", false)
+    assert els.length == 1
+    assert els[0].first == false
+    assert not add_element(els, "Lava", "xx", true)
+    assert els.length == 1
+    assert els[0].first == false
+    assert els[0].emoji == "🌋"
+
+test "add_element_js upgrades first flag"
+    els: List<Element> = []
+    assert add_element_js(els, "Lava", "🌋", false)
+    assert els[0].first == false
+    assert not add_element_js(els, "Lava", "xx", true)
+    assert els.length == 1
+    assert els[0].first == true
+    assert els[0].emoji == "🌋"
+
+test "trace_recipe base element"
+    els: List<Element> = []
+    els.append(Element(name = "Water", emoji = "", first = false))
+    recipes: Map<text, List<(text, text)>> = Map()
+    r = trace_recipe(els, recipes, "Water")
+    match r
+        case IsBase(n)
+            assert n == "Water"
+        case NotFound
+            assert false
+        case NoRecipe(n)
+            assert n.length < 0
+        case Unreachable(n)
+            assert n.length < 0
+        case Steps(t, steps)
+            assert t.length < 0 or steps.length < 0
+
+test "trace_recipe no recipe"
+    els: List<Element> = []
+    els.append(Element(name = "Mystery", emoji = "", first = false))
+    recipes: Map<text, List<(text, text)>> = Map()
+    r = trace_recipe(els, recipes, "Mystery")
+    match r
+        case NoRecipe(n)
+            assert n == "Mystery"
+        case NotFound
+            assert false
+        case IsBase(n)
+            assert n.length < 0
+        case Unreachable(n)
+            assert n.length < 0
+        case Steps(t, steps)
+            assert t.length < 0 or steps.length < 0
+
+test "trace_recipe not found"
+    els: List<Element> = []
+    recipes: Map<text, List<(text, text)>> = Map()
+    r = trace_recipe(els, recipes, "Nope")
+    match r
+        case NotFound
+            assert true
+        case IsBase(n)
+            assert n.length < 0
+        case NoRecipe(n)
+            assert n.length < 0
+        case Unreachable(n)
+            assert n.length < 0
+        case Steps(t, steps)
+            assert t.length < 0 or steps.length < 0
+
+test "trace_recipe unreachable cycle"
+    els: List<Element> = []
+    els.append(Element(name = "A", emoji = "", first = false))
+    els.append(Element(name = "B", emoji = "", first = false))
+    recipes: Map<text, List<(text, text)>> = Map()
+    recipes["A"] = [("B", "Water")]
+    recipes["B"] = [("A", "Fire")]
+    r = trace_recipe(els, recipes, "A")
+    match r
+        case Unreachable(n)
+            assert n == "A"
+        case NotFound
+            assert false
+        case IsBase(n)
+            assert n.length < 0
+        case NoRecipe(n)
+            assert n.length < 0
+        case Steps(t, steps)
+            assert t.length < 0 or steps.length < 0
+
+test "trace_recipe two-step lineage"
+    els: List<Element> = []
+    els.append(Element(name = "Steam", emoji = "", first = false))
+    els.append(Element(name = "Cloud", emoji = "", first = false))
+    recipes: Map<text, List<(text, text)>> = Map()
+    recipes["Steam"] = [("Fire", "Water")]
+    recipes["Cloud"] = [("Steam", "Wind")]
+    r = trace_recipe(els, recipes, "Cloud")
+    match r
+        case Steps(t, steps)
+            assert t == "Cloud"
+            assert steps.length == 2
+            assert steps[0].result == "Steam"
+            assert steps[0].a == "Fire"
+            assert steps[0].b == "Water"
+            assert steps[1].result == "Cloud"
+            assert steps[1].a == "Steam"
+            assert steps[1].b == "Wind"
+        case NotFound
+            assert false
+        case IsBase(n)
+            assert n.length < 0
+        case NoRecipe(n)
+            assert n.length < 0
+        case Unreachable(n)
+            assert n.length < 0
+
+test "trace_recipe depth cap diverge"
+    els: List<Element> = []
+    recipes: Map<text, List<(text, text)>> = Map()
+    // C0 from bases; Ci = C{i-1} + Water for i in 1..250
+    recipes["C0"] = [("Fire", "Water")]
+    els.append(Element(name = "C0", emoji = "", first = false))
+    for i = 1 to 250
+        name = "C" + int_to_text(i)
+        prev = "C" + int_to_text(i - 1)
+        recipes[name] = [(prev, "Water")]
+        els.append(Element(name = name, emoji = "", first = false))
+    py = trace_recipe(els, recipes, "C250")
+    match py
+        case Steps(t, steps)
+            assert t == "C250"
+            assert steps.length == 251
+        case NotFound
+            assert false
+        case IsBase(n)
+            assert n.length < 0
+        case NoRecipe(n)
+            assert n.length < 0
+        case Unreachable(n)
+            assert n.length < 0
+    js = trace_recipe_js(els, recipes, "C250")
+    match js
+        case Unreachable(n)
+            assert n == "C250"
+        case NotFound
+            assert false
+        case IsBase(n)
+            assert n.length < 0
+        case NoRecipe(n)
+            assert n.length < 0
+        case Steps(t, steps)
+            assert t.length < 0 or steps.length < 0
+
+test "export_elements transitive closure diverge"
+    els: List<Element> = []
+    // (a) base
+    els.append(Element(name = "Water", emoji = "", first = false))
+    // (b) element with its own recipe
+    els.append(Element(name = "Steam", emoji = "", first = false))
+    // (c) terminal ingredient referenced only as a constituent
+    els.append(Element(name = "Mystery Gas", emoji = "", first = false))
+    // (d) pure orphan
+    els.append(Element(name = "Orphan", emoji = "", first = false))
+    recipes: Map<text, List<(text, text)>> = Map()
+    recipes["Steam"] = [("Mystery Gas", "Water")]
+    py = export_elements(els, recipes)
+    assert py.length == 3
+    names: Set<text> = Set()
+    for e in py
+        names.add(e.name)
+    assert names.has("Water")
+    assert names.has("Steam")
+    assert names.has("Mystery Gas")
+    assert not names.has("Orphan")
+    js = export_elements_js(els)
+    assert js.length == 4
+    jnames: Set<text> = Set()
+    for e in js
+        jnames.add(e.name)
+    assert jnames.has("Orphan")
+
+// ---------------------------------------------------------------------------
+// Boundary adapter smoke tests
+// ---------------------------------------------------------------------------
+
+test "match_elements_boundary round-trip"
+    els: List<(text, text, bool)> = []
+    els.append(("Water", "", false))
+    els.append(("Fire", "", false))
+    els.append(("Steam", "", false))
+    m = match_elements_boundary(els, "tea")
+    assert m.length == 1
+    n, em, f = m[0]
+    assert n == "Steam"
+    assert em == ""
+    assert f == false
+    m2 = match_elements_boundary(els, "r")
+    assert m2.length == 2
+    n0, em0, f0 = m2[0]
+    n1, em1, f1 = m2[1]
+    assert n0 == "Water"
+    assert n1 == "Fire"
+
+test "resolve_element_boundary miss"
+    els: List<(text, text, bool)> = []
+    miss = resolve_element_boundary(els, "unicorn dust")
+    n, em, f = miss
+    assert n == "Unicorn Dust"
+    assert em == ""
+    assert f == false
+
+test "add_element_boundary once then duplicate"
+    els: List<(text, text, bool)> = []
+    assert add_element_boundary(els, "Lava", "🌋", false)
+    assert els.length == 1
+    assert not add_element_boundary(els, "Lava", "xx", true)
+    assert els.length == 1
+
+test "trace_recipe_boundary base and two-step"
+    // base element → status 1 = IsBase
+    base_els: List<(text, text, bool)> = []
+    base_els.append(("Water", "", false))
+    base_recipes: Map<text, List<(text, text)>> = Map()
+    status, name, steps = trace_recipe_boundary(base_els, base_recipes, "Water")
+    assert status == 1
+    assert name == "Water"
+    assert steps.length == 0
+    // two-step lineage (Steam/Cloud) → status 4 = Steps
+    els: List<(text, text, bool)> = []
+    els.append(("Steam", "", false))
+    els.append(("Cloud", "", false))
+    recipes: Map<text, List<(text, text)>> = Map()
+    recipes["Steam"] = [("Fire", "Water")]
+    recipes["Cloud"] = [("Steam", "Wind")]
+    status2, name2, steps2 = trace_recipe_boundary(els, recipes, "Cloud")
+    assert status2 == 4
+    assert name2 == "Cloud"
+    assert steps2.length == 2
+
+test "export_elements_boundary orphan-filtering diverge"
+    els: List<(text, text, bool)> = []
+    els.append(("Water", "", false))
+    els.append(("Steam", "", false))
+    els.append(("Mystery Gas", "", false))
+    els.append(("Orphan", "", false))
+    recipes: Map<text, List<(text, text)>> = Map()
+    recipes["Steam"] = [("Mystery Gas", "Water")]
+    py = export_elements_boundary(els, recipes)
+    assert py.length == 3
+    names: Set<text> = Set()
+    for t in py
+        n, em, f = t
+        names.add(n)
+    assert names.has("Water")
+    assert names.has("Steam")
+    assert names.has("Mystery Gas")
+    assert not names.has("Orphan")
+    js = export_elements_js_boundary(els)
+    assert js.length == 4
+    jnames: Set<text> = Set()
+    for t in js
+        n, em, f = t
+        jnames.add(n)
+    assert jnames.has("Orphan")
