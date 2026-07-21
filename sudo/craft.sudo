@@ -2,8 +2,8 @@
 // Single kernel behavior = Python CLI. No `_js` siblings.
 // Matching uses vendored regex.sudo (linear-time; no safety gates/timeouts).
 
-import strings
-import regex
+import std.strings
+import std.regex
 
 record Element
     name: text
