@@ -1,0 +1,99 @@
+name: Release dry run
+
+# Rehearses the full v* tag release — PyPI package build and Pages site
+# build — without publishing anything. Run before tagging; green here means
+# the only untested steps in a real release are the standard upload actions.
+on:
+  workflow_dispatch:
+    inputs:
+      changelog_version:
+        description: "Version to test CHANGELOG extraction for (e.g. 1.5.0); blank skips"
+        required: false
+        default: ""
+
+jobs:
+  pypi-rehearsal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out sudocode (transpiler)
+        uses: actions/checkout@v4
+        with:
+          repository: hacker6284/sudocode
+          path: .sudocode
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .sudocode/sudoc
+      - name: Build sudoc
+        working-directory: .sudocode/sudoc
+        run: cargo build --release
+      - name: Generate kernel adapters
+        run: SUDOC_BIN="$PWD/.sudocode/sudoc/target/release/sudoc" bash scripts/generate.sh
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build package
+        run: |
+          pip install build twine
+          python -m build
+          twine check dist/*
+      - name: Wheel actually contains the kernel and the CLI runs
+        run: |
+          pip install dist/*.whl
+          python -c "import infinite_craft_cli._sudo.craft; print('kernel import OK')"
+          infinite-craft --help > /dev/null && echo "entry point OK"
+      - name: Keep artifacts for inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: pypi-dry-run-dist
+          path: dist/
+
+  pages-rehearsal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out sudocode (transpiler)
+        uses: actions/checkout@v4
+        with:
+          repository: hacker6284/sudocode
+          path: .sudocode
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .sudocode/sudoc
+      - name: Build sudoc
+        working-directory: .sudocode/sudoc
+        run: cargo build --release
+      - name: Generate kernel adapters
+        run: SUDOC_BIN="$PWD/.sudocode/sudoc/target/release/sudoc" bash scripts/generate.sh
+      - name: Bundle trainer
+        run: bash bookmarklet/minify.sh
+      - name: Site sanity (what a deploy would ship)
+        run: |
+          node --check bookmarklet/trainer.js
+          node --check bookmarklet/trainer.min.js
+          for m in __ICTrainer ict-trainer-ready ict-container; do
+            grep -q "$m" bookmarklet/trainer.js || { echo "missing marker $m"; exit 1; }
+          done
+          node bookmarklet/test_kernel_smoke.mjs
+      - name: Keep site for inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: pages-dry-run-site
+          path: |
+            bookmarklet/trainer.js
+            bookmarklet/trainer.min.js
+
+  release-notes-rehearsal:
+    if: inputs.changelog_version != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract changelog section (same awk as the release job)
+        run: |
+          VERSION="${{ inputs.changelog_version }}"
+          NOTES=$(awk "/^## \\[${VERSION}\\]/{found=1; next} /^## \\[/{if(found) exit} found{print}" CHANGELOG.md)
+          if [ -z "$NOTES" ]; then
+            echo "No CHANGELOG section found for ${VERSION} — the release job would produce an empty body."
+            exit 1
+          fi
+          echo "$NOTES"
