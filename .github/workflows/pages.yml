@@ -27,21 +27,11 @@ jobs:
       - uses: actions/checkout@v4
 
       # The deployed site is built from source every time — the sudo kernel
-      # is transpiled and the trainer re-bundled, so Pages can never serve
-      # an artifact that drifted from sudo/craft.sudo.
-      - name: Check out sudocode (transpiler)
-        uses: actions/checkout@v4
-        with:
-          repository: hacker6284/sudocode
-          path: .sudocode
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: .sudocode/sudoc
-      - name: Build sudoc
-        working-directory: .sudocode/sudoc
-        run: cargo build --release
+      # is transpiled (via the pinned sudoc release, scripts/generate.sh)
+      # and the trainer re-bundled, so Pages can never serve an artifact
+      # that drifted from sudo/craft.sudo.
       - name: Generate kernel adapters
-        run: SUDOC_BIN="$PWD/.sudocode/sudoc/target/release/sudoc" bash scripts/generate.sh
+        run: bash scripts/generate.sh
       - name: Bundle trainer
         run: bash bookmarklet/minify.sh
 

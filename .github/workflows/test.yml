@@ -12,22 +12,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The kernel is generated, gitignored code — it must exist before
-      # Bazel's load-time globs run or infinite_craft_cli._sudo is missing.
-      - name: Check out sudocode (transpiler)
-        uses: actions/checkout@v4
-        with:
-          repository: hacker6284/sudocode
-          path: .sudocode
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: .sudocode/sudoc
-      - name: Build sudoc
-        working-directory: .sudocode/sudoc
-        run: cargo build --release
-      - name: Generate kernel adapters
-        run: SUDOC_BIN="$PWD/.sudocode/sudoc/target/release/sudoc" bash scripts/generate.sh
-
       - uses: bazel-contrib/setup-bazel@0.14.0
         with:
           bazelisk-cache: true

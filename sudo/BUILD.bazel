@@ -1,0 +1,13 @@
+# Pinned sudoc binary, selected by the platform Bazel is actually running
+# actions on (matches CI's ubuntu-latest and local Apple Silicon dev; no
+# other exec platforms are supported here — see MODULE.bazel).
+alias(
+    name = "sudoc_bin",
+    actual = select({
+        "@platforms//os:macos": "@sudoc_darwin_arm64//file",
+        "//conditions:default": "@sudoc_linux_x86_64//file",
+    }),
+    visibility = ["//visibility:public"],
+)
+
+exports_files(["craft.sudo"])

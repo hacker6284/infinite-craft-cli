@@ -12,3 +12,6 @@ MODULE.bazel.lock
 # Generated sudo-kernel adapters (regenerate via scripts/generate.sh)
 src/infinite_craft_cli/_sudo/
 bookmarklet/_sudo/
+
+# Pinned sudoc binary cache (scripts/sudoc-bin.sh)
+.cache/

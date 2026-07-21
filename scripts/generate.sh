@@ -6,12 +6,14 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SUDOC_BIN="${SUDOC_BIN:-/Users/zachmills/Documents/Projects/sudocode/sudoc/target/release/sudoc}"
+
+# Acquisition precedence (SUDOC_BIN override / cache / pinned download with
+# checksum verification) lives in scripts/sudoc-bin.sh — the single
+# mechanism shared with any CI step that needs the sudoc binary directly.
+SUDOC_BIN="$(bash "$REPO_ROOT/scripts/sudoc-bin.sh")"
 
 if [ ! -x "$SUDOC_BIN" ]; then
     echo "error: sudoc binary not found or not executable at: $SUDOC_BIN" >&2
-    echo "Build it first: (cd /Users/zachmills/Documents/Projects/sudocode/sudoc && cargo build --release)" >&2
-    echo "Or point SUDOC_BIN at an existing build before re-running this script." >&2
     exit 1
 fi
 

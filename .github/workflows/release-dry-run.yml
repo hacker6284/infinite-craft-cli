@@ -16,19 +16,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check out sudocode (transpiler)
-        uses: actions/checkout@v4
-        with:
-          repository: hacker6284/sudocode
-          path: .sudocode
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: .sudocode/sudoc
-      - name: Build sudoc
-        working-directory: .sudocode/sudoc
-        run: cargo build --release
       - name: Generate kernel adapters
-        run: SUDOC_BIN="$PWD/.sudocode/sudoc/target/release/sudoc" bash scripts/generate.sh
+        run: bash scripts/generate.sh
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -52,19 +41,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check out sudocode (transpiler)
-        uses: actions/checkout@v4
-        with:
-          repository: hacker6284/sudocode
-          path: .sudocode
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: .sudocode/sudoc
-      - name: Build sudoc
-        working-directory: .sudocode/sudoc
-        run: cargo build --release
       - name: Generate kernel adapters
-        run: SUDOC_BIN="$PWD/.sudocode/sudoc/target/release/sudoc" bash scripts/generate.sh
+        run: bash scripts/generate.sh
       - name: Bundle trainer
         run: bash bookmarklet/minify.sh
       - name: Site sanity (what a deploy would ship)

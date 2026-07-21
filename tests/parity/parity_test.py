@@ -74,7 +74,7 @@ def test_python_js_host_parity():
 
     run_js_path = _resolve_data_file("tests/parity/run_js.mjs")
     proc = subprocess.run(
-        ["node", str(run_js_path)],
+        ["node", "--preserve-symlinks", "--preserve-symlinks-main", str(run_js_path)],
         capture_output=True,
         text=True,
     )
