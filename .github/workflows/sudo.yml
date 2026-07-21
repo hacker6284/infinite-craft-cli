@@ -34,8 +34,10 @@ jobs:
         run: ./.sudocode/sudoc/target/release/sudoc test --target py --target js sudo/craft.sudo
 
       - uses: astral-sh/setup-uv@v5
+      # pytest is not a pyproject dependency (the repo's canonical runner is
+      # Bazel, which brings its own) — inject it ephemerally.
       - name: Python tests
-        run: uv run pytest tests/ -q
+        run: uv run --with pytest --with pytest-asyncio pytest tests/ -q
 
       - name: Host parity lockstep
         run: bash tests/parity/run_parity.sh
