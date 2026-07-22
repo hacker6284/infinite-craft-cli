@@ -1,28 +1,21 @@
-# Kernel adapters for craft.sudo (JS target), generated at build time by the
-# pinned sudoc binary (see //sudo:sudoc_bin). Same generated-only rationale
-# as //src/infinite_craft_cli:gen_py_sudo -- no glob(["_sudo/**"]) alongside
-# it, to avoid colliding with the gitignored output scripts/generate.sh
-# writes in-place for non-Bazel flows (minify.sh, Pages/publish CI).
-genrule(
-    name = "gen_js_sudo",
-    srcs = ["//sudo:craft.sudo"],
-    outs = [
-        "_sudo/craft.mjs",
-        "_sudo/_craft_impl.mjs",
-        "_sudo/_regex_impl.mjs",
-        "_sudo/_strings_impl.mjs",
-        "_sudo/_sudo_rt.mjs",
-        "_sudo/regex.mjs",
-    ],
-    cmd = "set -euo pipefail; " +
-          "OUTDIR=$(RULEDIR)/_sudo; " +
-          "mkdir -p \"$$OUTDIR\"; " +
-          "$(location //sudo:sudoc_bin) build --target js -o \"$$OUTDIR\" $(location //sudo:craft.sudo)",
-    tools = ["//sudo:sudoc_bin"],
+load("@rules_sudo//:defs.bzl", "sudo_js_library")
+
+# Kernel adapters for craft.sudo (JS target), compiled by rules_sudo's
+# sudo_js_library into a tree-artifact directory named "_sudo". Runtime
+# consumers (trainer.src.mjs via "./_sudo/craft.mjs",
+# tests/parity/run_js.mjs via "../../bookmarklet/_sudo/craft.mjs") resolve
+# this exact path unchanged from the old genrule layout.
+sudo_js_library(
+    name = "_sudo",
+    lib = "//sudo:craft",
+    entry = "craft.sudo",
 )
 
 filegroup(
     name = "trainer_srcs",
-    srcs = ["trainer.src.mjs", ":gen_js_sudo"],
+    srcs = [
+        "trainer.src.mjs",
+        ":_sudo",
+    ],
     visibility = ["//visibility:public"],
 )

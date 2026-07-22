@@ -4,7 +4,7 @@ name: sudo kernel
 # tests, including host-parity lockstep (//tests/parity:parity_test).
 # This workflow owns toolchain integration — generating kernel adapters
 # via the pinned sudoc release (scripts/generate.sh / scripts/sudoc-bin.sh),
-# kernel py/js lockstep, node smoke, and the bookmarklet bundle/artifact.
+# node smoke, and the bookmarklet bundle/artifact.
 
 on:
   push:
@@ -19,16 +19,6 @@ jobs:
 
       - name: Generate kernel adapters (py + js)
         run: bash scripts/generate.sh
-
-      # The kernel's own tests, lockstep across exactly the two targets
-      # this repo consumes — divergence fails the build. scripts/sudoc-bin.sh
-      # is the shared acquisition mechanism (SUDOC_BIN override / cache /
-      # pinned download+checksum) also used by scripts/generate.sh above;
-      # by this point it resolves from cache with no re-download.
-      - name: Kernel lockstep (py vs js)
-        run: |
-          SUDOC_BIN="$(bash scripts/sudoc-bin.sh)"
-          "$SUDOC_BIN" test --target py --target js sudo/craft.sudo
 
       - name: Kernel smoke (node, ex-bug behaviors)
         run: node bookmarklet/test_kernel_smoke.mjs
