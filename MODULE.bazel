@@ -23,11 +23,11 @@ use_repo(pip, "pip")
 bazel_dep(name = "rules_sudo", version = "0.1.0")
 archive_override(
     module_name = "rules_sudo",
-    urls = ["https://github.com/hacker6284/sudocode/releases/download/v0.1.0/rules_sudo-v0.1.0.tar.gz"],
-    sha256 = "dc9d46f803c86c873f0adefb97b43367e05239987f8cf4f85a13fbbae81ef7d5",
+    urls = ["https://github.com/hacker6284/sudocode/releases/download/v0.2.0/rules_sudo-v0.2.1.tar.gz"],
+    sha256 = "2a32f250aca89e8b9502719df738270eeb95f2d90cc73aac0621d8fbfdd66454",
     strip_prefix = "rules_sudo",
 )
 
 sudo = use_extension("@rules_sudo//:extensions.bzl", "sudo")
-sudo.toolchain(version = "v0.1.0")
+sudo.toolchain(version = "v0.2.0")
 use_repo(sudo, "sudo_toolchain")

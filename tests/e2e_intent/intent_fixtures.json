@@ -1,652 +1,694 @@
 {
-  "element_sets": {
-    "main": [
-      [
-        "Water",
-        "💧",
-        false
-      ],
-      [
-        "Fire",
-        "🔥",
-        false
-      ],
-      [
-        "Wind",
-        "🌬",
-        false
-      ],
-      [
-        "Earth",
-        "🌍",
-        false
-      ],
-      [
-        "Steam",
-        "💨",
-        true
-      ],
-      [
-        "Firewall",
-        "🧱",
-        true
-      ],
-      [
-        "Café",
-        "☕",
-        false
-      ],
-      [
-        "C* Algorithm",
-        "🧮",
-        false
-      ],
-      [
-        "Cool Algorithm",
-        "🧠",
-        false
-      ],
-      [
-        "Boring Algorithm",
-        "😴",
-        false
-      ],
-      [
-        "/fire",
-        "",
-        false
-      ],
-      [
-        "fire/",
-        "",
-        false
-      ],
-      [
-        "Apple",
-        "",
-        false
-      ],
-      [
-        "Banana",
-        "",
-        false
-      ],
-      [
-        "Cherry",
-        "",
-        false
-      ],
-      [
-        "Date",
-        "",
-        false
-      ],
-      [
-        "Catfish",
-        "",
-        false
-      ],
-      [
-        "Dogwood",
-        "",
-        false
-      ],
-      [
-        "Bird",
-        "",
-        false
-      ],
-      [
-        "Area 51",
-        "",
-        false
-      ],
-      [
-        "AreaX",
-        "",
-        false
-      ]
-    ],
-    "pending": [
-      [
-        "a^b",
-        "",
-        false
-      ],
-      [
-        "axb",
-        "",
-        false
-      ],
-      [
-        "a$b",
-        "",
-        false
-      ],
-      [
-        "a fire b",
-        "",
-        false
-      ],
-      [
-        "Firewall",
-        "",
-        false
-      ]
-    ]
-  },
-  "scenarios": [
-    {
-      "id": "r1-combine-bang-then-caret",
-      "surface": "search",
-      "status": "active",
-      "ruling": "R1",
-      "elements": "main",
-      "query": "!^steam*",
-      "expect": {
-        "names": [
-          "Firewall"
-        ],
-        "error": null
-      },
-      "note": "'!' then '^': exclude AND only_new both apply"
-    },
-    {
-      "id": "r1-combine-caret-then-bang",
-      "surface": "search",
-      "status": "active",
-      "ruling": "R1",
-      "elements": "main",
-      "query": "^!steam*",
-      "expect": {
-        "names": [
-          "Firewall"
-        ],
-        "error": null
-      },
-      "note": "order-swapped: same combined result as !^steam*"
-    },
-    {
-      "id": "r1-repeated-bang-second-is-literal",
-      "surface": "search",
-      "status": "active",
-      "ruling": "R1",
-      "elements": "main",
-      "query": "!!x",
-      "expect": {
-        "names": [
-          "/fire",
-          "Apple",
-          "Area 51",
-          "AreaX",
-          "Banana",
-          "Bird",
-          "Boring Algorithm",
-          "C* Algorithm",
-          "Café",
-          "Catfish",
-          "Cherry",
-          "Cool Algorithm",
-          "Date",
-          "Dogwood",
-          "Earth",
-          "Fire",
-          "Firewall",
-          "Steam",
-          "Water",
-          "Wind",
-          "fire/"
-        ],
-        "error": null
-      },
-      "note": "second '!' is not consumed as a prefix; it stays in the pattern text"
-    },
-    {
-      "id": "r1-repeated-caret-second-is-literal",
-      "surface": "search",
-      "status": "active",
-      "ruling": "R1",
-      "elements": "main",
-      "query": "^^x",
-      "expect": {
-        "names": [],
-        "error": null
-      },
-      "note": "second '^' is not consumed as a prefix; it stays in the pattern text"
-    },
-    {
-      "id": "r3-bare-pipe-is-literal-substring",
-      "surface": "search",
-      "status": "active",
-      "ruling": "R3",
-      "elements": "main",
-      "query": "fire|water",
-      "expect": {
-        "names": [],
-        "error": null
-      },
-      "note": "no delimiting slashes -> '|' is not alternation, just a literal substring; no hint/error on zero matches"
-    },
-    {
-      "id": "r4-leading-slash-is-substring",
-      "surface": "search",
-      "status": "active",
-      "ruling": "R4",
-      "elements": "main",
-      "query": "/fire",
-      "expect": {
-        "names": [
-          "/fire"
-        ],
-        "error": null
-      },
-      "note": "single leading slash (no closing slash) is a literal substring search, not a regex delimiter"
-    },
-    {
-      "id": "r4-trailing-slash-is-substring",
-      "surface": "search",
-      "status": "active",
-      "ruling": "R4",
-      "elements": "main",
-      "query": "fire/",
-      "expect": {
-        "names": [
-          "fire/"
-        ],
-        "error": null
-      },
-      "note": "single trailing slash is a literal substring search, not a regex delimiter"
-    },
-    {
-      "id": "r4-empty-delimited-regex-matches-all",
-      "surface": "search",
-      "status": "active",
-      "ruling": "R4",
-      "elements": "main",
-      "query": "//",
-      "expect": {
-        "names": [
-          "/fire",
-          "Apple",
-          "Area 51",
-          "AreaX",
-          "Banana",
-          "Bird",
-          "Boring Algorithm",
-          "C* Algorithm",
-          "Café",
-          "Catfish",
-          "Cherry",
-          "Cool Algorithm",
-          "Date",
-          "Dogwood",
-          "Earth",
-          "Fire",
-          "Firewall",
-          "Steam",
-          "Water",
-          "Wind",
-          "fire/"
-        ],
-        "error": null
-      },
-      "note": "'//' is a delimited regex with an empty body; an empty pattern matches every name"
-    },
-    {
-      "id": "r6-uppercase-accent-does-not-fold",
-      "surface": "search",
-      "status": "active",
-      "ruling": "R6",
-      "elements": "main",
-      "query": "CAFÉ",
-      "expect": {
-        "names": [],
-        "error": null
-      },
-      "note": "case-folding is ASCII-only; 'É' is not folded to 'é', so 'CAFÉ' does not match 'Café'"
-    },
-    {
-      "id": "r6-lowercase-accent-matches-verbatim",
-      "surface": "search",
-      "status": "active",
-      "ruling": "R6",
-      "elements": "main",
-      "query": "café",
-      "expect": {
-        "names": [
-          "Café"
-        ],
-        "error": null
-      },
-      "note": "'café' matches 'Café' because only the ASCII 'C' needed folding"
-    },
-    {
-      "id": "r7-literal-star-name-globs",
-      "surface": "search",
-      "status": "active",
-      "ruling": "R7",
-      "elements": "main",
-      "query": "C* Algorithm",
-      "expect": {
-        "names": [
-          "C* Algorithm",
-          "Cool Algorithm"
-        ],
-        "error": null
-      },
-      "note": "unescaped '*' in the query is a glob wildcard: matches the literal 'C* Algorithm' name AND 'Cool Algorithm'"
-    },
-    {
-      "id": "r7-escaped-star-matches-exactly-one",
-      "surface": "search",
-      "status": "active",
-      "ruling": "R7",
-      "elements": "main",
-      "query": "/C\\* Algorithm/",
-      "expect": {
-        "names": [
-          "C* Algorithm"
-        ],
-        "error": null
-      },
-      "note": "delimited regex with an escaped '\\*' matches only the literal 'C* Algorithm' name"
-    },
-    {
-      "id": "pin-query-exactly-512-chars-ok",
-      "surface": "search",
-      "status": "active",
-      "ruling": "pin",
-      "elements": "main",
-      "query": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "expect": {
-        "names": [],
-        "error": null
-      },
-      "note": "512 chars is the maximum allowed query length; no length error"
-    },
-    {
-      "id": "pin-query-513-chars-too-long",
-      "surface": "search",
-      "status": "active",
-      "ruling": "pin",
-      "elements": "main",
-      "query": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "expect": {
-        "names": [],
-        "error": "Query too long (max 512 characters)"
-      },
-      "note": "513 chars exceeds the maximum; exact error message pinned"
-    },
-    {
-      "id": "pin-whitespace-stripped",
-      "surface": "search",
-      "status": "active",
-      "ruling": "pin",
-      "elements": "main",
-      "query": "  fire*  ",
-      "expect": {
-        "names": [
-          "Fire",
-          "Firewall",
-          "fire/"
-        ],
-        "error": null
-      },
-      "note": "leading/trailing whitespace around the whole query is stripped before matching"
-    },
-    {
-      "id": "pin-bare-caret-is-all-first-discoveries",
-      "surface": "search",
-      "status": "active",
-      "ruling": "pin",
-      "elements": "main",
-      "query": "^",
-      "expect": {
-        "names": [
-          "Firewall",
-          "Steam"
-        ],
-        "error": null
-      },
-      "note": "'^' alone (no pattern) returns all first-discovery elements"
-    },
-    {
-      "id": "pin-bare-bang-is-everything",
-      "surface": "search",
-      "status": "active",
-      "ruling": "pin",
-      "elements": "main",
-      "query": "!",
-      "expect": {
-        "names": [
-          "/fire",
-          "Apple",
-          "Area 51",
-          "AreaX",
-          "Banana",
-          "Bird",
-          "Boring Algorithm",
-          "C* Algorithm",
-          "Café",
-          "Catfish",
-          "Cherry",
-          "Cool Algorithm",
-          "Date",
-          "Dogwood",
-          "Earth",
-          "Fire",
-          "Firewall",
-          "Steam",
-          "Water",
-          "Wind",
-          "fire/"
-        ],
-        "error": null
-      },
-      "note": "'!' alone (no pattern) returns every element (exclude nothing)"
-    },
-    {
-      "id": "pin-bare-star-glob-matches-all",
-      "surface": "search",
-      "status": "active",
-      "ruling": "pin",
-      "elements": "main",
-      "query": "*",
-      "expect": {
-        "names": [
-          "/fire",
-          "Apple",
-          "Area 51",
-          "AreaX",
-          "Banana",
-          "Bird",
-          "Boring Algorithm",
-          "C* Algorithm",
-          "Café",
-          "Catfish",
-          "Cherry",
-          "Cool Algorithm",
-          "Date",
-          "Dogwood",
-          "Earth",
-          "Fire",
-          "Firewall",
-          "Steam",
-          "Water",
-          "Wind",
-          "fire/"
-        ],
-        "error": null
-      },
-      "note": "'*' alone is a glob wildcard that matches every name"
-    },
-    {
-      "id": "pin-character-class-glob",
-      "surface": "search",
-      "status": "active",
-      "ruling": "pin",
-      "elements": "main",
-      "query": "[a-c]*",
-      "expect": {
-        "names": [
-          "Apple",
-          "Area 51",
-          "AreaX",
-          "Banana",
-          "Bird",
-          "Boring Algorithm",
-          "C* Algorithm",
-          "Café",
-          "Catfish",
-          "Cherry",
-          "Cool Algorithm"
-        ],
-        "error": null
-      },
-      "note": "fnmatch-style character-class glob"
-    },
-    {
-      "id": "pin-case-insensitive-substring",
-      "surface": "search",
-      "status": "active",
-      "ruling": "pin",
-      "elements": "main",
-      "query": "water",
-      "expect": {
-        "names": [
-          "Water"
-        ],
-        "error": null
-      },
-      "note": "plain substring search is case-insensitive"
-    },
-    {
-      "id": "pin-anchored-regex",
-      "surface": "search",
-      "status": "active",
-      "ruling": "pin",
-      "elements": "main",
-      "query": "/^fi/",
-      "expect": {
-        "names": [
-          "Fire",
-          "Firewall",
-          "fire/"
-        ],
-        "error": null
-      },
-      "note": "delimited regex with a leading anchor at position 0"
-    },
-    {
-      "id": "pin-alternation",
-      "surface": "search",
-      "status": "active",
-      "ruling": "pin",
-      "elements": "main",
-      "query": "/cat|dog/",
-      "expect": {
-        "names": [
-          "Catfish",
-          "Dogwood"
-        ],
-        "error": null
-      },
-      "note": "delimited regex real alternation (DIVERGENCES.md ruling 7)"
-    },
-    {
-      "id": "pin-digit-escape",
-      "surface": "search",
-      "status": "active",
-      "ruling": "pin",
-      "elements": "main",
-      "query": "/\\d+/",
-      "expect": {
-        "names": [
-          "Area 51"
-        ],
-        "error": null
-      },
-      "note": "delimited regex backslash digit-class escape"
-    },
-    {
-      "id": "pin-validate-combined-prefix-accepted",
-      "surface": "validate",
-      "status": "active",
-      "ruling": "R1",
-      "validator": "command_line",
-      "line": "/permute !^steam*",
-      "expect": {
-        "error": null
-      },
-      "note": "combined prefixes reach validate_command_line -> validate_query_at_enqueue without error"
-    },
-    {
-      "id": "pin-validate-invalid-regex-rejected",
-      "surface": "validate",
-      "status": "active",
-      "ruling": "pin",
-      "validator": "command_line",
-      "line": "/permute /[abc/",
-      "expect": {
-        "error": "  Invalid regex pattern"
-      },
-      "note": "invalid regex body is rejected at enqueue time with the exact kernel message"
-    },
-    {
-      "id": "pin-validate-query-513-too-long",
-      "surface": "validate",
-      "status": "active",
-      "ruling": "pin",
-      "validator": "command_line",
-      "line": "/permute aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "expect": {
-        "error": "  Query too long (max 512 characters)"
-      },
-      "note": "over-length query is rejected at enqueue time with the exact kernel message"
-    },
-    {
-      "id": "pending-mid-pattern-caret-anchor",
-      "surface": "search",
-      "status": "pending-v0.2.0",
-      "ruling": "R2",
-      "elements": "pending",
-      "query": "/a^b/",
-      "expect": null,
-      "note": "owner ruling: a mid-pattern '^' should behave as a real anchor (unsatisfiable after consuming 'a'), matching nothing — current engine instead treats it as a literal '^' character",
-      "skip_reason": "pending sudoc v0.2.0 regex engine work (owner ruling R2, mid-pattern anchors) — current kernel treats mid-pattern '^' as a literal character, not an anchor"
-    },
-    {
-      "id": "pending-mid-pattern-dollar-anchor",
-      "surface": "search",
-      "status": "pending-v0.2.0",
-      "ruling": "R2",
-      "elements": "pending",
-      "query": "/a$b/",
-      "expect": null,
-      "note": "owner ruling: a mid-pattern '$' should behave as a real anchor, matching nothing — current engine instead treats it as a literal '$' character",
-      "skip_reason": "pending sudoc v0.2.0 regex engine work (owner ruling R2, mid-pattern anchors) — current kernel treats mid-pattern '$' as a literal character, not an anchor"
-    },
-    {
-      "id": "pending-word-boundary-positive",
-      "surface": "search",
-      "status": "pending-v0.2.0",
-      "ruling": "R5",
-      "elements": "pending",
-      "query": "/\\bfire\\b/",
-      "expect": null,
-      "note": "owner ruling: \\b should match the word-boundary-delimited 'fire' in 'a fire b'",
-      "skip_reason": "pending sudoc v0.2.0 regex engine work (owner ruling R5, \\b word boundary) — current kernel rejects \\b as 'Invalid regex pattern' (unsupported escape)"
-    },
-    {
-      "id": "pending-word-boundary-negative",
-      "surface": "search",
-      "status": "pending-v0.2.0",
-      "ruling": "R5",
-      "elements": "pending",
-      "query": "/\\bfire\\b/",
-      "expect": null,
-      "note": "owner ruling: \\b should NOT match 'fire' inside 'Firewall' (no boundary after 'fire')",
-      "skip_reason": "pending sudoc v0.2.0 regex engine work (owner ruling R5, \\b word boundary) — current kernel rejects \\b as 'Invalid regex pattern' (unsupported escape)"
-    }
+ "element_sets": {
+  "main": [
+   [
+    "Water",
+    "💧",
+    false
+   ],
+   [
+    "Fire",
+    "🔥",
+    false
+   ],
+   [
+    "Wind",
+    "🌬",
+    false
+   ],
+   [
+    "Earth",
+    "🌍",
+    false
+   ],
+   [
+    "Steam",
+    "💨",
+    true
+   ],
+   [
+    "Firewall",
+    "🧱",
+    true
+   ],
+   [
+    "Café",
+    "☕",
+    false
+   ],
+   [
+    "C* Algorithm",
+    "🧮",
+    false
+   ],
+   [
+    "Cool Algorithm",
+    "🧠",
+    false
+   ],
+   [
+    "Boring Algorithm",
+    "😴",
+    false
+   ],
+   [
+    "/fire",
+    "",
+    false
+   ],
+   [
+    "fire/",
+    "",
+    false
+   ],
+   [
+    "Apple",
+    "",
+    false
+   ],
+   [
+    "Banana",
+    "",
+    false
+   ],
+   [
+    "Cherry",
+    "",
+    false
+   ],
+   [
+    "Date",
+    "",
+    false
+   ],
+   [
+    "Catfish",
+    "",
+    false
+   ],
+   [
+    "Dogwood",
+    "",
+    false
+   ],
+   [
+    "Bird",
+    "",
+    false
+   ],
+   [
+    "Area 51",
+    "",
+    false
+   ],
+   [
+    "AreaX",
+    "",
+    false
+   ]
+  ],
+  "pending": [
+   [
+    "a^b",
+    "",
+    false
+   ],
+   [
+    "axb",
+    "",
+    false
+   ],
+   [
+    "a$b",
+    "",
+    false
+   ],
+   [
+    "a fire b",
+    "",
+    false
+   ],
+   [
+    "Firewall",
+    "",
+    false
+   ]
+  ],
+  "anchors_wb": [
+   [
+    "a^b",
+    "",
+    false
+   ],
+   [
+    "Fire",
+    "🔥",
+    true
+   ],
+   [
+    "Fire Pit",
+    "",
+    false
+   ],
+   [
+    "Campfire",
+    "",
+    false
+   ],
+   [
+    "Misfired",
+    "",
+    false
+   ]
   ]
+ },
+ "scenarios": [
+  {
+   "id": "r1-combine-bang-then-caret",
+   "surface": "search",
+   "status": "active",
+   "ruling": "R1",
+   "elements": "main",
+   "query": "!^steam*",
+   "expect": {
+    "names": [
+     "Firewall"
+    ],
+    "error": null
+   },
+   "note": "'!' then '^': exclude AND only_new both apply"
+  },
+  {
+   "id": "r1-combine-caret-then-bang",
+   "surface": "search",
+   "status": "active",
+   "ruling": "R1",
+   "elements": "main",
+   "query": "^!steam*",
+   "expect": {
+    "names": [
+     "Firewall"
+    ],
+    "error": null
+   },
+   "note": "order-swapped: same combined result as !^steam*"
+  },
+  {
+   "id": "r1-repeated-bang-second-is-literal",
+   "surface": "search",
+   "status": "active",
+   "ruling": "R1",
+   "elements": "main",
+   "query": "!!x",
+   "expect": {
+    "names": [
+     "/fire",
+     "Apple",
+     "Area 51",
+     "AreaX",
+     "Banana",
+     "Bird",
+     "Boring Algorithm",
+     "C* Algorithm",
+     "Café",
+     "Catfish",
+     "Cherry",
+     "Cool Algorithm",
+     "Date",
+     "Dogwood",
+     "Earth",
+     "Fire",
+     "Firewall",
+     "Steam",
+     "Water",
+     "Wind",
+     "fire/"
+    ],
+    "error": null
+   },
+   "note": "second '!' is not consumed as a prefix; it stays in the pattern text"
+  },
+  {
+   "id": "r1-repeated-caret-second-is-literal",
+   "surface": "search",
+   "status": "active",
+   "ruling": "R1",
+   "elements": "main",
+   "query": "^^x",
+   "expect": {
+    "names": [],
+    "error": null
+   },
+   "note": "second '^' is not consumed as a prefix; it stays in the pattern text"
+  },
+  {
+   "id": "r3-bare-pipe-is-literal-substring",
+   "surface": "search",
+   "status": "active",
+   "ruling": "R3",
+   "elements": "main",
+   "query": "fire|water",
+   "expect": {
+    "names": [],
+    "error": null
+   },
+   "note": "no delimiting slashes -> '|' is not alternation, just a literal substring; no hint/error on zero matches"
+  },
+  {
+   "id": "r4-leading-slash-is-substring",
+   "surface": "search",
+   "status": "active",
+   "ruling": "R4",
+   "elements": "main",
+   "query": "/fire",
+   "expect": {
+    "names": [
+     "/fire"
+    ],
+    "error": null
+   },
+   "note": "single leading slash (no closing slash) is a literal substring search, not a regex delimiter"
+  },
+  {
+   "id": "r4-trailing-slash-is-substring",
+   "surface": "search",
+   "status": "active",
+   "ruling": "R4",
+   "elements": "main",
+   "query": "fire/",
+   "expect": {
+    "names": [
+     "fire/"
+    ],
+    "error": null
+   },
+   "note": "single trailing slash is a literal substring search, not a regex delimiter"
+  },
+  {
+   "id": "r4-empty-delimited-regex-matches-all",
+   "surface": "search",
+   "status": "active",
+   "ruling": "R4",
+   "elements": "main",
+   "query": "//",
+   "expect": {
+    "names": [
+     "/fire",
+     "Apple",
+     "Area 51",
+     "AreaX",
+     "Banana",
+     "Bird",
+     "Boring Algorithm",
+     "C* Algorithm",
+     "Café",
+     "Catfish",
+     "Cherry",
+     "Cool Algorithm",
+     "Date",
+     "Dogwood",
+     "Earth",
+     "Fire",
+     "Firewall",
+     "Steam",
+     "Water",
+     "Wind",
+     "fire/"
+    ],
+    "error": null
+   },
+   "note": "'//' is a delimited regex with an empty body; an empty pattern matches every name"
+  },
+  {
+   "id": "r6-uppercase-accent-does-not-fold",
+   "surface": "search",
+   "status": "active",
+   "ruling": "R6",
+   "elements": "main",
+   "query": "CAFÉ",
+   "expect": {
+    "names": [],
+    "error": null
+   },
+   "note": "case-folding is ASCII-only; 'É' is not folded to 'é', so 'CAFÉ' does not match 'Café'"
+  },
+  {
+   "id": "r6-lowercase-accent-matches-verbatim",
+   "surface": "search",
+   "status": "active",
+   "ruling": "R6",
+   "elements": "main",
+   "query": "café",
+   "expect": {
+    "names": [
+     "Café"
+    ],
+    "error": null
+   },
+   "note": "'café' matches 'Café' because only the ASCII 'C' needed folding"
+  },
+  {
+   "id": "r7-literal-star-name-globs",
+   "surface": "search",
+   "status": "active",
+   "ruling": "R7",
+   "elements": "main",
+   "query": "C* Algorithm",
+   "expect": {
+    "names": [
+     "C* Algorithm",
+     "Cool Algorithm"
+    ],
+    "error": null
+   },
+   "note": "unescaped '*' in the query is a glob wildcard: matches the literal 'C* Algorithm' name AND 'Cool Algorithm'"
+  },
+  {
+   "id": "r7-escaped-star-matches-exactly-one",
+   "surface": "search",
+   "status": "active",
+   "ruling": "R7",
+   "elements": "main",
+   "query": "/C\\* Algorithm/",
+   "expect": {
+    "names": [
+     "C* Algorithm"
+    ],
+    "error": null
+   },
+   "note": "delimited regex with an escaped '\\*' matches only the literal 'C* Algorithm' name"
+  },
+  {
+   "id": "pin-query-exactly-512-chars-ok",
+   "surface": "search",
+   "status": "active",
+   "ruling": "pin",
+   "elements": "main",
+   "query": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "expect": {
+    "names": [],
+    "error": null
+   },
+   "note": "512 chars is the maximum allowed query length; no length error"
+  },
+  {
+   "id": "pin-query-513-chars-too-long",
+   "surface": "search",
+   "status": "active",
+   "ruling": "pin",
+   "elements": "main",
+   "query": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "expect": {
+    "names": [],
+    "error": "Query too long (max 512 characters)"
+   },
+   "note": "513 chars exceeds the maximum; exact error message pinned"
+  },
+  {
+   "id": "pin-whitespace-stripped",
+   "surface": "search",
+   "status": "active",
+   "ruling": "pin",
+   "elements": "main",
+   "query": "  fire*  ",
+   "expect": {
+    "names": [
+     "Fire",
+     "Firewall",
+     "fire/"
+    ],
+    "error": null
+   },
+   "note": "leading/trailing whitespace around the whole query is stripped before matching"
+  },
+  {
+   "id": "pin-bare-caret-is-all-first-discoveries",
+   "surface": "search",
+   "status": "active",
+   "ruling": "pin",
+   "elements": "main",
+   "query": "^",
+   "expect": {
+    "names": [
+     "Firewall",
+     "Steam"
+    ],
+    "error": null
+   },
+   "note": "'^' alone (no pattern) returns all first-discovery elements"
+  },
+  {
+   "id": "pin-bare-bang-is-everything",
+   "surface": "search",
+   "status": "active",
+   "ruling": "pin",
+   "elements": "main",
+   "query": "!",
+   "expect": {
+    "names": [
+     "/fire",
+     "Apple",
+     "Area 51",
+     "AreaX",
+     "Banana",
+     "Bird",
+     "Boring Algorithm",
+     "C* Algorithm",
+     "Café",
+     "Catfish",
+     "Cherry",
+     "Cool Algorithm",
+     "Date",
+     "Dogwood",
+     "Earth",
+     "Fire",
+     "Firewall",
+     "Steam",
+     "Water",
+     "Wind",
+     "fire/"
+    ],
+    "error": null
+   },
+   "note": "'!' alone (no pattern) returns every element (exclude nothing)"
+  },
+  {
+   "id": "pin-bare-star-glob-matches-all",
+   "surface": "search",
+   "status": "active",
+   "ruling": "pin",
+   "elements": "main",
+   "query": "*",
+   "expect": {
+    "names": [
+     "/fire",
+     "Apple",
+     "Area 51",
+     "AreaX",
+     "Banana",
+     "Bird",
+     "Boring Algorithm",
+     "C* Algorithm",
+     "Café",
+     "Catfish",
+     "Cherry",
+     "Cool Algorithm",
+     "Date",
+     "Dogwood",
+     "Earth",
+     "Fire",
+     "Firewall",
+     "Steam",
+     "Water",
+     "Wind",
+     "fire/"
+    ],
+    "error": null
+   },
+   "note": "'*' alone is a glob wildcard that matches every name"
+  },
+  {
+   "id": "pin-character-class-glob",
+   "surface": "search",
+   "status": "active",
+   "ruling": "pin",
+   "elements": "main",
+   "query": "[a-c]*",
+   "expect": {
+    "names": [
+     "Apple",
+     "Area 51",
+     "AreaX",
+     "Banana",
+     "Bird",
+     "Boring Algorithm",
+     "C* Algorithm",
+     "Café",
+     "Catfish",
+     "Cherry",
+     "Cool Algorithm"
+    ],
+    "error": null
+   },
+   "note": "fnmatch-style character-class glob"
+  },
+  {
+   "id": "pin-case-insensitive-substring",
+   "surface": "search",
+   "status": "active",
+   "ruling": "pin",
+   "elements": "main",
+   "query": "water",
+   "expect": {
+    "names": [
+     "Water"
+    ],
+    "error": null
+   },
+   "note": "plain substring search is case-insensitive"
+  },
+  {
+   "id": "pin-anchored-regex",
+   "surface": "search",
+   "status": "active",
+   "ruling": "pin",
+   "elements": "main",
+   "query": "/^fi/",
+   "expect": {
+    "names": [
+     "Fire",
+     "Firewall",
+     "fire/"
+    ],
+    "error": null
+   },
+   "note": "delimited regex with a leading anchor at position 0"
+  },
+  {
+   "id": "pin-alternation",
+   "surface": "search",
+   "status": "active",
+   "ruling": "pin",
+   "elements": "main",
+   "query": "/cat|dog/",
+   "expect": {
+    "names": [
+     "Catfish",
+     "Dogwood"
+    ],
+    "error": null
+   },
+   "note": "delimited regex real alternation (DIVERGENCES.md ruling 7)"
+  },
+  {
+   "id": "pin-digit-escape",
+   "surface": "search",
+   "status": "active",
+   "ruling": "pin",
+   "elements": "main",
+   "query": "/\\d+/",
+   "expect": {
+    "names": [
+     "Area 51"
+    ],
+    "error": null
+   },
+   "note": "delimited regex backslash digit-class escape"
+  },
+  {
+   "id": "pin-validate-combined-prefix-accepted",
+   "surface": "validate",
+   "status": "active",
+   "ruling": "R1",
+   "validator": "command_line",
+   "line": "/permute !^steam*",
+   "expect": {
+    "error": null
+   },
+   "note": "combined prefixes reach validate_command_line -> validate_query_at_enqueue without error"
+  },
+  {
+   "id": "pin-validate-invalid-regex-rejected",
+   "surface": "validate",
+   "status": "active",
+   "ruling": "pin",
+   "validator": "command_line",
+   "line": "/permute /[abc/",
+   "expect": {
+    "error": "  Invalid regex pattern"
+   },
+   "note": "invalid regex body is rejected at enqueue time with the exact kernel message"
+  },
+  {
+   "id": "pin-validate-query-513-too-long",
+   "surface": "validate",
+   "status": "active",
+   "ruling": "pin",
+   "validator": "command_line",
+   "line": "/permute aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "expect": {
+    "error": "  Query too long (max 512 characters)"
+   },
+   "note": "over-length query is rejected at enqueue time with the exact kernel message"
+  },
+  {
+   "id": "r2-mid-caret-anchor",
+   "surface": "search",
+   "status": "active",
+   "ruling": "R2",
+   "elements": "anchors_wb",
+   "query": "/a^b/",
+   "expect": {
+    "names": [],
+    "error": null
+   },
+   "note": "R2: mid-pattern ^ is a real anchor — matches nothing, even the literal name a^b"
+  },
+  {
+   "id": "r2-mid-dollar-anchor",
+   "surface": "search",
+   "status": "active",
+   "ruling": "R2",
+   "elements": "anchors_wb",
+   "query": "/a$b/",
+   "expect": {
+    "names": [],
+    "error": null
+   },
+   "note": "R2: mid-pattern $ is a real anchor — matches nothing"
+  },
+  {
+   "id": "r5-word-boundary-whole",
+   "surface": "search",
+   "status": "active",
+   "ruling": "R5",
+   "elements": "anchors_wb",
+   "query": "/\\bfire\\b/",
+   "expect": {
+    "names": [
+     "Fire",
+     "Fire Pit"
+    ],
+    "error": null
+   },
+   "note": "R5: \\b matches whole-word fire (Fire, Fire Pit) case-insensitively"
+  },
+  {
+   "id": "r5-word-boundary-trailing",
+   "surface": "search",
+   "status": "active",
+   "ruling": "R5",
+   "elements": "anchors_wb",
+   "query": "/fire\\b/",
+   "expect": {
+    "names": [
+     "Campfire",
+     "Fire",
+     "Fire Pit"
+    ],
+    "error": null
+   },
+   "note": "R5: trailing \\b — Campfire ends a word with fire; Misfired does not"
+  }
+ ]
 }

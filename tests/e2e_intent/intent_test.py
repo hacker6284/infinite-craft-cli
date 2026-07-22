@@ -83,6 +83,6 @@ def test_active_scenario(scenario: dict) -> None:
         pytest.fail(f"unknown surface: {scenario['surface']!r}")
 
 
-@pytest.mark.parametrize("scenario", PENDING, ids=_id)
+@pytest.mark.parametrize("scenario", PENDING, ids=[s["id"] for s in PENDING])
 def test_pending_scenario(scenario: dict) -> None:
     pytest.skip(f"{scenario['ruling']}: {scenario['skip_reason']}")
