@@ -393,15 +393,28 @@ func export_elements(elements: List<Element>, recipes: Map<text, List<(text, tex
 // ---------------------------------------------------------------------------
 
 export func parse_query_filter(query: text) -> (text, bool, bool)
+    // owner ruling 2026-07-22: '!' (exclude) and '^' (only_new) prefixes
+    // combine — both may appear, in either order ('!^x' and '^!x' both
+    // set exclude=true and only_new=true). A repeated prefix consumes
+    // only its first occurrence; the second instance stays in the
+    // pattern text ('!!x' -> pattern "!x", still exclude=true).
     q = strip_spaces(query)
     exclude = false
     only_new = false
-    if q.length > 0 and q[0] == '!'
-        exclude = true
-        q = strip_prefix_one(q)
-    else if q.length > 0 and q[0] == '^'
-        only_new = true
-        q = strip_prefix_one(q)
+    took_bang = false
+    took_caret = false
+    keep_going = true
+    while keep_going
+        if q.length > 0 and q[0] == '!' and not took_bang
+            exclude = true
+            took_bang = true
+            q = strip_prefix_one(q)
+        else if q.length > 0 and q[0] == '^' and not took_caret
+            only_new = true
+            took_caret = true
+            q = strip_prefix_one(q)
+        else
+            keep_going = false
     return (q, exclude, only_new)
 
 export func is_delimited_regex(pattern: text) -> bool
@@ -420,8 +433,9 @@ export func element_matches_pattern(name: text, pattern: text) -> (bool, Option<
         return (false, None)
     if is_delimited_regex(pattern)
         body = text_slice(pattern, 1, pattern.length - 1)
-        if body.length == 0
-            return (false, None)
+        // owner ruling 2026-07-22 (R4): an empty regex body ("//") is
+        // a valid empty pattern that matches every name — standard
+        // empty-regex semantics, not a special "no match" case.
         match regex.regex_search(body, name, true)
             case Err(msg)
                 assert msg.length >= 0
@@ -924,6 +938,25 @@ test "parse_query_filter parity"
     assert p == "water"
     assert not ex
     assert not on
+    // owner ruling 2026-07-22: prefixes combine, either order
+    p, ex, on = parse_query_filter("!^steam*")
+    assert p == "steam*"
+    assert ex
+    assert on
+    p, ex, on = parse_query_filter("^!steam*")
+    assert p == "steam*"
+    assert ex
+    assert on
+    // owner ruling 2026-07-22: repeated prefix consumes only the first
+    // occurrence; the second stays in the pattern text
+    p, ex, on = parse_query_filter("!!x")
+    assert p == "!x"
+    assert ex
+    assert not on
+    p, ex, on = parse_query_filter("^^x")
+    assert p == "^x"
+    assert not ex
+    assert on
 
 test "match_elements parity fixture"
     els = parity_fixture()
@@ -957,6 +990,16 @@ test "match_elements parity fixture"
     assert names.has("Fire")
     assert names.has("Firewall")
     assert not names.has("Water")
+    // owner ruling 2026-07-22: combined prefixes work end-to-end through
+    // match_elements too (exclude AND only_new applied together)
+    names, err = match_names(els, "!^wind")
+    assert err.is_none()
+    assert names.has("Firewall")
+    assert names.items().length == 1
+    names, err = match_names(els, "^!wind")
+    assert err.is_none()
+    assert names.has("Firewall")
+    assert names.items().length == 1
 
 test "parse_two_elements and cross helpers"
     r = parse_two_elements("Water Fire")
@@ -1116,9 +1159,12 @@ test "element_matches_pattern branches"
     assert err.unwrap() == "Invalid regex pattern"
     assert not m
     m, err = element_matches_pattern("//", "//")
-    // body empty after strip delimiters
+    // owner ruling 2026-07-22 (R4): empty regex body matches every name
     assert err.is_none()
-    assert not m
+    assert m
+    m, err = element_matches_pattern("Anything At All", "//")
+    assert err.is_none()
+    assert m
 
 test "match_elements exclude only_new error abort"
     els = parity_fixture()

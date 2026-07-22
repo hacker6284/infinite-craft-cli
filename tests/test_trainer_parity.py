@@ -300,16 +300,29 @@ def validate_command_line_js_mirror(line: str) -> str | None:
 
 
 def parse_query_filter_js_mirror(query: str) -> dict[str, str | bool]:
-    """Python mirror of trainer.js parseQueryFilter()."""
+    """Python mirror of trainer.js parseQueryFilter().
+
+    owner ruling 2026-07-22: '!' (exclude) and '^' (only_new) prefixes
+    combine — both may appear, in either order. A repeated prefix
+    consumes only its first occurrence; the second instance stays in
+    the returned pattern text.
+    """
     q = query.strip()
     exclude = False
     only_new = False
-    if q.startswith("!"):
-        exclude = True
-        q = q[1:]
-    elif q.startswith("^"):
-        only_new = True
-        q = q[1:]
+    took_bang = False
+    took_caret = False
+    while True:
+        if q.startswith("!") and not took_bang:
+            exclude = True
+            took_bang = True
+            q = q[1:]
+        elif q.startswith("^") and not took_caret:
+            only_new = True
+            took_caret = True
+            q = q[1:]
+        else:
+            break
     return {"pattern": q, "exclude": exclude, "onlyNew": only_new}
 
 
@@ -423,6 +436,12 @@ class TestQueryFilterParity:
             ("^", "", False, True),
             ("/^fi/", "/^fi/", False, False),
             ("water", "water", False, False),
+            # owner ruling 2026-07-22: prefixes combine, either order
+            ("!^steam*", "steam*", True, True),
+            ("^!steam*", "steam*", True, True),
+            # repeated prefix: second occurrence stays in the pattern
+            ("!!x", "!x", True, False),
+            ("^^x", "^x", False, True),
         ],
     )
     def test_parse_query_filter_matches_js_mirror(

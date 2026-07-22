@@ -1,0 +1,12 @@
+load("@rules_python//python:defs.bzl", "py_test")
+
+py_test(
+    name = "intent_test",
+    srcs = ["intent_test.py"],
+    main = "intent_test.py",
+    data = ["intent_fixtures.json"],
+    deps = [
+        "//src/infinite_craft_cli",
+        "@pip//pytest",
+    ],
+)

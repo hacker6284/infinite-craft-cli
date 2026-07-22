@@ -106,11 +106,14 @@ class TestMatchElements:
         assert matches == []
         assert err == "Invalid regex pattern"
 
-    def test_empty_regex_no_match(self, mock_storage_with_extras):
+    def test_empty_regex_matches_all(self, mock_storage_with_extras):
+        """owner ruling 2026-07-22 (R4): an empty regex body ("//") matches
+        every element, not zero."""
         from infinite_craft_cli.cli import _match_elements
         matches, err = _match_elements(mock_storage_with_extras, "//")
-        assert matches == []
         assert err is None
+        assert len(matches) == len(mock_storage_with_extras.get_all())
+
 
     def test_first_discovery_filter(self, mock_storage_with_extras):
         from infinite_craft_cli.cli import _match_elements
