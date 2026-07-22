@@ -14,4 +14,7 @@ sudo_lockstep_test(
         "py",
         "js",
     ],
+    # 18 tests x 2 targets runs ~3.5min locally and ~2x that on CI —
+    # the default moderate (300s) timeout is exactly the wrong size.
+    timeout = "long",
 )

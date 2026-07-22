@@ -2487,7 +2487,7 @@ def do_help() -> str:
   Query syntax (/search, /with, /permute, /permutate, /cross, /exhaust, shorthands):
     substring                   Default: case-insensitive substring
     * ? []                      fnmatch wildcards (e.g. fire*, mu?)
-    /pattern/                   Regex, case-insensitive (| alternation, \d escapes)
+    /pattern/                   Regex, case-insensitive (| alternation, \\d escapes)
     !<query>                    Exclude matches (e.g. !fire* = everything except fire*)
     !                           All elements (exclude nothing)
     ^<query>                    First discoveries only (e.g. ^fire* = new fire* matches)
