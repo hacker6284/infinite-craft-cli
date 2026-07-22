@@ -67,7 +67,7 @@ def test_manifest_fetches_hosted_trainer() -> None:
     assert content_script["js"] == ["loader.js"]
     assert content_script["matches"] == ["https://neal.fun/infinite-craft/*"]
     assert content_script["run_at"] == "document_idle"
-    assert manifest["version"] == "1.3.1"
+    assert manifest["version"] == "1.5.0"
 
 
 def test_loader_contract() -> None:
