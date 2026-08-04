@@ -22,14 +22,26 @@ jobs:
       - name: Build wheel
         run: bazel build //release:wheel.dist
 
-      - name: Stage wheel (refuse an unversioned build)
+      - name: Stage wheel (refuse a mismatched version)
         run: |
           mkdir -p dist
           cp bazel-bin/release/wheel_dist/*.whl dist/
-          # A tagless/shallow checkout stamps 0.0.0 (workspace_status.sh); never
-          # publish that. On a real tag push the version is X.Y.Z.
-          if ls dist/*-0.0.0-*.whl >/dev/null 2>&1; then
-            echo "::error::wheel version is 0.0.0 — refusing to publish an unversioned build"
+          # This workflow only triggers on tag pushes (v*), so the intended
+          # version is known exactly — require the staged wheel to match it.
+          # A tagless/shallow checkout would stamp 0.0.0 (workspace_status.sh);
+          # this also catches that, plus any other stamping mismatch.
+          EXPECTED="${GITHUB_REF_NAME#v}"
+          WHEEL="$(ls dist/*-py3-none-any.whl 2>/dev/null | head -n1)"
+          if [ -z "$WHEEL" ]; then
+            echo "::error::no wheel found in dist/ — build step did not produce a wheel"
+            exit 1
+          fi
+          WHEEL_BASENAME="$(basename "$WHEEL")"
+          # Filename shape: infinite_craft_cli-<version>-py3-none-any.whl
+          ACTUAL="${WHEEL_BASENAME#infinite_craft_cli-}"
+          ACTUAL="${ACTUAL%-py3-none-any.whl}"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::wheel version '${ACTUAL}' does not match tag version '${EXPECTED}' — refusing to publish"
             exit 1
           fi
 

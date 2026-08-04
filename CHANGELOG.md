@@ -11,6 +11,10 @@
   longer committed to the repo. Host tests read the built bundle via a
   runfiles locator (`tests/artifact_paths.py`) instead of a fixed path. CI
   (publish/pages/test/release-dry-run) now calls Bazel directly.
+- **PyPI publishing is now wheel-only.** `publish.yml` publishes a single
+  pure `py3-none-any` wheel built by Bazel `//release:wheel`. The previous
+  hatchling-based `python -m build` also produced a source distribution
+  (sdist); that sdist is intentionally no longer built or published.
 
 ### Removed
 - The standalone `sudoc` toolchain path: `scripts/generate.sh`,

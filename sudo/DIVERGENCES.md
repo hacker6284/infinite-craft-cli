@@ -117,9 +117,13 @@ obsolete: `regex.sudo` implements real alternation (`|` splits the pattern —
 or a group body — into branches via the engine's native NFA `Split`
 fan-out). `/cat|dog/` is a valid kernel regex meaning "cat" OR "dog", not
 the seven-character literal run `"cat|dog"`. This is a deliberate widening
-beyond upstream, not a compatibility requirement — the CLI and JS trainer
-still hard-reject any `|` as "too complex" and would need separate porting
-to gain this. Test coverage: `"element_matches_pattern real alternation cat
+beyond upstream, not a compatibility requirement — upstream v1.4.2's frozen
+hand-written reference implementations (the parity oracle this repo diffs
+against) still hard-reject any `|` as "too complex". This repo's own
+kernel-backed CLI and JS trainer are NOT among those rejectors: they
+inherit `regex.sudo`'s real alternation directly, with no separate porting
+needed (see `tests/test_bulk.py::TestDoCross::test_complex_regex_cross_combines_matching_elements`,
+which passes `/(a|aa)+/` end-to-end through `do_cross`). Test coverage: `"element_matches_pattern real alternation cat
 or dog"` — `/cat|dog/` matches `"Watchdog"` (contains "dog"), does not match
 `"Elephant"` (contains neither). `"ex-gate pathological patterns now work"`
 also covers `/a|b/` now matching bare `"a"` and `"b"` (previously
