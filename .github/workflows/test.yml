@@ -12,10 +12,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-
       - uses: bazel-contrib/setup-bazel@0.14.0
         with:
           bazelisk-cache: true
@@ -24,3 +20,6 @@ jobs:
 
       - name: Run tests
         run: bazel test //... --test_output=all --verbose_failures
+
+      - name: Build release artifacts
+        run: bazel build //release:wheel //bookmarklet:site

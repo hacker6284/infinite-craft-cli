@@ -16,15 +16,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Generate kernel adapters
-        run: bash scripts/generate.sh
-      - uses: actions/setup-python@v5
+      - uses: bazel-contrib/setup-bazel@0.14.0
         with:
-          python-version: "3.12"
-      - name: Build package
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}
+          repository-cache: true
+      - name: Build wheel
+        run: bazel build //release:wheel.dist
+      - name: Stage wheel + twine check
         run: |
-          pip install build twine
-          python -m build
+          mkdir -p dist
+          cp bazel-bin/release/wheel_dist/*.whl dist/
+          pip install twine
           twine check dist/*
       - name: Wheel actually contains the kernel and the CLI runs
         run: |
@@ -41,25 +44,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Generate kernel adapters
-        run: bash scripts/generate.sh
-      - name: Bundle trainer
-        run: bash bookmarklet/minify.sh
+      - uses: bazel-contrib/setup-bazel@0.14.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}
+          repository-cache: true
+      - name: Build site
+        run: bazel build //bookmarklet:site
       - name: Site sanity (what a deploy would ship)
         run: |
-          node --check bookmarklet/trainer.js
-          node --check bookmarklet/trainer.min.js
+          node --check bazel-bin/bookmarklet/site/trainer.js
+          node --check bazel-bin/bookmarklet/site/trainer.min.js
           for m in __ICTrainer ict-trainer-ready ict-container; do
-            grep -q "$m" bookmarklet/trainer.js || { echo "missing marker $m"; exit 1; }
+            grep -q "$m" bazel-bin/bookmarklet/site/trainer.js || { echo "missing marker $m"; exit 1; }
           done
-          node bookmarklet/test_kernel_smoke.mjs
       - name: Keep site for inspection
         uses: actions/upload-artifact@v4
         with:
           name: pages-dry-run-site
-          path: |
-            bookmarklet/trainer.js
-            bookmarklet/trainer.min.js
+          path: bazel-bin/bookmarklet/site
 
   release-notes-rehearsal:
     if: inputs.changelog_version != ''

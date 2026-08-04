@@ -26,18 +26,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: bazel-contrib/setup-bazel@0.14.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}
+          repository-cache: true
+
       # The deployed site is built from source every time — the sudo kernel
-      # is transpiled (via the pinned sudoc release, scripts/generate.sh)
-      # and the trainer re-bundled, so Pages can never serve an artifact
-      # that drifted from sudo/craft.sudo.
-      - name: Generate kernel adapters
-        run: bash scripts/generate.sh
-      - name: Bundle trainer
-        run: bash bookmarklet/minify.sh
+      # is transpiled and the trainer re-bundled by Bazel, so Pages can never
+      # serve an artifact that drifted from sudo/craft.sudo.
+      - name: Build site
+        run: bazel build //bookmarklet:site
 
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: bookmarklet
+          path: bazel-bin/bookmarklet/site
       - id: deployment
         uses: actions/deploy-pages@v4

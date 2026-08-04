@@ -13,27 +13,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The kernel is generated code and gitignored — the package is
-      # incomplete (ImportError on infinite_craft_cli._sudo) unless the
-      # sudo sources are transpiled (via the pinned sudoc release) before
-      # building.
-      - name: Generate kernel adapters
-        run: bash scripts/generate.sh
-
-      - uses: actions/setup-python@v5
+      - uses: bazel-contrib/setup-bazel@0.14.0
         with:
-          python-version: '3.12'
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}
+          repository-cache: true
 
-      - name: Install build tools
-        run: pip install build
+      - name: Build wheel
+        run: bazel build //release:wheel.dist
 
-      - name: Build package
-        run: python -m build
+      - name: Stage wheel (refuse an unversioned build)
+        run: |
+          mkdir -p dist
+          cp bazel-bin/release/wheel_dist/*.whl dist/
+          # A tagless/shallow checkout stamps 0.0.0 (workspace_status.sh); never
+          # publish that. On a real tag push the version is X.Y.Z.
+          if ls dist/*-0.0.0-*.whl >/dev/null 2>&1; then
+            echo "::error::wheel version is 0.0.0 — refusing to publish an unversioned build"
+            exit 1
+          fi
 
       - name: Wheel actually contains the kernel
         run: |
-          pip install dist/*.whl
-          python -c "import infinite_craft_cli._sudo.craft; print('kernel import OK')"
+          python3 -m venv /tmp/icw
+          /tmp/icw/bin/pip install dist/*.whl
+          /tmp/icw/bin/python -c "import infinite_craft_cli._sudo.craft; print('kernel import OK')"
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
