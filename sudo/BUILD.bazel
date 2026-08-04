@@ -10,11 +10,14 @@ sudo_lockstep_test(
     name = "craft_lockstep_test",
     lib = ":craft",
     entry = "craft.sudo",
-    targets = [
+    # rules_sudo 1.0.0 renamed `targets` → `backends` (the list may now also
+    # carry LABELS to sudo_external_backend targets; craft.sudo uses only the
+    # built-in py/js).
+    backends = [
         "py",
         "js",
     ],
-    # 18 tests x 2 targets runs ~3.5min locally and ~2x that on CI —
+    # 18 tests x 2 backends runs ~3.5min locally and ~2x that on CI —
     # the default moderate (300s) timeout is exactly the wrong size.
     timeout = "long",
 )

@@ -16,18 +16,51 @@ pip.parse(
 )
 use_repo(pip, "pip")
 
-# rules_sudo compiles sudo/craft.sudo into generated Python/JS libraries via
-# the pinned sudoc release binary. No BCR registration yet — consume via
-# archive_override against the GitHub release tarball. See
-# https://github.com/hacker6284/sudocode for the source ruleset.
-bazel_dep(name = "rules_sudo", version = "0.1.0")
-archive_override(
+# rules_sudo 1.0.0's hermetic decomposed sudo_lockstep_test rule declares BOTH
+# the python and rust toolchain types (the py/rs run-leaves pin a toolchain from
+# runfiles — design §5/§9). craft.sudo only exercises py+js, but the rule still
+# resolves @rules_rust//rust:toolchain_type, so a rust toolchain must be
+# registered even though no Rust code is compiled here.
+bazel_dep(name = "rules_rust", version = "0.72.0")
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2021",
+    versions = ["1.96.0"],
+)
+use_repo(rust, "rust_toolchains")
+
+register_toolchains("@rust_toolchains//:all")
+
+# rules_sudo compiles sudo/craft.sudo into generated Python/JS libraries and
+# lockstep-tests them across backends. Phase 5 bumped it to 1.0.0
+# (compatibility_level 2): the hermetic decomposed sudo_lockstep_test REPLACES
+# the v0.2.1 PATH-inheriting one (breaking).
+#
+# PRE-RELEASE HEAD DOGFOOD (design §8 Phase 5 Task 8): no published release ships
+# rules_sudo 1.0.0 or the matched binary SET (sudoc + lockstep_diff +
+# capture_run + emit_unpack) yet — the matched-pair release v0.2.0 cuts them.
+# Until then this repo validates against the sibling sudocode checkout at HEAD:
+# the ruleset via local_path_override, the binaries via sudo.local_binary. Run
+# `tests/parity/verify_head.sh` to build HEAD binaries, fill the paths below, and
+# run the lockstep test. AFTER the matched-pair release, swap this whole block
+# back to:
+#     bazel_dep(name = "rules_sudo", version = "1.0.0")
+#     archive_override(module_name = "rules_sudo",
+#         urls = [".../releases/download/v0.2.0/rules_sudo-v0.2.0.tar.gz"],
+#         sha256 = "<tarball sha>", strip_prefix = "rules_sudo")
+#     sudo.toolchain(version = "v0.2.0")
+bazel_dep(name = "rules_sudo", version = "1.0.0")
+local_path_override(
     module_name = "rules_sudo",
-    urls = ["https://github.com/hacker6284/sudocode/releases/download/v0.2.0/rules_sudo-v0.2.1.tar.gz"],
-    sha256 = "2a32f250aca89e8b9502719df738270eeb95f2d90cc73aac0621d8fbfdd66454",
-    strip_prefix = "rules_sudo",
+    path = "../sudocode/rules_sudo",
 )
 
 sudo = use_extension("@rules_sudo//:extensions.bzl", "sudo")
-sudo.toolchain(version = "v0.2.0")
+sudo.local_binary(
+    sudoc = "/REPLACE/WITH/ABSOLUTE/PATH/TO/sudoc",  # tests/parity/verify_head.sh fills these
+    lockstep_diff = "/REPLACE/WITH/ABSOLUTE/PATH/TO/lockstep_diff",
+    capture_run = "/REPLACE/WITH/ABSOLUTE/PATH/TO/capture_run",
+    emit_unpack = "/REPLACE/WITH/ABSOLUTE/PATH/TO/emit_unpack",
+)
 use_repo(sudo, "sudo_toolchain")
