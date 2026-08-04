@@ -6,7 +6,6 @@ changing either side.
 
 import re
 import time
-from pathlib import Path
 
 import pytest
 
@@ -29,6 +28,7 @@ from infinite_craft_cli.cli import (
     _validate_query_at_enqueue,
     do_help,
 )
+from tests.artifact_paths import trainer_js_path
 from tests.conftest import MockElement, make_mock_storage
 from tests.help_utils import (
     assert_help_dual_formats,
@@ -488,12 +488,9 @@ class TestMatchElementsParity:
         assert set(mirror_names) == expected_names
 
 
-ROOT = Path(__file__).resolve().parent.parent
-
-
 class TestTrainerSourceParity:
     def test_wait_for_input_uses_try_enqueue(self):
-        source = (ROOT / "bookmarklet" / "trainer.js").read_text(encoding="utf-8")
+        source = trainer_js_path().read_text(encoding="utf-8")
         assert "function tryEnqueue(line)" in source
         assert "tryEnqueue(val)" in source
         handler = re.search(

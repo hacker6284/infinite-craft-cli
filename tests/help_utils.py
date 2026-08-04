@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from tests.artifact_paths import trainer_js_path
+
 ROOT = Path(__file__).resolve().parent.parent
 
 DEPRECATED_PHRASES = ("also:", "Same as", "spaced variant")
@@ -44,8 +46,8 @@ def assert_help_query_syntax_once(text: str) -> None:
 
 
 def extract_js_help_plaintext(trainer_path: Path | None = None) -> str:
-    """Extract doHelp() template literals from trainer.js as plain text."""
-    path = trainer_path or (ROOT / "bookmarklet" / "trainer.js")
+    """Extract doHelp() template literals from the built trainer.js as plain text."""
+    path = trainer_path or trainer_js_path()
     source = path.read_text(encoding="utf-8")
     match = re.search(
         r"function doHelp\(\) \{\s*print\(`([\s\S]*?)`\);",

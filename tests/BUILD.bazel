@@ -11,10 +11,22 @@ py_library(
 )
 
 py_library(
+    name = "artifact_paths",
+    srcs = ["artifact_paths.py"],
+    imports = [".."],
+    data = [
+        "//bookmarklet:trainer_js",
+        "//bookmarklet:trainer_min_js",
+    ],
+    deps = ["@rules_python//python/runfiles"],
+)
+
+py_library(
     name = "help_utils",
     srcs = ["help_utils.py"],
     imports = [".."],
     deps = [
+        ":artifact_paths",
         "//src/infinite_craft_cli",
         "@pip//pytest",
     ],
@@ -26,11 +38,16 @@ py_library(
     main = test_file,
     imports = [".."],
     deps = [
+        ":artifact_paths",
         ":conftest",
         ":help_utils",
         "//src/infinite_craft_cli",
         "@pip//pytest",
         "@pip//pytest_asyncio",
+    ],
+    data = [
+        "//bookmarklet:trainer_js",
+        "//bookmarklet:trainer_min_js",
     ],
 ) for test_file in glob(
     ["test_*.py"],

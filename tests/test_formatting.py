@@ -1,11 +1,11 @@
 """Tests for formatting functions: _color, format_element, format_result, do_help."""
 
 import sys
-from pathlib import Path
 
 import pytest
 from unittest.mock import patch, MagicMock
 
+from tests.artifact_paths import trainer_min_js_path
 from tests.conftest import MockElement
 from tests.help_utils import (
     assert_help_dual_formats,
@@ -224,9 +224,7 @@ class TestDoHelp:
 
 class TestTrainerMinJs:
     def test_min_js_contains_key_help_strings(self):
-        min_js = (
-            Path(__file__).resolve().parent.parent / "bookmarklet" / "trainer.min.js"
-        ).read_text()
+        min_js = trainer_min_js_path().read_text()
         for needle in (
             "no space between + and |",
             "/combine <element> <element>",

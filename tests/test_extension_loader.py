@@ -11,16 +11,15 @@ from pathlib import Path
 
 import pytest
 
+from tests.artifact_paths import trainer_js_path, trainer_min_js_path
+
 ROOT = Path(__file__).resolve().parents[1]
 EXTENSION = ROOT / "extension"
 BOOKMARKLET = ROOT / "bookmarklet"
 TRAINER_URL = "https://hacker6284.github.io/infinite-craft-cli/trainer.min.js"
-TERSER_VERSION = "5.48.0"
 LOADER = EXTENSION / "loader.js"
 MANIFEST = EXTENSION / "manifest.json"
-TRAINER_JS = BOOKMARKLET / "trainer.js"
 TRAINER_SRC = BOOKMARKLET / "trainer.src.mjs"
-TRAINER_MIN = BOOKMARKLET / "trainer.min.js"
 INDEX_HTML = BOOKMARKLET / "index.html"
 ZIP_PATH = ROOT / "infinite-craft-trainer.zip"
 
@@ -45,8 +44,9 @@ def test_loader_js_syntax() -> None:
 
 
 def test_trainer_min_js_exists() -> None:
-    assert TRAINER_MIN.is_file()
-    assert TRAINER_MIN.stat().st_size > 0
+    trainer_min = trainer_min_js_path()
+    assert trainer_min.is_file()
+    assert trainer_min.stat().st_size > 0
 
 
 def test_extension_does_not_bundle_trainer() -> None:
@@ -122,20 +122,6 @@ def test_cross_surface_trainer_url_parity() -> None:
     assert "AbortSignal.timeout" in userscript
 
 
-@pytest.mark.skipif(shutil.which("node") is None, reason="node required")
-def test_trainer_min_js_matches_terser_output() -> None:
-    result = subprocess.run(
-        ["npx", "--yes", f"terser@{TERSER_VERSION}", str(TRAINER_JS), "-c", "-m"],
-        capture_output=True,
-        text=True,
-        timeout=120,
-        cwd=ROOT,
-        check=False,
-    )
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == _read(TRAINER_MIN).strip()
-
-
 def test_extension_zip_matches_current_layout() -> None:
     assert ZIP_PATH.is_file()
     listing = subprocess.run(
@@ -159,7 +145,7 @@ def test_extension_zip_matches_source_hashes() -> None:
 
 
 def test_trainer_min_contains_sentinel_and_ui_marker() -> None:
-    minified = _read(TRAINER_MIN)
+    minified = trainer_min_js_path().read_text(encoding="utf-8")
     assert "__ICTrainer" in minified
     assert "ict-container" in minified
     assert "ict-trainer-ready" in minified
@@ -172,7 +158,7 @@ def test_trainer_source_has_single_source_comment() -> None:
 
 
 def test_trainer_defers_singleton_until_ui_ready() -> None:
-    source = _read(TRAINER_JS)
+    source = trainer_js_path().read_text(encoding="utf-8")
     singleton_set = source.index("window.__ICTrainer = true")
     container_append = source.index("document.body.appendChild(container)")
     ready_event = source.index('new CustomEvent("ict-trainer-ready")')
