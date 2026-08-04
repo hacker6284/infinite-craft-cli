@@ -9,8 +9,9 @@ touches either host's tuple/object conversion, status-int handling, or
 exact-case name index. A wiring bug — not a kernel divergence — shows up here
 as a scenario mismatch between the two hosts.
 
-Run locally with `bash tests/parity/run_parity.sh` (regenerates `_sudo/`
-adapters via `scripts/generate.sh` if missing).
+Run locally with `bash tests/parity/run_parity.sh` (wraps
+`bazel test //tests/parity:parity_test`; the `_sudo/` adapters are built by
+Bazel, no separate regeneration step needed).
 
 `fixtures.json` is data-only: add a scenario by adding one JSON object; no
 code changes needed in most cases.

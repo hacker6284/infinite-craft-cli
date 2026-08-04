@@ -1,5 +1,23 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- **Consolidated onto a single Bazel build path.** The wheel (`//release:wheel.dist`),
+  bookmarklet bundles (`//bookmarklet:trainer_js` / `:trainer_min_js`), GitHub
+  Pages site (`//bookmarklet:site`), and kernel smoke test
+  (`//bookmarklet:kernel_smoke_test`) are now all built by rules_sudo v0.3.0 +
+  Bazel; `trainer.js` and `trainer.min.js` are build-only outputs and are no
+  longer committed to the repo. Host tests read the built bundle via a
+  runfiles locator (`tests/artifact_paths.py`) instead of a fixed path. CI
+  (publish/pages/test/release-dry-run) now calls Bazel directly.
+
+### Removed
+- The standalone `sudoc` toolchain path: `scripts/generate.sh`,
+  `scripts/sudoc-bin.sh`, `scripts/sudoc-version.txt`, and
+  `bookmarklet/minify.sh`. The `.cache/` sudoc-binary download cache and the
+  old `sudo.yml` CI workflow are gone too.
+
 ## [1.5.0] - 2026-07-22
 
 ### Changed

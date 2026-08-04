@@ -42,7 +42,7 @@ The extension communicates with:
 
 The Chrome extension is intentionally a thin loader: it downloads and executes `trainer.min.js` from GitHub Pages so trainer updates can ship without a Chrome Web Store review. This means:
 
-- **You trust the GitHub Pages deployment** (`hacker6284.github.io/infinite-craft-cli/`) to serve the authentic open-source trainer built from this repository's `bookmarklet/trainer.js`.
+- **You trust the GitHub Pages deployment** (`hacker6284.github.io/infinite-craft-cli/`) to serve the authentic open-source trainer built from this repository's `bookmarklet/trainer.src.mjs` (bundled by `//bookmarklet:trainer_min_js`).
 - **The loader runs in the extension's isolated content-script world**; only the fetched trainer code executes in the page context (required for IndexedDB access). Loader state is tracked in the content-script scope, not in page-writable DOM attributes.
 - **Init verification uses a cross-world handshake**: the trainer dispatches an `ict-trainer-ready` custom event after creating its UI; the loader listens for this event (not DOM presence alone).
 
@@ -60,7 +60,7 @@ The Chrome extension is intentionally a thin loader: it downloads and executes `
 
 **Monitoring guidance for operators:**
 - Watch the [GitHub repository](https://github.com/hacker6284/infinite-craft-cli) and [Pages deploy workflow](https://github.com/hacker6284/infinite-craft-cli/actions) for unexpected changes to `bookmarklet/`.
-- Compare served `trainer.min.js` against the committed artifact after deploys.
+- CI rebuilds `trainer.min.js` from source (`sudo/craft.sudo` via the pinned rules_sudo release + `trainer.src.mjs`, bundled by `//bookmarklet:trainer_min_js`) on every deploy — there is no committed artifact to compare against; reproducibility comes from rebuilding the Bazel target.
 - Report suspicious behavior via [GitHub Issues](https://github.com/hacker6284/infinite-craft-cli/issues).
 
 ## Changes to This Policy

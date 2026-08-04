@@ -1,8 +1,9 @@
 // Single source of truth for the trainer's UI and effects. The pure
 // kernel (matching, resolution, recipes, lineage, export) lives in
-// ../sudo/craft.sudo and is imported below as generated code — regenerate
-// with scripts/generate.sh. trainer.js / trainer.min.js are build
-// artifacts produced by minify.sh; do not edit them by hand.
+// ../sudo/craft.sudo and is imported below as generated code, built by
+// Bazel's //bookmarklet:_sudo target. trainer.js / trainer.min.js are
+// build-only outputs of //bookmarklet:trainer_js / :trainer_min_js; do not
+// edit them by hand (they are not committed to the repo).
 import {
   match_elements_boundary as matchElementsBoundary,
   resolve_element_boundary as resolveElementBoundary,

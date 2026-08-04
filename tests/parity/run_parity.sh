@@ -7,11 +7,6 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-if [ ! -d "src/infinite_craft_cli/_sudo" ] || [ ! -d "bookmarklet/_sudo" ]; then
-  echo "Generated kernel adapters missing — regenerating via scripts/generate.sh" >&2
-  bash scripts/generate.sh
-fi
-
-# Mirror sudo.yml's former "Python tests" / host-parity uv invocation:
-# pytest is not a pyproject dependency — inject it ephemerally.
-exec uv run --with pytest --with pytest-asyncio pytest tests/parity/parity_test.py -q
+# Kernel adapters are Bazel-generated targets now (//src/infinite_craft_cli:_sudo,
+# //bookmarklet:_sudo) — no standalone regeneration step needed.
+exec bazel test //tests/parity:parity_test --test_output=errors

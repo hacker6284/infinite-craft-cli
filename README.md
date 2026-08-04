@@ -143,10 +143,16 @@ The [browser trainers](https://hacker6284.github.io/infinite-craft-cli/) share t
 
 ## Development
 
-After editing `bookmarklet/trainer.js`, regenerate the minified artifact:
+After editing `bookmarklet/trainer.src.mjs`, rebuild the bundles:
 
 ```bash
-./bookmarklet/minify.sh
+bazel build //bookmarklet:site
+```
+
+Build the Python wheel:
+
+```bash
+bazel build //release:wheel.dist
 ```
 
 Run unit tests:

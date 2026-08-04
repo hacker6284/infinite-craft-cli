@@ -9,9 +9,6 @@ build/
 bazel-*
 MODULE.bazel.lock
 
-# Generated sudo-kernel adapters (regenerate via scripts/generate.sh)
+# Generated sudo-kernel adapters (built by Bazel: //src/infinite_craft_cli:_sudo, //bookmarklet:_sudo)
 src/infinite_craft_cli/_sudo/
 bookmarklet/_sudo/
-
-# Pinned sudoc binary cache (scripts/sudoc-bin.sh)
-.cache/
