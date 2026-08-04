@@ -33,34 +33,23 @@ use_repo(rust, "rust_toolchains")
 register_toolchains("@rust_toolchains//:all")
 
 # rules_sudo compiles sudo/craft.sudo into generated Python/JS libraries and
-# lockstep-tests them across backends. Phase 5 bumped it to 1.0.0
-# (compatibility_level 2): the hermetic decomposed sudo_lockstep_test REPLACES
-# the v0.2.1 PATH-inheriting one (breaking).
+# lockstep-tests them across backends. rules_sudo 1.0.0 (compatibility_level 2):
+# the hermetic decomposed sudo_lockstep_test REPLACES the v0.2.1 PATH-inheriting
+# one (breaking).
 #
-# PRE-RELEASE HEAD DOGFOOD (design §8 Phase 5 Task 8): no published release ships
-# rules_sudo 1.0.0 or the matched binary SET (sudoc + lockstep_diff +
-# capture_run + emit_unpack) yet — the matched-pair release v0.3.0 cuts them.
-# Until then this repo validates against the sibling sudocode checkout at HEAD:
-# the ruleset via local_path_override, the binaries via sudo.local_binary. Run
-# `tests/parity/verify_head.sh` to build HEAD binaries, fill the paths below, and
-# run the lockstep test. AFTER the matched-pair release, swap this whole block
-# back to:
-#     bazel_dep(name = "rules_sudo", version = "1.0.0")
-#     archive_override(module_name = "rules_sudo",
-#         urls = [".../releases/download/v0.3.0/rules_sudo-v0.3.0.tar.gz"],
-#         sha256 = "<tarball sha>", strip_prefix = "rules_sudo")
-#     sudo.toolchain(version = "v0.3.0")
+# Consumed from the matched-pair release v0.3.0 (design §8 Phase 5 Task 8), which
+# publishes BOTH the ruleset tarball AND the matched binary SET (sudoc +
+# lockstep_diff + capture_run + emit_unpack). Each binary's per-platform sha256 is
+# pinned in the tarball's versions.bzl, so sudo.toolchain(version = "v0.3.0")
+# resolves the whole set with no local sha overrides.
 bazel_dep(name = "rules_sudo", version = "1.0.0")
-local_path_override(
+archive_override(
     module_name = "rules_sudo",
-    path = "../sudocode/rules_sudo",
+    urls = ["https://github.com/hacker6284/sudocode/releases/download/v0.3.0/rules_sudo-v0.3.0.tar.gz"],
+    strip_prefix = "rules_sudo",
+    sha256 = "89b6a672417c2e50d08f129a2b6aed2012e4b7cbd5aa1f8df918f29001a28c7a",
 )
 
 sudo = use_extension("@rules_sudo//:extensions.bzl", "sudo")
-sudo.local_binary(
-    sudoc = "/REPLACE/WITH/ABSOLUTE/PATH/TO/sudoc",  # tests/parity/verify_head.sh fills these
-    lockstep_diff = "/REPLACE/WITH/ABSOLUTE/PATH/TO/lockstep_diff",
-    capture_run = "/REPLACE/WITH/ABSOLUTE/PATH/TO/capture_run",
-    emit_unpack = "/REPLACE/WITH/ABSOLUTE/PATH/TO/emit_unpack",
-)
+sudo.toolchain(version = "v0.3.0")
 use_repo(sudo, "sudo_toolchain")
