@@ -48,7 +48,7 @@ against `sudo/craft.sudo` and upstream `src/infinite_craft_cli/`.
 | 4 | **Export/prune filter = transitive recipe closure** (`included_element_names(recipes)` only) | Matches v1.4.2 `_included_element_names` (cli.py ~2518–2547); pure orphans are export-excluded and prune targets. |
 | 5 | **No fnmatch/glob safety gate** | Vendored `regex.sudo` is Thompson-NFA / Pike-VM, linear in input length — wildcard-count / consecutive-star heuristics are unnecessary. |
 | 6 | **No 512-char name truncation** | Only the **query** is capped at 512; names match in full. JS `name.slice(0, 512)` existed only to bound in-browser `RegExp` cost. |
-| 7 | **No scan budget / regex timeout**; only error is `"Invalid regex pattern"`; real `\|` alternation | Same linear-time engine; CLI `MATCH_SCAN_BUDGET` / `REGEX_TIMEOUT` and JS `REGEX_TIMEOUT_MS` guard PCRE/backtracking the NFA cannot exhibit. Kernel now also performs real `\|` alternation (native NFA `Split` fan-out) — upstream's blanket "any `\|` is too complex" rejection has no counterpart at all. |
+| 7 | **No scan budget / regex timeout**; only error is `"Invalid regex pattern"`; full NFA regex — real grouping `()`, quantifiers over groups, nested alternation, `^`/`$`/`\b`/`\B` assertions | Same linear-time engine; CLI `MATCH_SCAN_BUDGET` / `REGEX_TIMEOUT` and JS `REGEX_TIMEOUT_MS` guard PCRE/backtracking the NFA cannot exhibit. `regex.sudo` v0.3.0 compiles `(...)` as real (always non-capturing) grouping — `(ab)+`, `(a+)+`, nested `(x(y|z))w` — and `^`/`$` as true zero-width position assertions anywhere in the pattern, not just at branch edges. `(?:...)` is **not** separately recognized (a leading `?` inside a group with nothing preceding it to quantify is a parse error) — since every group is already non-capturing, this is a confirmed syntax gap, not a matching-correctness bug. Upstream's blanket "any `\|` is too complex" rejection, and its lack of any grouping support at all, have no counterpart here. |
 
 ### 1. Unbounded trace BFS
 
@@ -97,7 +97,7 @@ Matching always uses the full element name. Only the query string is capped:
 `query.length > 512` → `"Query too long (max 512 characters)"` (exact upstream
 message) in `match_elements` / `validate_query_at_enqueue`.
 
-### 7. No scan-time budget / regex timeout; `|` is literal
+### 7. No scan-time budget / regex timeout; full NFA regex engine (v0.3.0)
 
 `_regex_is_safe` / `MAX_REGEX_BODY_LENGTH` / `|`-rejection / nested-quantifier
 rejection are **not** ported. The string `"Regex pattern too complex"` does not
@@ -113,15 +113,14 @@ upstream `_regex_is_safe` rejected *any* pattern containing `|` outright as
 alternation — the rejection was a backtracking-blowup safety gate, not a
 feature gap. `regex.sudo`'s Thompson-NFA/Pike-VM engine is linear-time by
 construction and cannot exhibit catastrophic backtracking, so that fear is
-obsolete: `regex.sudo` now implements real flat top-level alternation (`|`
-splits the pattern into whole-branch alternatives via the engine's native
-NFA `Split` fan-out; `^`/`$` anchors bind per-branch). `/cat|dog/` is a
-valid kernel regex meaning "cat" OR "dog", not the seven-character literal
-run `"cat|dog"`. This is a deliberate widening beyond upstream, not a
-compatibility requirement — the CLI and JS trainer still hard-reject any
-`|` as "too complex" and would need separate porting to gain this. Test
-coverage: `"element_matches_pattern real alternation cat or dog"` —
-`/cat|dog/` matches `"Watchdog"` (contains "dog"), does not match
+obsolete: `regex.sudo` implements real alternation (`|` splits the pattern —
+or a group body — into branches via the engine's native NFA `Split`
+fan-out). `/cat|dog/` is a valid kernel regex meaning "cat" OR "dog", not
+the seven-character literal run `"cat|dog"`. This is a deliberate widening
+beyond upstream, not a compatibility requirement — the CLI and JS trainer
+still hard-reject any `|` as "too complex" and would need separate porting
+to gain this. Test coverage: `"element_matches_pattern real alternation cat
+or dog"` — `/cat|dog/` matches `"Watchdog"` (contains "dog"), does not match
 `"Elephant"` (contains neither). `"ex-gate pathological patterns now work"`
 also covers `/a|b/` now matching bare `"a"` and `"b"` (previously
 literal-pipe-only, matched neither).
@@ -133,7 +132,7 @@ counts, never backslash). `regex.sudo` previously treated `\` as an
 ordinary literal character, so `/\d+/` meant "a literal backslash followed
 by one or more 'd' characters" (the `+` was always a real quantifier, just
 applied to a literal `d` instead of a digit class), not "one or more
-digits" — a real behavioral gap against upstream. `regex.sudo` now implements
+digits" — a real behavioral gap against upstream. `regex.sudo` implements
 backslash escapes: metacharacter escapes (`\.` `\*` `\+` `\?` `\[` `\]`
 `\^` `\$` `\|` `\\` `\/` `\{` `\}` `\(` `\)`) and predefined classes `\d`
 `\D` `\w` `\W` `\s` `\S`. **Caveat, also documented in `regex.sudo`'s own
@@ -141,12 +140,51 @@ header:** the predefined classes are ASCII-only subsets (this engine has
 no Unicode tables, same family as the existing ASCII-only case folding) —
 python's `\d`/`\w` are Unicode-aware and match e.g. the Arabic-indic digit
 `٣` or the letter `É`; this engine's `\d`/`\w` do not. `\b`/`\B` word
-boundaries are recognized but not implemented (a parse error, not a silent
-no-op) — a deliberate, reported scope cut, not a compatibility gap, since
-upstream's own regex engines support `\b` but the kernel's delimited-query
-use case has not needed it yet. Test coverage:
-`"element_matches_pattern backslash escape digits"` — `/\d+/` matches
-`"Area 51"` (contains digits), does not match `"AreaX"` (contains none).
+boundaries (ASCII `[A-Za-z0-9_]` word class, same divergence as `\w`) **are
+now implemented** as real zero-width assertions — as of v0.3.0 this is no
+longer a parse error (v0.2.0's `regex_is_valid("\\b") == false` is now
+`true`). Test coverage: `"element_matches_pattern backslash escape
+digits"` — `/\d+/` matches `"Area 51"` (contains digits), does not match
+`"AreaX"` (contains none).
+
+**Third gap closed (v0.3.0) — real grouping, quantified groups, nested
+alternation, and full-position anchors:** `regex.sudo` previously had no
+grouping construct at all — `(` and `)` were ordinary literal characters,
+so a pattern like `/(a+)+/` meant the 5-character literal run `"(a+)+"`
+(one `(`, one-or-more `a`, one `)`, then a dangling `+` with nothing to
+repeat — actually a parse error in that older scheme) and top-level `|`
+split the *whole raw pattern* on literal `(`/`)` text, not a semantic
+group. v0.3.0 compiles `(...)` as a real (always non-capturing — there
+are no capture slots at all, so there is no separate "capturing vs.
+non-capturing" distinction to make) grouping metacharacter: quantifiers
+apply to the whole preceding group (`(ab)+`, `(a+)+`, `(ab){2}`), `|`
+inside a group body is scoped to that group and nests arbitrarily
+(`(a(b|c)d)+`, `(x(y|z))w`), and `^`/`$` are true zero-width position
+assertions that can appear anywhere in a branch — not just bound to a
+branch's start/end — so a mid-pattern `^` (e.g. `"a^b"`) can never be
+satisfied (the position right after `a` is never position 0), matching
+python's `regex`/`re` semantics exactly (verified against `python3
+regex.search(...)` as the oracle for every anchor-placement case in
+`regex.sudo`'s own test suite). Host coverage: CLI test
+`test_nested_quantifier_group_matches_names_with_a` — `/(a+)+/` now matches
+any fixture element name containing an `a` (e.g. `Water`, `Earth`), not the
+empty set; `test_alternation_quantifier_group_matches_names_with_a` —
+`/(a|aa)+/` matches the same set via a quantified alternation group.
+`sudo/craft.sudo`'s own `regex.sudo`-level tests (`"regex non-capturing
+groups"`, `"regex mid-pattern anchors"`) are the underlying oracle.
+
+**Confirmed gap, not papered over — no `(?:...)` non-capturing-group
+syntax:** because every `(...)` group is already non-capturing by
+construction (the engine has no capture-slot concept to opt out of), there
+is no dedicated `(?:...)` spelling the way PCRE/python `re` have one.
+Writing it does not silently degrade to plain grouping — inside a group
+body, a leading `?` with no preceding atom to quantify is a parse error
+(`"invalid pattern: quantifier with nothing to repeat"`), so the whole
+pattern fails to compile and the CLI reports `"Invalid regex pattern"`.
+Host coverage: `test_non_capturing_group_syntax_is_unsupported` —
+`/(a|(?:aa))+b/` returns `matches == []` and `err == "Invalid regex
+pattern"`, not a match. Query authors should write bare `(aa)` instead of
+`(?:aa)`.
 
 ---
 

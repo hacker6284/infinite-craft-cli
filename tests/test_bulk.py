@@ -319,19 +319,28 @@ class TestDoCross:
         captured = capsys.readouterr()
         assert "Invalid regex pattern" in captured.out
 
-    def test_complex_regex_now_no_match(self, capsys):
-        # DIVERGENCES.md ruling 7: no "too complex" gate; "/(a|aa)+/"
-        # parses fine (parens are literal, "|" splits into literal
-        # branches "(a" / "aa)+") and matches nothing among the default
-        # base elements, so the left query now simply has no matches
-        # instead of erroring.
+    def test_complex_regex_cross_combines_matching_elements(self, capsys):
+        # DIVERGENCES.md ruling 7: no "too complex" gate, and "/(a|aa)+/"
+        # is a real quantified alternation group meaning "contains a run
+        # of 'a'". Against the default base elements (Water, Fire, Wind,
+        # Earth) the left query matches Water and Earth; the right query
+        # "water" substring-matches Water. Water+Water is skipped as a
+        # self-pair, leaving exactly one pair (Earth, Water) — so this
+        # cross now actually runs instead of hitting the old "No elements
+        # match" no-op path.
         from infinite_craft_cli.cli import do_cross
 
         client = make_mock_client()
+        client.pair.return_value = MockElement("Mud", "")
         storage = make_mock_storage()
         run_async(do_cross(client, storage, "/(a|aa)+/", "water"))
         captured = capsys.readouterr()
-        assert "No elements match: /(a|aa)+/" in captured.out
+        assert "No elements match" not in captured.out
+        assert "Error" not in captured.out
+        assert "Left (2): 💧 Water, 🌍 Earth" in captured.out
+        assert "Right (1): 💧 Water" in captured.out
+        assert "1 unique pairs" in captured.out
+        assert "🌍 Earth + 💧 Water = Mud" in captured.out
 
     def test_left_no_matches(self, capsys):
         from infinite_craft_cli.cli import do_cross

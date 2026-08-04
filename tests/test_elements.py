@@ -144,36 +144,56 @@ class TestMatchElements:
         assert matches == []
         assert "too long" in err
 
-    def test_nested_quantifier_regex_now_matches_literally(self, mock_storage_with_extras):
-        # DIVERGENCES.md ruling 7: kernel drops the "too complex"
-        # nested-quantifier gate entirely, and regex.sudo has no capture
-        # groups (parens are literal characters, not grouping) — "/(a+)+/"
-        # now parses as literal '(' + one-or-more 'a' + one-or-more ')',
-        # which simply doesn't match any fixture name here.
+    def test_nested_quantifier_group_matches_names_with_a(self, mock_storage_with_extras):
+        # DIVERGENCES.md ruling 7: regex.sudo is a full NFA — "(" / ")" are
+        # real (always non-capturing) grouping metacharacters, and a
+        # postfix quantifier applies to the whole preceding group. "/(a+)+/"
+        # is "one-or-more of (one-or-more 'a')", which reduces to "at least
+        # one contiguous run of 'a'"; unanchored + case-insensitive search
+        # (see is_delimited_regex's regex_search(..., true) call) means it
+        # matches any fixture name that contains an 'a' anywhere.
         from infinite_craft_cli.cli import _match_elements
         matches, err = _match_elements(mock_storage_with_extras, "/(a+)+/")
-        assert matches == []
         assert err is None
+        names = {e.name for e in matches}
+        assert names == {"Water", "Earth", "Steam", "Lava", "Waterfall", "Firewall"}
+        # No 'a' in these — must be excluded.
+        assert "Fire" not in names
+        assert "Wind" not in names
+        assert "Mud" not in names
+        assert "Dust" not in names
 
-    def test_alternation_quantifier_regex_now_matches_literally(self, mock_storage_with_extras):
-        # DIVERGENCES.md ruling 7: "|" is now real top-level alternation
-        # and there is no "too complex" gate. "/(a|aa)+/" has one
-        # top-level "|", splitting into two literal branches "(a" and
-        # "aa)+" (parens are literal, not grouping) — neither matches any
-        # fixture name here.
+    def test_alternation_quantifier_group_matches_names_with_a(self, mock_storage_with_extras):
+        # DIVERGENCES.md ruling 7: "|" inside a group is real nested
+        # alternation, and "(...)+" quantifies the whole group. "/(a|aa)+/"
+        # is "one-or-more of ('a' OR 'aa')" — since the single-'a' branch
+        # alone already matches any run of 'a', this matches the same set
+        # of fixture names as the nested-quantifier case above (any name
+        # containing 'a').
         from infinite_craft_cli.cli import _match_elements
         matches, err = _match_elements(mock_storage_with_extras, "/(a|aa)+/")
-        assert matches == []
         assert err is None
+        names = {e.name for e in matches}
+        assert names == {"Water", "Earth", "Steam", "Lava", "Waterfall", "Firewall"}
+        assert "Fire" not in names
+        assert "Wind" not in names
 
-    def test_nested_paren_alternation_regex_now_matches_literally(self, mock_storage_with_extras):
-        # DIVERGENCES.md ruling 7: same as above — "/(a|(?:aa))+b/" splits
-        # on its one top-level "|" into literal branches "(a" and
-        # "(?:aa))+b"; neither matches any fixture name here.
+    def test_non_capturing_group_syntax_is_unsupported(self, mock_storage_with_extras):
+        # DIVERGENCES.md ruling 7: regex.sudo's groups are ALWAYS
+        # non-capturing (there are no capture slots at all — see the
+        # stdlib module header), so there is no dedicated "(?:...)"
+        # group-modifier syntax the way PCRE/python `re` have one. Inside
+        # a group body, a leading '?' with no preceding atom to quantify
+        # is a parse error ("quantifier with nothing to repeat"), so
+        # "/(a|(?:aa))+b/" fails to compile — this is a real, confirmed
+        # syntax gap (not a matching-correctness bug): writing a bare
+        # "(aa)" gets you the same (already non-capturing) grouping that
+        # "(?:aa)" would provide elsewhere, but the "?:" spelling itself
+        # is not recognized.
         from infinite_craft_cli.cli import _match_elements
         matches, err = _match_elements(mock_storage_with_extras, "/(a|(?:aa))+b/")
         assert matches == []
-        assert err is None
+        assert err == "Invalid regex pattern"
 
     def test_no_matches(self, mock_storage_with_extras):
         from infinite_craft_cli.cli import _match_elements
@@ -299,15 +319,20 @@ class TestDoSearch:
         assert "Invalid regex pattern" in result
         assert "No matches found" not in result
 
-    def test_complex_regex_now_no_match_message(self, mock_storage):
-        # DIVERGENCES.md ruling 7: no "too complex" gate; "/(a|aa)+/"
-        # parses to two literal branches ("(a" / "aa)+") that match
-        # nothing among the base elements, so this is now a plain
-        # no-match, not an error.
+    def test_complex_regex_matches_base_elements_with_a(self, mock_storage):
+        # DIVERGENCES.md ruling 7: no "too complex" gate, and "/(a|aa)+/"
+        # is a real quantified alternation group meaning "one-or-more of
+        # ('a' OR 'aa')", i.e. "contains a run of 'a'". Of the default
+        # base elements (Water, Fire, Wind, Earth), Water and Earth
+        # contain 'a'; Fire and Wind do not.
         from infinite_craft_cli.cli import do_search
         result = do_search(mock_storage, "/(a|aa)+/")
-        assert "No matches found." in result
+        assert "No matches found." not in result
         assert "Invalid regex pattern" not in result
+        assert "Water" in result
+        assert "Earth" in result
+        assert "Fire" not in result
+        assert "Wind" not in result
 
     def test_single_match(self, mock_storage):
         from infinite_craft_cli.cli import do_search
