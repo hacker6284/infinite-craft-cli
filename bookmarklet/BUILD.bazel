@@ -31,6 +31,17 @@ filegroup(
 # via `node --check`) but a gratuitous transform + a wall of esbuild
 # "may crash at run-time [bigint]" warnings for a bookmarklet that only ever
 # runs in modern BigInt-capable browsers.
+#
+# Both targets also pin sourcemap = "" (rules_esbuild's macro default is
+# "linked", which emits a companion "<output>.map" file and declares it as an
+# extra DefaultInfo output). The old minify.sh produced no maps at all, and
+# //bookmarklet:site copy_to_directory's srcs pull each esbuild target's full
+# DefaultInfo, so a linked map would ride along into the deploy dir and get
+# uploaded to GitHub Pages by Task 6. sourcemap = "" is falsy in the macro
+# (aspect_rules_esbuild's esbuild/defs.bzl `if sourcemap:` / `if sourcemap and
+# sourcemap != "inline":` gates), so no output_map is declared at all -- the
+# cleanest way to suppress maps entirely, rather than filtering them out
+# downstream in copy_to_directory.
 
 # Bundled, unminified trainer (host tests + local dev read this).
 esbuild(
@@ -39,6 +50,7 @@ esbuild(
     srcs = ["trainer.src.mjs", ":_sudo"],
     config = "esbuild.config.mjs",
     format = "iife",
+    sourcemap = "",
     target = ["esnext"],
     output = "trainer.js",
     visibility = ["//visibility:public"],
@@ -52,6 +64,7 @@ esbuild(
     config = "esbuild.config.mjs",
     format = "iife",
     minify = True,
+    sourcemap = "",
     target = ["esnext"],
     output = "trainer.min.js",
     visibility = ["//visibility:public"],
