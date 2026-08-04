@@ -1,4 +1,6 @@
 load("@aspect_rules_esbuild//esbuild:defs.bzl", "esbuild")
+load("@aspect_rules_js//js:defs.bzl", "js_test")
+load("@bazel_lib//lib:copy_to_directory.bzl", "copy_to_directory")
 load("@rules_sudo//:defs.bzl", "sudo_js_library")
 
 # Kernel adapters for craft.sudo (JS target), compiled by rules_sudo's
@@ -53,4 +55,32 @@ esbuild(
     target = ["esnext"],
     output = "trainer.min.js",
     visibility = ["//visibility:public"],
+)
+
+# The exact directory GitHub Pages uploads: committed static assets + built
+# bundle. root_paths = ["bookmarklet"] strips the "bookmarklet/" package
+# prefix off srcs that live directly in this package (index.html,
+# trainer.user.js) so they land at the site root; the esbuild outputs
+# (:trainer_js, :trainer_min_js) already produce bare "trainer.js" /
+# "trainer.min.js" (declared via output = ...), so they land at the root too.
+copy_to_directory(
+    name = "site",
+    srcs = [
+        "index.html",
+        "trainer.user.js",
+        ":trainer_js",
+        ":trainer_min_js",
+    ],
+    root_paths = ["bookmarklet"],
+    visibility = ["//visibility:public"],
+)
+
+# Node smoke of ex-bug kernel behaviors (was sudo.yml's `node test_kernel_smoke.mjs`).
+js_test(
+    name = "kernel_smoke_test",
+    data = [
+        "test_kernel_smoke.mjs",
+        ":_sudo",
+    ],
+    entry_point = "test_kernel_smoke.mjs",
 )
