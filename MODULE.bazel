@@ -39,7 +39,7 @@ register_toolchains("@rust_toolchains//:all")
 #
 # PRE-RELEASE HEAD DOGFOOD (design §8 Phase 5 Task 8): no published release ships
 # rules_sudo 1.0.0 or the matched binary SET (sudoc + lockstep_diff +
-# capture_run + emit_unpack) yet — the matched-pair release v0.2.0 cuts them.
+# capture_run + emit_unpack) yet — the matched-pair release v0.3.0 cuts them.
 # Until then this repo validates against the sibling sudocode checkout at HEAD:
 # the ruleset via local_path_override, the binaries via sudo.local_binary. Run
 # `tests/parity/verify_head.sh` to build HEAD binaries, fill the paths below, and
@@ -47,9 +47,9 @@ register_toolchains("@rust_toolchains//:all")
 # back to:
 #     bazel_dep(name = "rules_sudo", version = "1.0.0")
 #     archive_override(module_name = "rules_sudo",
-#         urls = [".../releases/download/v0.2.0/rules_sudo-v0.2.0.tar.gz"],
+#         urls = [".../releases/download/v0.3.0/rules_sudo-v0.3.0.tar.gz"],
 #         sha256 = "<tarball sha>", strip_prefix = "rules_sudo")
-#     sudo.toolchain(version = "v0.2.0")
+#     sudo.toolchain(version = "v0.3.0")
 bazel_dep(name = "rules_sudo", version = "1.0.0")
 local_path_override(
     module_name = "rules_sudo",
