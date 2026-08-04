@@ -58,25 +58,30 @@
 #   on an exact tag  vX.Y.Z            -> X.Y.Z
 #   N commits after  vX.Y.Z-N-g<sha>   -> X.Y.Z.devN+g<sha>
 #   dirty tree                          -> ...+dirty appended
+# Shallow/tagless checkouts (e.g. CI PRs with fetch-depth 1) -> 0.0.0, which the
+# publish workflow refuses to upload (guard in Task 6).
 set -euo pipefail
-raw="$(git describe --tags --long --dirty 2>/dev/null || echo "v0.0.0-0-gunknown")"
-# strip leading v
-raw="${raw#v}"
-# split "X.Y.Z-N-gSHA[-dirty]"
+raw="$(git describe --tags --long --dirty 2>/dev/null || true)"
+if [ -z "$raw" ]; then
+  echo "STABLE_VERSION 0.0.0"
+  exit 0
+fi
+raw="${raw#v}"                                   # strip leading v
+# --long always yields "X.Y.Z-N-gSHA[-dirty]".
 base="$(printf '%s' "$raw" | sed -E 's/-[0-9]+-g[0-9a-f]+(-dirty)?$//')"
 suffix="$(printf '%s' "$raw" | sed -nE 's/^.*-([0-9]+)-g([0-9a-f]+)(-dirty)?$/\1 \2 \3/p')"
-if [ -z "$suffix" ]; then
+if [ -z "$suffix" ] || [ -z "$base" ]; then
+  echo "STABLE_VERSION 0.0.0"                    # unparseable describe output
+  exit 0
+fi
+n="$(printf '%s' "$suffix" | awk '{print $1}')"
+sha="$(printf '%s' "$suffix" | awk '{print $2}')"
+dirty="$(printf '%s' "$suffix" | awk '{print $3}')"
+if [ "$n" = "0" ] && [ -z "$dirty" ]; then
   version="$base"
 else
-  n="$(printf '%s' "$suffix" | awk '{print $1}')"
-  sha="$(printf '%s' "$suffix" | awk '{print $2}')"
-  dirty="$(printf '%s' "$suffix" | awk '{print $3}')"
-  if [ "$n" = "0" ] && [ -z "$dirty" ]; then
-    version="$base"
-  else
-    version="${base}.dev${n}+g${sha}"
-    [ -n "$dirty" ] && version="${version}.dirty"
-  fi
+  version="${base}.dev${n}+g${sha}"
+  [ -n "$dirty" ] && version="${version}.dirty"
 fi
 echo "STABLE_VERSION ${version}"
 ```
@@ -113,13 +118,46 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
 **Files:**
 - Create: `release/BUILD.bazel`
-- Reference (do not modify): `src/infinite_craft_cli/BUILD.bazel` (`//src/infinite_craft_cli:infinite_craft_cli`, which already deps `:_sudo`), `pyproject.toml` (source of truth for metadata to copy).
+- Modify: `BUILD.bazel` (repo root — add `exports_files` for README/LICENSE), `src/infinite_craft_cli/BUILD.bazel` (add a `_sudo_files` filegroup so the tree artifact reaches the wheel as a **direct** dep file).
+- Reference (do not modify): `pyproject.toml` (source of truth for metadata to copy).
 
 **Interfaces:**
-- Consumes: `{STABLE_VERSION}` from Task 1; `//src/infinite_craft_cli:infinite_craft_cli`.
-- Produces: `//release:wheel` → `bazel-bin/release/infinite_craft_cli-<version>-py3-none-any.whl`, consumed by `publish.yml` in Task 6.
+- Consumes: `{STABLE_VERSION}` from Task 1; `//src/infinite_craft_cli:infinite_craft_cli` (the `.py` sources) and `//src/infinite_craft_cli:_sudo_files` (the kernel tree artifact).
+- Produces: `//release:wheel` and its implicit `//release:wheel.dist` copy target → `bazel-bin/release/wheel_dist/infinite_craft_cli-<version>-py3-none-any.whl`, consumed by `publish.yml` in Task 6.
 
-- [ ] **Step 1: Create `release/BUILD.bazel`**
+> **Why `_sudo_files` is required (Fable review):** `py_wheel` packages
+> `depset(direct = ctx.files.deps)` — direct dep files ONLY, no PyInfo/runfiles
+> traversal. The py_library's `.py` srcs are its direct files (included), but
+> `:_sudo` is a *transitive* dep of that library, so it is invisible to the
+> wheel unless named directly. A `filegroup` re-exposes the tree artifact as a
+> direct file; `tools/wheelmaker.py` recurses into directory inputs, so the
+> whole `_sudo/` tree lands in the wheel. `strip_path_prefixes=["src"]` operates
+> on `short_path` (`src/infinite_craft_cli/...`), so files land under
+> `infinite_craft_cli/...`; the py_library's `imports=[".."]` is irrelevant to
+> packaging.
+
+- [ ] **Step 1a: Add `exports_files` to the repo-root `BUILD.bazel`**
+
+The wheel references `//:README.md` and `//:LICENSE`; the root package must
+export them. Append to `BUILD.bazel`:
+```starlark
+exports_files(["README.md", "LICENSE"])
+```
+
+- [ ] **Step 1b: Add the `_sudo_files` filegroup**
+
+Append to `src/infinite_craft_cli/BUILD.bazel`:
+```starlark
+# Re-expose the _sudo tree artifact as a direct file so py_wheel (which packages
+# only ctx.files.deps, no PyInfo traversal) includes the kernel.
+filegroup(
+    name = "_sudo_files",
+    srcs = [":_sudo"],
+    visibility = ["//visibility:public"],
+)
+```
+
+- [ ] **Step 1c: Create `release/BUILD.bazel`**
 
 ```starlark
 load("@rules_python//python:packaging.bzl", "py_wheel")
@@ -155,8 +193,11 @@ py_wheel(
     entry_points = {"console_scripts": ["infinite-craft = infinite_craft_cli.cli:main"]},
     extra_distinfo_files = {"//:LICENSE": "LICENSE"},
     strip_path_prefixes = ["src"],
-    stamp = 1,
-    deps = ["//src/infinite_craft_cli:infinite_craft_cli"],
+    stamp = 1,  # forces stamping; the CLI --stamp flag is then redundant
+    deps = [
+        "//src/infinite_craft_cli:infinite_craft_cli",  # the .py sources (direct files)
+        "//src/infinite_craft_cli:_sudo_files",          # the kernel tree artifact
+    ],
     visibility = ["//visibility:public"],
 )
 ```
@@ -168,46 +209,41 @@ rules_python version. Confirm each attribute exists in
 rules_python docs). If `description_content_type`/`project_urls` are unsupported
 in 1.7.0, drop them — they are cosmetic metadata, not correctness.
 
-- [ ] **Step 2: Build the wheel**
+- [ ] **Step 2: Build the wheel (use the `.dist` copy target — stable filename)**
 
-Run: `bazel build //release:wheel --stamp`
-Expected: SUCCESS; a `.whl` under `bazel-bin/release/`.
+The primary `//release:wheel` output embeds the stamped version in its filename
+via a placeholder that is only resolved by the implicit `.dist` copy target. Build
+the `.dist` target so downstream steps read a real filename:
+
+Run: `bazel build //release:wheel.dist`
+Expected: SUCCESS; a real `.whl` (version in the name, no `{...}` placeholder)
+under `bazel-bin/release/wheel_dist/`.
 
 - [ ] **Step 3: Verify wheel contents match the current package (top risk)**
 
 Run:
 ```bash
-unzip -l "$(echo bazel-bin/release/infinite_craft_cli-*.whl)" | sort
+unzip -l "$(echo bazel-bin/release/wheel_dist/infinite_craft_cli-*.whl)" | sort
 ```
 Expected: the archive contains `infinite_craft_cli/cli.py` (and siblings), the
 full `infinite_craft_cli/_sudo/` tree (`craft.py`, `_craft_impl.py`,
 `_regex_impl.py`, `_strings_impl.py`, `_sudo_rt.py`, `regex.py`, `__init__.py`),
 a `console_scripts` `infinite-craft` entry in the `entry_points.txt`, and the
-LICENSE in `*.dist-info/`.
-
-**If `_sudo/` is absent** (py_wheel did not follow the tree artifact): add an
-explicit inclusion — depend on the `_sudo` filegroup directly. Change `deps` to
-keep the py_library and add:
-```starlark
-    # Fallback: force the tree artifact in if PyInfo traversal misses it.
-    extra_requires = {},
-```
-and, in `src/infinite_craft_cli/BUILD.bazel`, expose the tree artifact via a
-`filegroup(name = "_sudo_files", srcs = [":_sudo"])`, then add
-`"//src/infinite_craft_cli:_sudo_files"` to the wheel `deps`. Re-run Step 2–3.
+LICENSE in `*.dist-info/`. If `_sudo/` is missing, the `_sudo_files` filegroup
+(Step 1b) is not in `deps` — fix and rebuild.
 
 - [ ] **Step 4: Install-smoke the wheel**
 
 Run:
 ```bash
-python3 -m venv /tmp/icw && /tmp/icw/bin/pip install -q "$(echo bazel-bin/release/infinite_craft_cli-*.whl)" && /tmp/icw/bin/python -c "import infinite_craft_cli._sudo.craft; print('kernel import OK')"
+python3 -m venv /tmp/icw && /tmp/icw/bin/pip install -q "$(echo bazel-bin/release/wheel_dist/infinite_craft_cli-*.whl)" && /tmp/icw/bin/python -c "import infinite_craft_cli._sudo.craft; print('kernel import OK')"
 ```
 Expected: prints `kernel import OK`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add release/BUILD.bazel src/infinite_craft_cli/BUILD.bazel
+git add BUILD.bazel release/BUILD.bazel src/infinite_craft_cli/BUILD.bazel
 git commit -m "build: //release:wheel builds the PyPI wheel via py_wheel
 
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
@@ -232,6 +268,12 @@ Append:
 ```starlark
 # Hermetic esbuild (bundles the bookmarklet; replaces npx esbuild/terser).
 bazel_dep(name = "aspect_rules_esbuild", version = "0.22.1")
+# Directly loaded by //bookmarklet (js_test, copy_to_directory). Under bzlmod a
+# root module can only load repos it declares — transitive deps of
+# aspect_rules_esbuild are NOT visible — so these are explicit even though
+# rules_esbuild also pulls them in. (Fable review.)
+bazel_dep(name = "aspect_rules_js", version = "2.1.0")
+bazel_dep(name = "aspect_bazel_lib", version = "2.9.4")
 
 esbuild = use_extension("@aspect_rules_esbuild//esbuild:extensions.bzl", "esbuild")
 esbuild.toolchain(esbuild_version = "0.28.1")
@@ -239,17 +281,23 @@ use_repo(esbuild, "esbuild_toolchains")
 register_toolchains("@esbuild_toolchains//:all")
 ```
 
-Note for the implementer: pin `aspect_rules_esbuild` to the newest version on
-the Bazel Central Registry and confirm the extension/toolchain API in its README
-for that version (the `use_extension` path and `esbuild.toolchain` attr name have
-changed across releases). `aspect_rules_js` + a hermetic Node come in
-transitively. Run `bazel mod deps` after editing to confirm resolution.
+Note for the implementer: pin all three rulesets to compatible versions on the
+Bazel Central Registry (match `aspect_rules_js`/`aspect_bazel_lib` to whatever
+the chosen `aspect_rules_esbuild` depends on — check its `MODULE.bazel` on BCR),
+and confirm the extension/toolchain API in the rules_esbuild README for that
+version (the `use_extension` path and `esbuild.toolchain` attr name have changed
+across releases). If **esbuild 0.28.1 is not in that ruleset's known-versions
+table**, use the ruleset's default esbuild version — byte-parity with the old
+`minify.sh` is an explicit non-goal. Run `bazel mod deps` after editing to
+confirm resolution.
 
 - [ ] **Step 2: Create `bookmarklet/esbuild.config.mjs`**
 
 ```javascript
 // esbuild config for the trainer bundle. Banner marks the output as generated.
-module.exports = {
+// This is an .mjs file, so it MUST use ESM `export default`, not `module.exports`
+// (a CommonJS `module.exports` in an .mjs throws at load). (Fable review.)
+export default {
   banner: {
     js: "/* Built artifact — do not edit. Single source of truth: trainer.src.mjs\n * (UI/effects) + ../sudo/craft.sudo (kernel, transpiled via sudoc). */",
   },
@@ -568,12 +616,18 @@ with:
           repository-cache: true
 
       - name: Build wheel
-        run: bazel build //release:wheel --stamp
+        run: bazel build //release:wheel.dist
 
-      - name: Stage wheel
+      - name: Stage wheel (refuse an unversioned build)
         run: |
           mkdir -p dist
-          cp bazel-bin/release/*.whl dist/
+          cp bazel-bin/release/wheel_dist/*.whl dist/
+          # A tagless/shallow checkout stamps 0.0.0 (workspace_status.sh); never
+          # publish that. On a real tag push the version is X.Y.Z.
+          if ls dist/*-0.0.0-*.whl >/dev/null 2>&1; then
+            echo "::error::wheel version is 0.0.0 — refusing to publish an unversioned build"
+            exit 1
+          fi
 
       - name: Wheel actually contains the kernel
         run: |
@@ -643,7 +697,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
 **Files:**
 - Delete: `scripts/generate.sh`, `scripts/sudoc-bin.sh`, `scripts/sudoc-version.txt`, `bookmarklet/minify.sh`, `bookmarklet/trainer.js`, `bookmarklet/trainer.min.js`
-- Modify: `.gitignore`, `PRIVACY.md`, `CHANGELOG.md`, `tests/parity/run_parity.sh`
+- Modify: `.gitignore`, `PRIVACY.md`, `CHANGELOG.md`, `tests/parity/run_parity.sh`, `README.md` (drop the `minify.sh`/`generate.sh` build instructions, ~line 146), `tests/parity/README.md` (drop the `generate.sh` fallback mention), `bookmarklet/trainer.src.mjs` (header comment references `scripts/generate.sh`)
 
 **Interfaces:**
 - Consumes: nothing new. This task removes the now-dead second path.
@@ -678,17 +732,27 @@ no committed artifact to compare against; reproducibility comes from rebuilding
 the Bazel target. Add a `CHANGELOG.md` entry describing the consolidation
 (single Bazel build path; `trainer.js`/`min.js` now build-only).
 
+Also drop the now-stale build instructions elsewhere: in `README.md` remove the
+`scripts/generate.sh` / `bookmarklet/minify.sh` steps (~line 146) and replace
+with the Bazel equivalents (`bazel build //bookmarklet:site`,
+`bazel build //release:wheel.dist`); in `tests/parity/README.md` remove the
+"regenerates adapters via `scripts/generate.sh` if missing" note; in
+`bookmarklet/trainer.src.mjs` fix the header comment that points at
+`scripts/generate.sh` (adapters now come from `//bookmarklet:_sudo`).
+
 - [ ] **Step 5: Grep for dangling references**
 
 Run:
 ```bash
 grep -rn "generate.sh\|sudoc-bin\|sudoc-version\|minify.sh\|trainer\.min\.js\|trainer\.js" \
-  --include=*.md --include=*.yml --include=*.sh --include=*.py --include=*.bazel . \
-  | grep -v bazel-out | grep -v "bookmarklet/BUILD.bazel\|tests/artifact_paths\|:trainer_js\|:trainer_min_js\|trainer_js_path\|trainer_min_js_path\|fetch('trainer.min.js'\|docs/superpowers"
+  --include=*.md --include=*.yml --include=*.sh --include=*.py --include=*.bazel --include=*.mjs --include=*.js . \
+  | grep -v bazel-out | grep -v "bookmarklet/BUILD.bazel\|bookmarklet/esbuild.config.mjs\|tests/artifact_paths\|:trainer_js\|:trainer_min_js\|trainer_js_path\|trainer_min_js_path\|fetch('trainer.min.js'\|docs/superpowers"
 ```
 Expected: no references to the deleted scripts or to reading committed
 `trainer.js`/`min.js` as files (only the Bazel targets / locators / the
-extension's `fetch('trainer.min.js')` remain).
+extension's `fetch('trainer.min.js')` remain). The `--include=*.mjs` catches the
+`trainer.src.mjs` header comment; `*.js` catches any lingering loader/userscript
+mention.
 
 - [ ] **Step 6: Final green**
 
@@ -727,3 +791,14 @@ are defined in Task 5 Step 1 and used identically in Steps 3–5. Target labels
 `//release:wheel`, `//bookmarklet:{trainer_js,trainer_min_js,site,kernel_smoke_test}`
 are consistent across Tasks 2–7. Stamp key `STABLE_VERSION` defined in Task 1,
 consumed in Task 2.
+
+**Fable review incorporated (2026-08-04):** (1) `py_wheel` packages only
+`ctx.files.deps` (no PyInfo traversal) → `_sudo_files` filegroup is now a
+first-class wheel dep, not a fallback; bogus `extra_requires` line removed. (2)
+Stamped wheel filename is only real on the implicit `//release:wheel.dist` target
+→ build/stage/publish all read `bazel-bin/release/wheel_dist/`. (3) `aspect_rules_js`
+and `aspect_bazel_lib` get explicit root `bazel_dep`s (bzlmod won't load transitive
+repos). (4) `esbuild.config.mjs` uses `export default` (ESM), not `module.exports`.
+Pre-empts: root `exports_files`, `0.0.0` tagless fallback + publish guard,
+esbuild-version-not-in-table fallback, and Task 7 now also fixes `README.md` /
+`tests/parity/README.md` / `trainer.src.mjs` and greps `.mjs`/`.js`.
