@@ -666,7 +666,6 @@ export func validate_query_at_enqueue(query: text) -> Option<text>
     if query.length > 512
         return Some("  Query too long (max 512 characters)")
     q, qf_exclude, qf_only_new = parse_query_filter(query)
-    assert (qf_exclude == qf_exclude) and (qf_only_new == qf_only_new)
     if not is_delimited_regex(q)
         return None
     body = text_slice(q, 1, q.length - 1)
