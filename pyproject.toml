@@ -1,59 +1,6 @@
-# -----------------------------------------------------------------------
-# LEGACY BUILD CONFIG — NOT USED TO BUILD OR PUBLISH THE WHEEL.
-#
-# The canonical and only supported build of the published wheel is Bazel
-# `//release:wheel` (see release/BUILD.bazel). The [build-system], [project],
-# and [tool.hatch.*] sections below are left over from the pre-Bazel
-# hatchling/hatch-vcs toolchain and are no longer wired to anything: their
-# `force-include` of `src/infinite_craft_cli/_sudo/` depends on a generated
-# directory that nothing in this repo produces anymore
-# (`scripts/generate.sh` was deleted as part of the Bazel consolidation).
-# `pip install .` from source is NOT supported — use the Bazel-built wheel.
-# -----------------------------------------------------------------------
-[build-system]
-requires = ["hatchling", "hatch-vcs"]
-build-backend = "hatchling.build"
-
-[project]
-name = "infinite-craft-cli"
-dynamic = ["version"]
-description = "Interactive CLI for Infinite Craft — combine elements from the terminal"
-readme = "README.md"
-license = "MIT"
-requires-python = ">=3.10"
-keywords = ["infinite-craft", "cli", "game"]
-classifiers = [
-    "Development Status :: 5 - Production/Stable",
-    "Environment :: Console",
-    "Topic :: Games/Entertainment",
-    "Programming Language :: Python :: 3",
-]
-dependencies = [
-    "curl-cffi>=0.15",
-]
-
-[project.urls]
-Homepage = "https://github.com/hacker6284/infinite-craft-cli"
-Repository = "https://github.com/hacker6284/infinite-craft-cli"
-
-[tool.hatch.version]
-source = "vcs"
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/infinite_craft_cli"]
-
-# The generated kernel is gitignored; hatchling's VCS-based file selection
-# skips it, so it is force-included at BOTH stages (build tools build the
-# wheel from the sdist, so the sdist must carry it too). Without this the
-# wheel ships without infinite_craft_cli._sudo and the CLI dies on import.
-[tool.hatch.build.targets.sdist.force-include]
-"src/infinite_craft_cli/_sudo" = "src/infinite_craft_cli/_sudo"
-
-[tool.hatch.build.targets.wheel.force-include]
-"src/infinite_craft_cli/_sudo" = "infinite_craft_cli/_sudo"
-
-[project.scripts]
-infinite-craft = "infinite_craft_cli.cli:main"
+# Package build + metadata now live in release/BUILD.bazel (Bazel py_wheel;
+# the canonical and only supported build of the published wheel is
+# `//release:wheel`). This file retains only pytest config.
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
