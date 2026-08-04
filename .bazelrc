@@ -1,0 +1,2 @@
+# Stamp STABLE_VERSION (tools/workspace_status.sh) for //release:wheel.
+build --workspace_status_command=tools/workspace_status.sh
