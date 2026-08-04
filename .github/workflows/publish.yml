@@ -31,7 +31,7 @@ jobs:
           # A tagless/shallow checkout would stamp 0.0.0 (workspace_status.sh);
           # this also catches that, plus any other stamping mismatch.
           EXPECTED="${GITHUB_REF_NAME#v}"
-          WHEEL="$(ls dist/*-py3-none-any.whl 2>/dev/null | head -n1)"
+          WHEEL="$(ls dist/*-py3-none-any.whl 2>/dev/null | head -n1 || true)"
           if [ -z "$WHEEL" ]; then
             echo "::error::no wheel found in dist/ — build step did not produce a wheel"
             exit 1
