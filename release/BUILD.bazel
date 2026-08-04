@@ -1,0 +1,40 @@
+load("@rules_python//python:packaging.bzl", "py_wheel")
+
+# Single-source wheel: packages the pure-Python CLI plus the rules_sudo-emitted
+# _sudo/ kernel (a tree artifact reached transitively through the py_library's
+# PyInfo). strip_path_prefixes drops the "src/" layout root so files land under
+# infinite_craft_cli/… in the wheel.
+py_wheel(
+    name = "wheel",
+    distribution = "infinite-craft-cli",
+    version = "{STABLE_VERSION}",
+    python_tag = "py3",
+    abi = "none",
+    platform = "any",
+    python_requires = ">=3.10",
+    summary = "Interactive CLI for Infinite Craft — combine elements from the terminal",
+    description_file = "//:README.md",
+    description_content_type = "text/markdown",
+    homepage = "https://github.com/hacker6284/infinite-craft-cli",
+    project_urls = {
+        "Homepage": "https://github.com/hacker6284/infinite-craft-cli",
+        "Repository": "https://github.com/hacker6284/infinite-craft-cli",
+    },
+    license = "MIT",
+    classifiers = [
+        "Development Status :: 5 - Production/Stable",
+        "Environment :: Console",
+        "Topic :: Games/Entertainment",
+        "Programming Language :: Python :: 3",
+    ],
+    requires = ["curl-cffi>=0.15"],
+    entry_points = {"console_scripts": ["infinite-craft = infinite_craft_cli.cli:main"]},
+    extra_distinfo_files = {"//:LICENSE": "LICENSE"},
+    strip_path_prefixes = ["src"],
+    stamp = 1,  # forces stamping; the CLI --stamp flag is then redundant
+    deps = [
+        "//src/infinite_craft_cli:infinite_craft_cli",  # the .py sources (direct files)
+        "//src/infinite_craft_cli:_sudo_files",          # the kernel tree artifact
+    ],
+    visibility = ["//visibility:public"],
+)

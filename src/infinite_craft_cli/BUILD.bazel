@@ -23,3 +23,11 @@ py_library(
         "@pip//curl_cffi",
     ],
 )
+
+# Re-expose the _sudo tree artifact as a direct file so py_wheel (which packages
+# only ctx.files.deps, no PyInfo traversal) includes the kernel.
+filegroup(
+    name = "_sudo_files",
+    srcs = [":_sudo"],
+    visibility = ["//visibility:public"],
+)
