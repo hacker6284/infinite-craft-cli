@@ -17,6 +17,7 @@ py_library(
     data = [
         "//bookmarklet:trainer_js",
         "//bookmarklet:trainer_min_js",
+        "//extension:zip",
     ],
     deps = ["@rules_python//python/runfiles"],
 )
@@ -48,6 +49,7 @@ py_library(
     data = [
         "//bookmarklet:trainer_js",
         "//bookmarklet:trainer_min_js",
+        "//extension:zip",
     ],
 ) for test_file in glob(
     ["test_*.py"],

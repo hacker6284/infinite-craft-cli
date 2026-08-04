@@ -1,0 +1,31 @@
+load("@rules_pkg//pkg:mappings.bzl", "pkg_files", "strip_prefix")
+load("@rules_pkg//pkg:zip.bzl", "pkg_zip")
+
+# The extension is a thin loader: only these tracked sources ship in the
+# Web Store zip (never bookmarklet/trainer.js -- it is fetched at runtime
+# from GitHub Pages, see loader.js). strip_prefix.from_pkg() drops the
+# "extension/" package prefix so the archive layout is loader.js,
+# manifest.json, page-bridge.js, icons/icon16.png, ... at the ROOT --
+# matching what the Chrome Web Store expects to unpack.
+pkg_files(
+    name = "extension_files",
+    srcs = [
+        "loader.js",
+        "manifest.json",
+        "page-bridge.js",
+        "icons/icon16.png",
+        "icons/icon48.png",
+        "icons/icon128.png",
+    ],
+    strip_prefix = strip_prefix.from_pkg(),
+)
+
+# Named to match the filename the repo has historically built by hand
+# (tests/test_extension_loader.py + tests/artifact_paths.py locate it via
+# runfiles).
+pkg_zip(
+    name = "zip",
+    srcs = [":extension_files"],
+    out = "infinite-craft-trainer.zip",
+    visibility = ["//visibility:public"],
+)

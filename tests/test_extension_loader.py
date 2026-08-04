@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.artifact_paths import trainer_js_path, trainer_min_js_path
+from tests.artifact_paths import extension_zip_path, trainer_js_path, trainer_min_js_path
 
 ROOT = Path(__file__).resolve().parents[1]
 EXTENSION = ROOT / "extension"
@@ -21,7 +21,6 @@ LOADER = EXTENSION / "loader.js"
 MANIFEST = EXTENSION / "manifest.json"
 TRAINER_SRC = BOOKMARKLET / "trainer.src.mjs"
 INDEX_HTML = BOOKMARKLET / "index.html"
-ZIP_PATH = ROOT / "infinite-craft-trainer.zip"
 
 
 def _read(path: Path) -> str:
@@ -123,9 +122,10 @@ def test_cross_surface_trainer_url_parity() -> None:
 
 
 def test_extension_zip_matches_current_layout() -> None:
-    assert ZIP_PATH.is_file()
+    zip_path = extension_zip_path()
+    assert zip_path.is_file()
     listing = subprocess.run(
-        ["unzip", "-l", str(ZIP_PATH)],
+        ["unzip", "-l", str(zip_path)],
         capture_output=True,
         text=True,
         check=True,
@@ -137,7 +137,7 @@ def test_extension_zip_matches_current_layout() -> None:
 
 
 def test_extension_zip_matches_source_hashes() -> None:
-    with zipfile.ZipFile(ZIP_PATH) as archive:
+    with zipfile.ZipFile(extension_zip_path()) as archive:
         for name in ("loader.js", "manifest.json"):
             archived = archive.read(name)
             source = (EXTENSION / name).read_bytes()

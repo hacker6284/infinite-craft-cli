@@ -84,3 +84,9 @@ esbuild = use_extension("@aspect_rules_esbuild//esbuild:extensions.bzl", "esbuil
 esbuild.toolchain(esbuild_version = "0.28.0")
 use_repo(esbuild, "esbuild_toolchains")
 register_toolchains("@esbuild_toolchains//:all")
+
+# Packages the Chrome extension's tracked sources into a real .zip
+# (//extension:zip) so tests/test_extension_loader.py can read a hermetic,
+# Bazel-built artifact instead of a manually-built untracked file. Pinned to
+# the latest BCR release (checked https://registry.bazel.build/modules/rules_pkg).
+bazel_dep(name = "rules_pkg", version = "1.2.0")

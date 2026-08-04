@@ -1,8 +1,8 @@
-"""Locate the Bazel-built trainer bundle from tests.
+"""Locate Bazel-built artifacts (trainer bundle, extension zip) from tests.
 
 Under `bazel test` the files arrive as runfiles data deps; under a plain
 `pytest` dev run they are read from `bazel-bin/` (build them first with
-`bazel build //bookmarklet:trainer_js //bookmarklet:trainer_min_js`).
+`bazel build //bookmarklet:trainer_js //bookmarklet:trainer_min_js //extension:zip`).
 """
 from pathlib import Path
 
@@ -32,3 +32,9 @@ def trainer_js_path() -> Path:
 
 def trainer_min_js_path() -> Path:
     return _runfiles_path("bookmarklet/trainer.min.js") or _bin_path("bookmarklet/trainer.min.js")
+
+
+def extension_zip_path() -> Path:
+    return _runfiles_path("extension/infinite-craft-trainer.zip") or _bin_path(
+        "extension/infinite-craft-trainer.zip"
+    )
