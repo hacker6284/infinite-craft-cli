@@ -27,13 +27,14 @@ jobs:
         run: |
           mkdir -p dist
           cp bazel-bin/release/wheel_dist/*.whl dist/
-          pip install twine
-          twine check dist/*
+          python3 -m venv /tmp/icw
+          /tmp/icw/bin/pip install twine
+          /tmp/icw/bin/twine check dist/*
       - name: Wheel actually contains the kernel and the CLI runs
         run: |
-          pip install dist/*.whl
-          python -c "import infinite_craft_cli._sudo.craft; print('kernel import OK')"
-          infinite-craft --help > /dev/null && echo "entry point OK"
+          /tmp/icw/bin/pip install dist/*.whl
+          /tmp/icw/bin/python -c "import infinite_craft_cli._sudo.craft; print('kernel import OK')"
+          /tmp/icw/bin/infinite-craft --help > /dev/null && echo "entry point OK"
       - name: Keep artifacts for inspection
         uses: actions/upload-artifact@v4
         with:
