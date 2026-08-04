@@ -53,3 +53,34 @@ archive_override(
 sudo = use_extension("@rules_sudo//:extensions.bzl", "sudo")
 sudo.toolchain(version = "v0.3.0")
 use_repo(sudo, "sudo_toolchain")
+
+# Hermetic esbuild (bundles the bookmarklet; replaces npx esbuild/terser).
+#
+# Pinned to the latest BCR release (0.26.0) rather than the brief's 0.22.1:
+# checked https://registry.bazel.build/modules/aspect_rules_esbuild, 0.26.0 is
+# current. Its own MODULE.bazel (github.com/aspect-build/rules_esbuild
+# @v0.26.0) declares minimum bazel_dep versions of aspect_rules_js 3.0.3 and
+# bazel_lib 3.0.0 -- note the *module name* "bazel_lib", not
+# "aspect_bazel_lib": upstream bazel-contrib/bazel-lib renamed the BCR module
+# starting at bazel_lib 3.0.0 (aspect_bazel_lib tops out around 2.22.5 and is
+# the pre-rename name). Pinned here to the latest release of each on BCR.
+bazel_dep(name = "aspect_rules_esbuild", version = "0.26.0")
+
+# Directly loaded by //bookmarklet (esbuild rule transitively needs JsInfo /
+# copy_to_bin machinery from these). Under bzlmod a root module can only load
+# repos it declares -- transitive deps of aspect_rules_esbuild are NOT
+# visible -- so these are explicit even though rules_esbuild also pulls them
+# in. (Fable review.)
+bazel_dep(name = "aspect_rules_js", version = "3.3.1")
+bazel_dep(name = "bazel_lib", version = "3.7.1")
+
+esbuild = use_extension("@aspect_rules_esbuild//esbuild:extensions.bzl", "esbuild")
+
+# esbuild 0.28.1 (the brief's suggested pin) is not in aspect_rules_esbuild
+# 0.26.0's vendored TOOL_VERSIONS table (max is 0.28.0, which is also that
+# table's first/default entry -- LATEST_ESBUILD_VERSION). Byte-parity with
+# the old minify.sh is an explicit non-goal, so we take the ruleset's default
+# instead of supplying an unvendored version + manual integrity hashes.
+esbuild.toolchain(esbuild_version = "0.28.0")
+use_repo(esbuild, "esbuild_toolchains")
+register_toolchains("@esbuild_toolchains//:all")

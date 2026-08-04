@@ -1,3 +1,4 @@
+load("@aspect_rules_esbuild//esbuild:defs.bzl", "esbuild")
 load("@rules_sudo//:defs.bzl", "sudo_js_library")
 
 # Kernel adapters for craft.sudo (JS target), compiled by rules_sudo's
@@ -17,5 +18,39 @@ filegroup(
         "trainer.src.mjs",
         ":_sudo",
     ],
+    visibility = ["//visibility:public"],
+)
+
+# Both targets pin target = ["esnext"] (rules_esbuild's macro default is
+# es2015) to match the old minify.sh, which invoked esbuild with no --target
+# and so performed no syntax lowering. Without this override, es2015 lowering
+# rewrites craft.sudo's BigInt literals (e.g. "48n") in bookmarklet/_sudo/
+# _regex_impl.mjs into `BigInt("48")` calls -- functionally fine (verified
+# via `node --check`) but a gratuitous transform + a wall of esbuild
+# "may crash at run-time [bigint]" warnings for a bookmarklet that only ever
+# runs in modern BigInt-capable browsers.
+
+# Bundled, unminified trainer (host tests + local dev read this).
+esbuild(
+    name = "trainer_js",
+    entry_point = "trainer.src.mjs",
+    srcs = ["trainer.src.mjs", ":_sudo"],
+    config = "esbuild.config.mjs",
+    format = "iife",
+    target = ["esnext"],
+    output = "trainer.js",
+    visibility = ["//visibility:public"],
+)
+
+# Minified trainer (served by GitHub Pages, fetched by the extension).
+esbuild(
+    name = "trainer_min_js",
+    entry_point = "trainer.src.mjs",
+    srcs = ["trainer.src.mjs", ":_sudo"],
+    config = "esbuild.config.mjs",
+    format = "iife",
+    minify = True,
+    target = ["esnext"],
+    output = "trainer.min.js",
     visibility = ["//visibility:public"],
 )
