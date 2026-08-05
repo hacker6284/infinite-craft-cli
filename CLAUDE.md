@@ -12,4 +12,4 @@ When landing a change on `main`:
 
 Work-in-progress stays on branches or worktrees until steps 1–3 are done.
 
-The version in `pyproject.toml` is derived automatically from git tags via `hatch-vcs` — do not set it manually. The GitHub Actions workflow (`.github/workflows/publish.yml`) runs on `v*` tag pushes to publish PyPI and create a GitHub Release from the matching `CHANGELOG.md` section.
+The wheel version is derived automatically from git tags at build time by Bazel — `tools/workspace_status.sh` stamps `STABLE_VERSION`, consumed by `//release:wheel` — so do not set it manually. The GitHub Actions workflow (`.github/workflows/publish.yml`) runs on `v*` tag pushes to build the wheel with Bazel, publish it to PyPI, and create a GitHub Release from the matching `CHANGELOG.md` section.

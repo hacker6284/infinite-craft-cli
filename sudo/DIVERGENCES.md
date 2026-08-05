@@ -174,8 +174,8 @@ regex.search(...)` as the oracle for every anchor-placement case in
 any fixture element name containing an `a` (e.g. `Water`, `Earth`), not the
 empty set; `test_alternation_quantifier_group_matches_names_with_a` —
 `/(a|aa)+/` matches the same set via a quantified alternation group.
-`sudo/craft.sudo`'s own `regex.sudo`-level tests (`"regex non-capturing
-groups"`, `"regex mid-pattern anchors"`) are the underlying oracle.
+The underlying oracle is `regex.sudo`'s own test suite in the sudocode
+stdlib (`"regex non-capturing groups"`, `"regex mid-pattern anchors"`).
 
 **Confirmed gap, not papered over — no `(?:...)` non-capturing-group
 syntax:** because every `(...)` group is already non-capturing by

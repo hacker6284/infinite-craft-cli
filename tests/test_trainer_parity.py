@@ -1,7 +1,8 @@
 """Parity checks for browser trainer helpers (no JS harness required).
 
-Mirrors bookmarklet/trainer.js and extension/trainer.js. Keep in sync when
-changing either side.
+Mirrors the browser trainer logic in bookmarklet/trainer.src.mjs (the JS
+source; trainer.js / trainer.min.js are now build-only bundles). Keep in
+sync when changing the trainer source.
 """
 
 import re

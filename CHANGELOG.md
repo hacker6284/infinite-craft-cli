@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [1.6.0] - 2026-08-05
 
 ### Changed
 - **Consolidated onto a single Bazel build path.** The wheel (`//release:wheel.dist`),
