@@ -348,14 +348,31 @@ def _pairs_from_boundary(pair_tuples, elements):
 
 
 def _resolve_element(storage, name: str):
-    """Look up an element by name in discoveries; fall back to bare Element."""
-    resolved_name, _emoji, _first = craft.resolve_element_boundary(
-        _elements_to_boundary(storage.get_all()), name
-    )
-    found = storage.get_by_name(resolved_name)
+    """Look up an element by name in discoveries; fall back to bare Element.
+
+    Host-side resolution (exact → stripped → title_case → ASCII-ci) matching
+    the kernel, without rematerializing the entire save through
+    resolve_element_boundary on every call — that was multi-second on large
+    inventories when formatting multi-step /recipe output.
+    """
+    found = storage.get_by_name(name)
     if found is not None:
         return found
-    return Element(name=resolved_name)
+    stripped = name.strip()  # display names are ASCII; strip is sufficient
+    if stripped != name:
+        found = storage.get_by_name(stripped)
+        if found is not None:
+            return found
+    title = craft.title_case(stripped)
+    if title != stripped:
+        found = storage.get_by_name(title)
+        if found is not None:
+            return found
+    needle = stripped.lower()
+    for el in storage.get_all():
+        if el.name.lower() == needle:
+            return el
+    return Element(name=title)
 
 
 # Runtime cache for pair results — avoids re-hitting the API for the same combo
@@ -2248,8 +2265,11 @@ async def _fill_missing_recipes_async(storage):
                 _repl_print_lines("  Stopped early.")
                 _mark_cancel_notified()
                 break
-            recipes = _load_recipes()
-            if not craft.is_unfilled(name, recipes) or name in failed:
+            # Track filled-ness via the local `missing` set (updated from each
+            # lineage's result names). Avoid craft.is_unfilled in this loop —
+            # it deep-copies the whole recipe map per call (sudoc Map arg
+            # semantics) and was multi-second on large saves.
+            if name not in missing or name in failed:
                 skipped += 1
                 continue
             processed += 1
@@ -2271,6 +2291,9 @@ async def _fill_missing_recipes_async(storage):
             )
             _record_recipes_batch(recipe_batch)
             storage.add_batch(element_batch)
+            # Results in this lineage now have at least one recipe pair.
+            for result_name, _a, _b in recipe_batch:
+                missing.discard(result_name)
             fetched += 1
             if await _sleep_cancellable_async(0.5):
                 _repl_print_lines("  Stopped early.")

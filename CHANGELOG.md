@@ -1,5 +1,33 @@
 # Changelog
 
+## [1.8.3] - 2026-08-08
+
+### Fixed
+- **`/fill` and `/unfilled` no longer stall on large saves.** `unfilled_names_boundary`
+  called `is_unfilled(name, recipes)` once per element; sudoc deep-copies every
+  Map argument, so a few-thousand-element save paid thousands of full recipe-map
+  copies before the first Infinibrowser request. The boundary now builds a
+  filled-name set once and scans with O(1) lookups (~2.8s → ~25ms on a 3k-element
+  fixture). Both hosts also skip names already filled by a prior lineage in the
+  same `/fill` run (local set, not per-name kernel `is_unfilled`).
+
+- **Trainer and CLI feel snappy again on large inventories.** Hot paths were
+  rematerializing the entire element list through the sudoc adapter on every
+  resolve and every single-element add (`resolve_element_boundary` /
+  `add_element_boundary`). Formatting a multi-step `/recipe` did that hundreds
+  of times; `/fill` and `/import` did it per lineage step. Hosts now resolve and
+  insert-or-ignore against their name indexes and only call string-level kernel
+  helpers (`title_case`, `sanitize_element_name`). Full-list boundary calls stay
+  for match and bulk pair generation where the whole inventory is required.
+  Resolve ×120 on a ~2.5k-element save: ~442ms → ~0.05ms in the trainer.
+
+### Changed
+- **`ingredient_usage_counts` and the internal export/prune closure no longer
+  sort map keys.** `sorted_text_list` is an O(n²) insertion sort; key order does
+  not affect usage counts or the transitive included-name fixed point. Bulk
+  prioritize and export/prune drop that pure overhead. Public included-name
+  lists remain sorted for stable display.
+
 ## [1.8.2] - 2026-08-07
 
 ### Fixed

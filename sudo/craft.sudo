@@ -198,9 +198,11 @@ func ascii_lower_text(s: text) -> text
     return out
 
 func get_by_name_ci(elements: List<Element>, name: text) -> Option<Element>
-    // ASCII case-insensitive scan; first hit wins. Used as a last inventory
-    // fallback so "you don't" / residual "You Don'T" still resolve to the
-    // stored "You Don't" even when title_case cannot reconstruct it.
+    // ASCII case-insensitive scan only — first hit wins. Apostrophe code
+    // points are NOT folded: the live pair API treats "You Don't" (U+0027)
+    // and "You Don't" (U+2019) as distinct element names, so inventory and
+    // resolve must keep them separate. Typographic vs ASCII forms stay
+    // different elements even if they look identical on screen.
     needle = ascii_lower_text(name)
     for e in elements
         if ascii_lower_text(e.name) == needle
@@ -216,6 +218,9 @@ func resolve_element(elements: List<Element>, name: text) -> Element
         found_s = get_by_name(elements, stripped)
         if found_s.is_some()
             return found_s.unwrap()
+    // title_case preserves the input's apostrophe code point (straight or
+    // curly); it only changes letter case. That way a typed ASCII name and
+    // an imported U+2019 name never collapse into one.
     title = title_case(stripped)
     if not (title == stripped)
         found2 = get_by_name(elements, title)
@@ -390,9 +395,11 @@ func crawl_generation_pairs(pool: List<Element>, tried: Set<text>) -> (List<(Ele
 export func ingredient_usage_counts(recipes: Map<text, List<(text, text)>>) -> Map<text, int>
     // +1 per ingredient slot per recorded recipe: a self-pair [X, X]
     // counts X twice; results do not count, only ingredient slots.
+    // Iteration order does not affect the counts map — do not sort keys
+    // (sorted_text_list is O(n²) insertion sort and made prioritize_pairs
+    // lag on large recipe indexes for every bulk command).
     counts: Map<text, int> = Map()
-    keys = sorted_text_list(recipes.keys())
-    for name in keys
+    for name in recipes.keys()
         for pair in recipes[name]
             pa, pb = pair
             counts[pa] = counts.get(pa).get_or(0) + 1
@@ -555,20 +562,24 @@ func trace_recipe(elements: List<Element>, recipes: Map<text, List<(text, text)>
 // ---------------------------------------------------------------------------
 
 func included_element_names(recipes: Map<text, List<(text, text)>>) -> Set<text>
+    // Transitive closure of recipe ingredients. The final Set is independent
+    // of scan order, so we never sort keys/items here — sorted_text_list is
+    // O(n²) and re-sorting on every closure iteration made export/prune lag
+    // on large saves. The public boundary still returns a sorted name list.
     included: Set<text> = Set()
     included.add("Water")
     included.add("Fire")
     included.add("Wind")
     included.add("Earth")
-    keys = sorted_text_list(recipes.keys())
-    for name in keys
+    for name in recipes.keys()
         pairs = recipes[name]
         if pairs.length > 0
             included.add(name)
     changed = true
     while changed
         changed = false
-        names = sorted_text_list(included.items())
+        // Snapshot current members; order does not affect the fixed point.
+        names = included.items()
         for nm in names
             if not recipes.has(nm)
                 continue
@@ -608,6 +619,12 @@ export func is_unfilled(name: text, recipes: Map<text, List<(text, text)>>) -> b
     // alone does not make an element filled (consistent with
     // included_element_names, which seeds only non-empty recipe results).
     // Base elements are never unfilled.
+    //
+    // Cost note: sudoc deep-copies Map args on entry, so a hot loop of
+    // is_unfilled(name, recipes) is O(n · |recipes|) in marshalling. Prefer
+    // unfilled_names_boundary for bulk scans — it precomputes a filled set
+    // once. Hosts that re-check after each /fill lineage should track a
+    // local filled set rather than calling this per name.
     if is_base_element(name)
         return false
     return recipes.get(name).get_or([]).length == 0
@@ -1229,9 +1246,22 @@ export func crawl_generation_pairs_boundary(pool: List<(text, text, bool)>, trie
 
 export func unfilled_names_boundary(elements: List<(text, text, bool)>, recipes: Map<text, List<(text, text)>>) -> List<text>
     // Element-list order is preserved (both hosts display in storage order).
+    //
+    // Precompute names with a non-empty recipe list, then scan elements with
+    // O(1) set lookups. The previous form called is_unfilled(e.name, recipes)
+    // once per element; sudoc deep-copies every Map parameter on entry, so
+    // that was O(|elements| · |recipes|) full-map dups and made /fill and
+    // /unfilled appear to hang on multi-thousand-element saves (same class
+    // of bug as the old is_available-in-compute_layers path).
+    filled: Set<text> = Set()
+    for k in recipes.keys()
+        if recipes[k].length > 0
+            filled.add(k)
     out: List<text> = []
     for e in elements_from_tuples(elements)
-        if is_unfilled(e.name, recipes)
+        if is_base_element(e.name)
+            continue
+        if not filled.has(e.name)
             out.append(e.name)
     return out
 
@@ -2032,10 +2062,26 @@ test "title_case resolve get_by_name add record"
     assert hit.emoji == "🔥"
     titled = resolve_element(els, "baking soda")
     assert titled.name == "Baking Soda"
-    // Exact + title_case + case-insensitive paths for contractions
+    // Exact + title_case + case-insensitive paths (same apostrophe code point)
     assert resolve_element(els, "You Don't").name == "You Don't"
     assert resolve_element(els, "you don't").emoji == "🤷"
     assert resolve_element(els, "YOU DON'T").name == "You Don't"
+    // ASCII ' and U+2019 are distinct element names — do not cross-match.
+    curly_name: text = "You Don"
+    curly_name.append(8217)
+    curly_name = curly_name + "t"
+    els2: List<Element> = []
+    els2.append(Element(name = curly_name, emoji = "🤨", first = false))
+    els2.append(Element(name = "Beach", emoji = "🏖️", first = false))
+    // Typing ASCII ' against a curly-only inventory synthesizes ASCII form
+    // (no emoji) rather than aliasing to the curly element.
+    miss_cross = resolve_element(els2, "You Don't")
+    assert miss_cross.emoji == ""
+    assert miss_cross.name == "You Don't"
+    // Typing/pasting the curly form still hits the stored curly element.
+    hit_curly = resolve_element(els2, curly_name)
+    assert hit_curly.emoji == "🤨"
+    assert hit_curly.name == curly_name
     miss = resolve_element(els, "unicorn dust")
     assert miss.name == "Unicorn Dust"
     assert miss.emoji == ""

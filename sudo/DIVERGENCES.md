@@ -44,7 +44,7 @@ against `sudo/craft.sudo` and upstream `src/infinite_craft_cli/`.
 |---|--------|-----------|
 | 1 | **Unbounded trace BFS** — no depth cap | Matches CLI `do_recipe` / unbounded `while not found`; the 200-layer cap was only a JS browser-safety artifact, never a CLI invariant. |
 | 2 | **No discovered-flag promotion on re-add** | Matches `storage.add` insert-or-ignore; persisted storage is the source of truth. |
-| 3 | **Case-sensitive `get_by_name`; `resolve_element` falls back raw → stripped → title-cased → ASCII case-insensitive**. `title_case` is `str.title()` **except** apostrophes do not start a new word | `get_by_name` still matches `storage.get_by_name`'s exact lookup. The apostrophe divergence is deliberate (§3): `str.title()` yields `"You Don'T"`, which missed stored contraction names *and* was sent verbatim to the pair API for undiscovered operands, returning a spurious Nothing. The case-insensitive scan is a last-resort inventory fallback so residual `Don'T`-form names still resolve. |
+| 3 | **Case-sensitive `get_by_name`; `resolve_element` falls back raw → stripped → title-cased → ASCII case-insensitive**. `title_case` is `str.title()` **except** multi-letter apostrophe stems stay in-word. Apostrophe *code points* are never folded | `get_by_name` still matches `storage.get_by_name`'s exact lookup. `str.title()`'s `"You Don'T"` is rejected (§3) because it mangled contractions for the pair API. U+0027 vs U+2019 stay distinct element names (the live API can have both); resolve does not alias them. |
 | 4 | **Export/prune filter = transitive recipe closure** (`included_element_names(recipes)` only) | Matches v1.4.2 `_included_element_names` (cli.py ~2518–2547); pure orphans are export-excluded and prune targets. |
 | 5 | **No fnmatch/glob safety gate** | Vendored `regex.sudo` is Thompson-NFA / Pike-VM, linear in input length — wildcard-count / consecutive-star heuristics are unnecessary. |
 | 6 | **No 512-char name truncation** | Only the **query** is capped at 512; names match in full. JS `name.slice(0, 512)` existed only to bound in-browser `RegExp` cost. |
@@ -91,6 +91,21 @@ behaviours these rest on — orphan and empty-recipe ingredients counting as
 available, first-*ready* pair winning in list order, and an unsorted key list
 with a mid-layer stop still yielding the correct ancestor chain.
 
+**Related host/kernel snappiness (same sudoc Map/List cost model):**
+
+- `unfilled_names_boundary` precomputes a filled set once (never call
+  `is_unfilled` per element — each call deep-copies the recipe map).
+- `ingredient_usage_counts` and the internal `included_element_names` closure
+  no longer sort keys/items; insertion-sort was pure overhead for commutative
+  aggregates / set fixed-points. The public included-names boundary still
+  returns a sorted list for stable display.
+- Hosts must **not** rematerialize the full element list through
+  `resolve_element_boundary` / `add_element_boundary` on every operand or
+  add — use a name index (trainer `_nameIndex`, CLI `storage.get_by_name`)
+  and only call string-level kernel helpers (`title_case`,
+  `sanitize_element_name`). Full-list boundary calls stay for match / bulk
+  pair generation where the whole inventory is needed.
+
 ### 2. No discovered-flag promotion on re-add
 
 `add_element` (~188–193): if the name already exists, return `false` without
@@ -101,20 +116,20 @@ mutating emoji or `first`. Re-add with `first=true` cannot promote a stored
 
 `get_by_name` is exact `e.name == name`. `resolve_element` tries the raw name,
 then stripped, then `title_case(stripped)`, then an ASCII **case-insensitive**
-inventory scan, else synthesizes `Element(name=title, ...)`. `title_case` is
-an ASCII approximation of Python `str.title()` **except** that apostrophes
-(ASCII `'` and U+2019) do not start a new word — so `"you don't"` →
-`"You Don't"`, not Python's `"You Don'T"`. The Don'T form both missed stored
-contraction names and was sent to the pair API for undiscovered operands
-(trainer screenshot: `Beach + You Don't` displayed/sent as `You Don'T` →
-Nothing).
+scan of the same code points, else synthesizes `Element(name=title, ...)`.
+Apostrophe **code points are never folded**: `"You Don't"` (U+0027) and
+`"You Don't"` (U+2019) remain distinct names in inventory, recipes, and pair
+API calls — the game can have both, so resolve must not alias them.
 
-The rule is stem-length sensitive, not a blanket "never capitalize after an
-apostrophe": a **multi-letter** stem stays in-word (`don't` → `Don't`,
-`baker's` → `Baker's`), while a **single-letter** stem still starts a new word
-(`o'brien` → `O'Brien`), which is what Irish-style names and `O'Clock` need.
-Both apostrophe forms behave identically — sudoc iterates `text` by codepoint,
-so the U+2019 arm is live and covered by test asserts, not dead.
+`title_case` approximates Python `str.title()` with a stem-length-sensitive
+apostrophe rule (letter case only; the apostrophe character is preserved):
+a **multi-letter** stem stays in-word (`don't` → `Don't`, not `"Don'T"`);
+a **single-letter** stem still starts a new word (`o'brien` → `O'Brien`).
+Both ASCII `'` and U+2019 count as apostrophes for that rule.
+
+The Don'T form was a real trainer bug (`Beach + You Don't` sent as
+`You Don'T` → Nothing). Cross-matching curly IB imports to keyboard ASCII
+was deliberately *not* taken — that would merge two possible API identities.
 
 See residual JS §5 for the older `\b\w` replace disagreements.
 

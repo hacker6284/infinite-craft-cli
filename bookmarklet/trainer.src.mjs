@@ -6,9 +6,6 @@
 // edit them by hand (they are not committed to the repo).
 import {
   match_elements_boundary as matchElementsBoundary,
-  resolve_element_boundary as resolveElementBoundary,
-  add_element_boundary as addElementBoundary,
-  add_elements_batch_boundary as addElementsBatchBoundary,
   record_recipe as recordRecipeKernel,
   record_recipes_batch as recordRecipesBatchKernel,
   trace_recipe_boundary as traceRecipeBoundary,
@@ -26,6 +23,7 @@ import {
   pair_key as pairKeyKernel,
   is_base_element as isBaseElement,
   sanitize_element_name as sanitizeElementName,
+  title_case as titleCase,
   unfilled_names_boundary as unfilledNamesBoundary,
   is_local_command as isLocalCommand,
   is_slash_command_attempt as isSlashCommandAttempt,
@@ -208,9 +206,52 @@ function pairsFromBoundary(rawPairs) {
   ]);
 }
 
+// ASCII whitespace strip matching kernel strip_spaces (not String.trim —
+// trim also drops Unicode spaces the kernel leaves alone).
+function stripSpacesAscii(s) {
+  let start = 0, end = s.length;
+  const isSp = (c) => c === 32 || c === 9 || c === 10 || c === 13 || c === 11 || c === 12;
+  while (start < end && isSp(s.charCodeAt(start))) start++;
+  while (end > start && isSp(s.charCodeAt(end - 1))) end--;
+  return s.slice(start, end);
+}
+
+function asciiLower(s) {
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    out += (c >= 65 && c <= 90) ? String.fromCharCode(c + 32) : s[i];
+  }
+  return out;
+}
+
+function itemToEl(item) {
+  return { text: item.text, emoji: item.emoji || "", discovered: !!item.discovered };
+}
+
 function resolveElement(name) {
-  const [text, emoji, discovered] = resolveElementBoundary(elementTuples(), name);
-  return { text, emoji, discovered };
+  // Host-side resolve against _nameIndex — same rules as kernel
+  // resolve_element (exact → stripped → title_case → ASCII-ci), but without
+  // rematerializing the entire save into tuples and deep-copying it through
+  // the sudoc adapter on every call. That path made /recipe display and
+  // multi-operand formatting feel multi-second on large inventories.
+  let item = _nameIndex[name];
+  if (item) return itemToEl(item);
+  const stripped = stripSpacesAscii(name);
+  if (stripped !== name) {
+    item = _nameIndex[stripped];
+    if (item) return itemToEl(item);
+  }
+  const title = titleCase(stripped);
+  if (title !== stripped) {
+    item = _nameIndex[title];
+    if (item) return itemToEl(item);
+  }
+  const needle = asciiLower(stripped);
+  for (const el of _items) {
+    if (asciiLower(el.text) === needle) return itemToEl(el);
+  }
+  return { text: title, emoji: "", discovered: false };
 }
 
 function _materializeElement(text, emoji, discovered) {
@@ -223,29 +264,19 @@ function _materializeElement(text, emoji, discovered) {
 }
 
 function addElement(text, emoji, discovered) {
-  // Kernel storage normalization + insert-or-ignore decision (same rule as
-  // the CLI: no discovered-flag promotion on re-add); the host only
-  // materializes the item and persists.
+  // Kernel sanitize + host insert-or-ignore (no discovered-flag promotion).
+  // Avoids add_element_boundary rematerializing the whole inventory per add
+  // — critical during /fill and /import lineages.
   text = sanitizeElementName(text);
-  if (!addElementBoundary(elementTuples(), text, emoji || "", !!discovered)) return false;
+  if (!text || _nameIndex[text]) return false;
   _materializeElement(text, emoji, discovered);
   return true;
 }
 
 function addElementsBatch(batch) {
-  // Batch variant: one kernel decision pass; appended tuples come back on
-  // the inout list and are materialized in order.
-  const tuples = elementTuples();
-  const before = tuples.length;
-  const normalized = batch.map(([text, emoji, discovered]) => [
-    sanitizeElementName(text),
-    emoji || "",
-    !!discovered,
-  ]);
-  const count = addElementsBatchBoundary(tuples, normalized);
-  for (let i = before; i < tuples.length; i++) {
-    const [text, emoji, discovered] = tuples[i];
-    _materializeElement(text, emoji, discovered);
+  let count = 0;
+  for (const [text, emoji, discovered] of batch) {
+    if (addElement(text, emoji || "", !!discovered)) count++;
   }
   return count;
 }
@@ -808,7 +839,7 @@ function processRecipeSteps(steps) {
   const [elementBatch, recipeBatch] = lineageStepsToBatches(tuples);
   addElementsBatch(elementBatch);
   recordRecipesBatch(recipeBatch);
-  return recipeBatch.length;
+  return recipeBatch;
 }
 
 function pickFile(accept) {
@@ -882,9 +913,9 @@ async function doImport(name) {
     const recipeData = await recipeResp.json();
     const steps = recipeData.steps || recipeData.recipe || [];
     if (!steps.length) { print("  " + yellow("No recipe steps found.")); return; }
-    const count = processRecipeSteps(steps);
+    const recipeBatch = processRecipeSteps(steps);
     rebuildRecipeIndex();
-    print(`  Imported ${green(String(count))} recipe steps for ${bold(esc(name))}.`);
+    print(`  Imported ${green(String(recipeBatch.length))} recipe steps for ${bold(esc(name))}.`);
   } catch (e) {
     if (!cancelled) print("  " + red(`Import failed: ${esc(e.message)}. CORS may be blocked — try the Python CLI instead.`));
   } finally {
@@ -894,29 +925,40 @@ async function doImport(name) {
 
 async function doFill() {
   const elements = getAllElements();
-  const missingNames = new Set(unfilledNamesBoundary(elementTuples(), recipeIndex));
-  const missing = elements.filter(e => missingNames.has(e.text));
+  // Snapshot of still-unfilled names; updated as each lineage lands so
+  // intermediates filled by a prior fetch are skipped (matches CLI).
+  const stillMissing = new Set(unfilledNamesBoundary(elementTuples(), recipeIndex));
+  const missing = elements.filter(e => stillMissing.has(e.text));
   if (!missing.length) { print("  All elements have recipes."); return; }
   print(`  ${yellow(String(missing.length))} elements missing recipes. Fetching from Infinibrowser...`);
-  let filled = 0, errors = 0;
+  let filled = 0, errors = 0, skipped = 0;
   try {
     beginRun();
     for (let i = 0; i < missing.length; i++) {
       if (cancelled) { print("  " + yellow("Fill cancelled.")); break; }
       const el = missing[i];
+      // Prior lineage may have already recorded a recipe for this name.
+      if (!stillMissing.has(el.text)) {
+        skipped++;
+        continue;
+      }
       try {
         const recipeResp = await fetchRetry(`https://infinibrowser.wiki/api/recipe?id=${encodeURIComponent(el.text)}`);
         if (recipeResp.ok) {
           const data = await recipeResp.json();
           const steps = data.steps || data.recipe || [];
-          processRecipeSteps(steps);
-          filled++;
+          const recipeBatch = processRecipeSteps(steps);
+          // Results in this lineage now have at least one recipe pair.
+          for (const [resultName] of recipeBatch) stillMissing.delete(resultName);
+          stillMissing.delete(el.text);
+          if (recipeBatch.length) filled++;
+          else errors++;
         } else {
           errors++;
         }
       } catch { errors++; }
       if ((i + 1) % 10 === 0 || i === missing.length - 1) {
-        print(`  ${dim(`[${i + 1}/${missing.length}]`)} ${green(String(filled))} filled, ${errors ? red(String(errors)) + " failed" : "0 failed"}`);
+        print(`  ${dim(`[${i + 1}/${missing.length}]`)} ${green(String(filled))} filled, ${skipped ? dim(String(skipped)) + " skipped, " : ""}${errors ? red(String(errors)) + " failed" : "0 failed"}`);
       }
       await sleepCancellable(500);
     }
@@ -924,7 +966,7 @@ async function doFill() {
     rebuildRecipeIndex();
     endRun();
   }
-  print(`  Done: ${green(String(filled))} filled, ${errors ? red(String(errors)) + " failed" : "0 failed"} (${missing.length} total).`);
+  print(`  Done: ${green(String(filled))} filled, ${skipped ? dim(String(skipped)) + " skipped (already filled by prior lineages), " : ""}${errors ? red(String(errors)) + " failed" : "0 failed"} (${missing.length} total).`);
 }
 
 function doUnfilled() {
