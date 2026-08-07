@@ -298,9 +298,10 @@ that remain true of the v2 kernel, then findings new to this extraction.
   sorts are gone. This is viable because this repo builds only the py/js
   backends; the Rust cross-module `inout` bug below still stands as a
   caveat for prospective Rust/Zig backend adopters. **Updated 2026-08-07:**
-  fixed in sudoc v0.3.0 (pinned here); see the inout entry below. With no
-  closures, the prioritizer's comparator reads everything it needs (score,
-  pair key, input index) from the decorated tuples themselves.
+  fixed in sudoc v0.3.0 (present in the v0.4.0 toolchain pinned here); see
+  the inout entry below. With no closures, the prioritizer's comparator
+  reads everything it needs (score, pair key, input index) from the
+  decorated tuples themselves.
 
 - **Function values are top-level refs only** (no closures, no safe
   module-qualified pass-through as a function value). A local wrapper would
@@ -338,7 +339,7 @@ that remain true of the v2 kernel, then findings new to this extraction.
   **Updated 2026-08-07:** fixed upstream — sudoc's Rust backend now resolves
   callee signatures program-wide (regression:
   `conformance/multimodule/xmod_inout`); the fix is in every sudoc release
-  ≥ v0.1.0, including the v0.3.0 toolchain this repo pins. No longer a
+  ≥ v0.1.0, including the v0.4.0 toolchain this repo pins. No longer a
   blocker for Rust backend adoption.
 
 - **Record/enum-through-export-signature loses boundary intent.** `text` fields
@@ -424,7 +425,7 @@ is specifically record/enum nesting, not all composite types.
   **Updated 2026-08-07:** fixed in sudoc — the Zig backend now emits a shared
   `sudo_types.zig` giving cross-module monomorphized generics one canonical
   identity (regression: `conformance/multimodule/xmod_generics`); the fix is
-  present in the v0.3.0 toolchain this repo pins.
+  present in the v0.4.0 toolchain this repo pins.
 
 ---
 

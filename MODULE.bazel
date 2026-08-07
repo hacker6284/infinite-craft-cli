@@ -37,21 +37,28 @@ register_toolchains("@rust_toolchains//:all")
 # the hermetic decomposed sudo_lockstep_test REPLACES the v0.2.1 PATH-inheriting
 # one (breaking).
 #
-# Consumed from the matched-pair release v0.3.0 (design §8 Phase 5 Task 8), which
+# Consumed from a matched-pair release (design §8 Phase 5 Task 8), which
 # publishes BOTH the ruleset tarball AND the matched binary SET (sudoc +
 # lockstep_diff + capture_run + emit_unpack). Each binary's per-platform sha256 is
-# pinned in the tarball's versions.bzl, so sudo.toolchain(version = "v0.3.0")
+# pinned in the tarball's versions.bzl, so sudo.toolchain(version = "v0.4.0")
 # resolves the whole set with no local sha overrides.
+#
+# v0.4.0 is a sudocode-language release, not a ruleset one: the only rule-side
+# change vs v0.3.0 is versions.bzl (the generic INJECT-RELEASE block replacing
+# the v0.3.0-specific one, plus the backfilled v0.3.0 shas), so the module stays
+# at 1.0.0 / compatibility_level 2 and no rule attributes moved. The language
+# break -- `record`/`enum` names may no longer contain `_` -- does not touch
+# craft.sudo (Element, RecipeStep, RecipeResult are all underscore-free).
 bazel_dep(name = "rules_sudo", version = "1.0.0")
 archive_override(
     module_name = "rules_sudo",
-    urls = ["https://github.com/hacker6284/sudocode/releases/download/v0.3.0/rules_sudo-v0.3.0.tar.gz"],
+    urls = ["https://github.com/hacker6284/sudocode/releases/download/v0.4.0/rules_sudo-v0.4.0.tar.gz"],
     strip_prefix = "rules_sudo",
-    sha256 = "89b6a672417c2e50d08f129a2b6aed2012e4b7cbd5aa1f8df918f29001a28c7a",
+    sha256 = "0fd8304b2d68bc1a4bce767235c958da915be46bbf6e9a973848880fa7885a93",
 )
 
 sudo = use_extension("@rules_sudo//:extensions.bzl", "sudo")
-sudo.toolchain(version = "v0.3.0")
+sudo.toolchain(version = "v0.4.0")
 use_repo(sudo, "sudo_toolchain")
 
 # Hermetic esbuild (bundles the bookmarklet; replaces npx esbuild/terser).
