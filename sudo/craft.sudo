@@ -225,10 +225,10 @@ func add_elements_batch(elements: inout List<Element>, items: List<(text, text, 
 // Deterministic sorts — std.sorting.sort_by (stable insertion sort) with
 // top-level comparators; sudo has no closures, so anything a comparison
 // needs must live in the sorted items themselves.
-// NOTE for future Rust/Zig backends: sorting.sort_by historically hit a
-// Rust-backend cross-module `inout` codegen bug (see DIVERGENCES.md,
-// "sudo language friction"). This repo builds the py/js backends only,
-// where sort_by is fine.
+// NOTE: sorting.sort_by historically hit a Rust-backend cross-module
+// `inout` codegen bug (see DIVERGENCES.md, "sudo language friction");
+// fixed in sudoc v0.3.0 (the toolchain this repo pins), regression-
+// covered upstream by conformance/multimodule/xmod_inout.
 // ---------------------------------------------------------------------------
 
 func text_lex_less(a: text, b: text) -> bool

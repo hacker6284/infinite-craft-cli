@@ -297,9 +297,10 @@ that remain true of the v2 kernel, then findings new to this extraction.
   the prioritizer's decorated rows) — the hand-rolled same-module insertion
   sorts are gone. This is viable because this repo builds only the py/js
   backends; the Rust cross-module `inout` bug below still stands as a
-  caveat for prospective Rust/Zig backend adopters. With no closures, the
-  prioritizer's comparator reads everything it needs (score, pair key,
-  input index) from the decorated tuples themselves.
+  caveat for prospective Rust/Zig backend adopters. **Updated 2026-08-07:**
+  fixed in sudoc v0.3.0 (pinned here); see the inout entry below. With no
+  closures, the prioritizer's comparator reads everything it needs (score,
+  pair key, input index) from the decorated tuples themselves.
 
 - **Function values are top-level refs only** (no closures, no safe
   module-qualified pass-through as a function value). A local wrapper would
@@ -334,6 +335,11 @@ that remain true of the v2 kernel, then findings new to this extraction.
   because this repo's lockstep builds py/js only, where the bug does not
   reproduce. Any future Rust/Zig backend adoption must fix this codegen bug
   first (or reintroduce same-module sorts).
+  **Updated 2026-08-07:** fixed upstream — sudoc's Rust backend now resolves
+  callee signatures program-wide (regression:
+  `conformance/multimodule/xmod_inout`); the fix is in every sudoc release
+  ≥ v0.1.0, including the v0.3.0 toolchain this repo pins. No longer a
+  blocker for Rust backend adoption.
 
 - **Record/enum-through-export-signature loses boundary intent.** `text` fields
   nested under a named `record`/`enum` in an `export func` signature degrade to
@@ -378,8 +384,9 @@ is specifically record/enum nesting, not all composite types.
   - `validate_command_line` (~724–726):
     `with_elem, query = parsed.unwrap()` then `assert with_elem == with_elem`.
 
-- **OPEN Zig backend bug: cross-module generic type identity.** Confirmed
-  compiler bug, not an implementer mistake. Symptom when building for Zig:
+- **Zig backend bug (FIXED upstream): cross-module generic type identity.**
+  Confirmed compiler bug, not an implementer mistake. Symptom when building
+  for Zig:
 
   ```
   craft.zig:1940:37: error: expected type 'craft.Res_bool_List_i64', found 'regex.Res_bool_List_i64'
@@ -413,6 +420,11 @@ is specifically record/enum nesting, not all composite types.
   module's emitted type at use sites, or hoist shared instantiations into one
   file all modules import). Worth a real bug report to the Zig backend lane
   rather than treating the workaround as long-term sufficient.
+
+  **Updated 2026-08-07:** fixed in sudoc — the Zig backend now emits a shared
+  `sudo_types.zig` giving cross-module monomorphized generics one canonical
+  identity (regression: `conformance/multimodule/xmod_generics`); the fix is
+  present in the v0.3.0 toolchain this repo pins.
 
 ---
 
