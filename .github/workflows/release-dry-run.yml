@@ -15,8 +15,8 @@ jobs:
   pypi-rehearsal:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: bazel-contrib/setup-bazel@0.14.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: bazel-contrib/setup-bazel@e8776f58fb6a6e9055cbaf1b38c52ccc5247e9c4 # 0.14.0
         with:
           bazelisk-cache: true
           disk-cache: ${{ github.workflow }}
@@ -36,7 +36,7 @@ jobs:
           /tmp/icw/bin/python -c "import infinite_craft_cli._sudo.craft; print('kernel import OK')"
           /tmp/icw/bin/infinite-craft --help > /dev/null && echo "entry point OK"
       - name: Keep artifacts for inspection
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: pypi-dry-run-dist
           path: dist/
@@ -44,8 +44,8 @@ jobs:
   pages-rehearsal:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: bazel-contrib/setup-bazel@0.14.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: bazel-contrib/setup-bazel@e8776f58fb6a6e9055cbaf1b38c52ccc5247e9c4 # 0.14.0
         with:
           bazelisk-cache: true
           disk-cache: ${{ github.workflow }}
@@ -60,7 +60,7 @@ jobs:
             grep -q "$m" bazel-bin/bookmarklet/site/trainer.js || { echo "missing marker $m"; exit 1; }
           done
       - name: Keep site for inspection
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: pages-dry-run-site
           path: bazel-bin/bookmarklet/site
@@ -69,7 +69,7 @@ jobs:
     if: inputs.changelog_version != ''
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Extract changelog section (same awk as the release job)
         run: |
           VERSION="${{ inputs.changelog_version }}"

@@ -11,9 +11,9 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: bazel-contrib/setup-bazel@0.14.0
+      - uses: bazel-contrib/setup-bazel@e8776f58fb6a6e9055cbaf1b38c52ccc5247e9c4 # 0.14.0
         with:
           bazelisk-cache: true
           disk-cache: ${{ github.workflow }}
@@ -52,7 +52,7 @@ jobs:
           /tmp/icw/bin/python -c "import infinite_craft_cli._sudo.craft; print('kernel import OK')"
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
 
   release:
     needs: publish
@@ -60,7 +60,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Extract changelog for this version
         id: changelog
@@ -74,7 +74,7 @@ jobs:
           echo "$NOTES" > /tmp/release_notes.md
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           body_path: /tmp/release_notes.md
           generate_release_notes: false
