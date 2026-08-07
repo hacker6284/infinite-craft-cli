@@ -1,5 +1,57 @@
 # Changelog
 
+## [1.7.0] - 2026-08-07
+
+### Changed
+- **The remaining duplicated host logic moved into the sudo kernel.** Pair
+  generation for `/permute`, `/cross`, `/with`, and crawl generations;
+  shorthand operand extraction; the unfilled predicate; command-validation
+  error messages; `.ic` import/export folds; Infinibrowser lineage folds;
+  element-name storage sanitization; and insert-or-ignore element adds are
+  now single kernel implementations shared by the CLI and the browser
+  trainer (nine new owner rulings — see `sudo/DIVERGENCES.md`). New parity
+  fixtures cover every consolidated area (63 scenarios, up from 34).
+- **Crawl semantics are identical in both tools** (CLI semantics won the
+  rulings): generation pairs run in sorted-name order, the seed pair is part
+  of generation 1 rather than a special case, and any result not already in
+  the crawl pool joins the next generation — the trainer previously followed
+  insertion order, aborted crawls whose seed pair made Nothing, and only
+  followed globally-new discoveries.
+- **`/unfilled` and `/fill` agree on what "unfilled" means**: an element
+  whose recipes entry is an empty list now counts as unfilled everywhere
+  (previously "filled" in the CLI, "unfilled" in the trainer, and orphaned
+  by the export closure).
+- **Validation errors are structured kernel segments.** Message text lives
+  once in the kernel; the CLI styles highlights with ANSI, the trainer
+  HTML-escapes every segment and colors highlights.
+- **Trainer `.ic` exports use fresh sequential ids with recipes remapped to
+  the export closure** (matching the CLI), instead of copying game item ids
+  and recipe references verbatim.
+
+### Fixed
+- **Browser trainer: shorthand operands were silently truncated.**
+  `A + B + C` combined `A` with `B` (dropping `+ C`) because `String.split`'s
+  second argument is a result-length limit, not a maxsplit. Same bug in the
+  `++`, `+|`, and `*` shorthands. All four now keep the full tail, matching
+  the CLI.
+- **Browser trainer: validation messages containing `<element>` rendered as
+  empty HTML tags** — usage errors like `Usage: <element> + <element>`
+  displayed with the placeholders swallowed by the DOM. Segments are now
+  escaped before printing.
+- **Browser trainer: exports could contain dangling recipe id references**
+  pointing at items excluded from the export closure.
+- **Browser trainer: imported element names are now sanitized before
+  storage** (strip + control-character removal, same kernel rule as the
+  CLI), so the two tools can no longer persist different names for the same
+  payload.
+- **CLI: `/import` no longer crashes on malformed payloads** — Infinibrowser
+  lineage steps with missing fields are skipped (and the id-or-text fallback
+  matches the trainer) instead of raising `KeyError`, and `.ic` items with a
+  missing `text` are skipped along with any recipes referencing them (the
+  trainer previously stored the literal name `"undefined"` for those).
+- **CLI: `.ic` imports honor the save format's legacy `discovered` flag**
+  in addition to `discovery`.
+
 ## [1.6.0] - 2026-08-05
 
 ### Changed

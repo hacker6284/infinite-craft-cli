@@ -1,10 +1,17 @@
-"""Persistent storage for discovered elements."""
+"""Persistent storage for discovered elements.
+
+Insert-or-ignore decisions are the kernel's (add_element_boundary /
+add_elements_batch_boundary — no discovered-flag promotion on re-add);
+this class materializes host Elements and persists. get_by_name keeps the
+host's O(1) exact-case index — same contract as the kernel's get_by_name,
+which resolve parity scenarios exercise through resolve_element_boundary."""
 
 import contextlib
 import json
 import os
 import tempfile
 
+from infinite_craft_cli._sudo import craft
 from infinite_craft_cli.element import Element
 
 _STARTERS = [
@@ -103,9 +110,18 @@ class DiscoveryStorage:
     def get_by_name(self, name: str) -> Element | None:
         return self._index.get(name)
 
+    def _boundary(self) -> list[tuple[str, str, bool]]:
+        return [
+            (e.name, e.emoji or "", bool(e.is_first_discovery))
+            for e in self._elements
+            if e.name is not None
+        ]
+
     def add(self, *, name: str, emoji: str | None = None, is_first_discovery: bool | None = None) -> Element | None:
         """Add an element. Returns the Element if newly added, None if already exists."""
-        if name in self._index:
+        if not craft.add_element_boundary(
+            self._boundary(), name, emoji or "", bool(is_first_discovery)
+        ):
             return None
         elem = Element(name=name, emoji=emoji, is_first_discovery=is_first_discovery)
         self._elements.append(elem)
@@ -118,14 +134,23 @@ class DiscoveryStorage:
         items: list[tuple[str, str | None, bool | None]],
     ) -> int:
         """Add multiple elements with a single disk write. Returns new count."""
-        added = 0
-        for name, emoji, is_discovery in items:
-            if name in self._index:
+        boundary = self._boundary()
+        before = len(boundary)
+        normalized = [
+            (name, emoji or "", bool(first)) for name, emoji, first in items
+        ]
+        added = craft.add_elements_batch_boundary(boundary, normalized)
+        # Materialize from the caller's ORIGINAL values (kernel tuples coerce
+        # None to ""/False, which must not leak into persisted JSON). The
+        # kernel accepted each name's first occurrence, in input order.
+        accepted = {name for name, _emoji, _first in boundary[before:]}
+        for name, emoji, first in items:
+            if name not in accepted:
                 continue
-            elem = Element(name=name, emoji=emoji, is_first_discovery=is_discovery)
+            accepted.discard(name)
+            elem = Element(name=name, emoji=emoji, is_first_discovery=first)
             self._elements.append(elem)
             self._index[name] = elem
-            added += 1
         if added:
             self._save()
         return added

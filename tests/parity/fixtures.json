@@ -86,6 +86,53 @@
     { "id": "classify-slash-combine-operator", "op": "classify", "line": "/combine Water + Fire" },
     { "id": "validate-slash-combine-operator-error", "op": "validate", "line": "/combine Water + Fire" },
     { "id": "validate-plus-shorthand-ok", "op": "validate", "line": "Water + Fire" },
-    { "id": "validate-unknown-command", "op": "validate", "line": "/notacommand" }
+    { "id": "validate-unknown-command", "op": "validate", "line": "/notacommand" },
+
+    { "id": "operands-plus-maxsplit-tail", "op": "operands", "kind": "+", "payload": "A + B + C" },
+    { "id": "operands-crawl-maxsplit-tail", "op": "operands", "kind": "++", "payload": "A ++ B ++ C" },
+    { "id": "operands-with-maxsplit-tail", "op": "operands", "kind": "+|", "payload": "A+|b+|c" },
+    { "id": "operands-cross-maxsplit-tail", "op": "operands", "kind": "*", "payload": "x * y * z" },
+    { "id": "operands-plus-simple", "op": "operands", "kind": "+", "payload": "Water + Fire" },
+    { "id": "operands-plus-trailing-plus-missing-second", "op": "operands", "kind": "+", "payload": "Water +" },
+    { "id": "operands-with-stripped", "op": "operands", "kind": "+|", "payload": "  Water  +|  fire*  " },
+    { "id": "operands-crawl-empty-right", "op": "operands", "kind": "++", "payload": "A ++ " },
+    { "id": "operands-non-shorthand-kind", "op": "operands", "kind": "combine", "payload": "Water Fire" },
+
+    { "id": "permute-pairs-upper-triangle", "op": "permute_pairs", "matches": [["A", "", false], ["B", "", false], ["C", "", false]] },
+    { "id": "permute-pairs-single", "op": "permute_pairs", "matches": [["A", "", false]] },
+    { "id": "cross-pairs-overlap-dedup", "op": "cross_pairs", "left": [["A", "", false], ["B", "", false]], "right": [["B", "", false], ["C", "", false]] },
+    { "id": "cross-pairs-symmetric-dedup", "op": "cross_pairs", "left": [["A", "", false], ["B", "", false]], "right": [["B", "", false], ["A", "", false]] },
+    { "id": "with-pairs-self-skip", "op": "with_pairs", "target": ["B", "", false], "others": [["A", "", false], ["B", "", false], ["C", "", false]] },
+
+    { "id": "unfilled-empty-list-ruling", "op": "unfilled",
+      "elements": [["Water", "", false], ["Ghost", "", false], ["Steam", "", false], ["Mystery", "", false]],
+      "recipes": {"Ghost": [], "Steam": [["Fire", "Water"]]} },
+    { "id": "unfilled-all-filled", "op": "unfilled", "elements": [["Water", "", false], ["Steam", "", false]], "recipes": {"Steam": [["Fire", "Water"]]} },
+
+    { "id": "validate-segments-unknown-command", "op": "validate_segments", "line": "/notacommand" },
+    { "id": "validate-segments-operator-error", "op": "validate_segments", "line": "/combine Water + Fire" },
+    { "id": "validate-segments-bad-pipe", "op": "validate_segments", "line": "Water + | Fire" },
+    { "id": "validate-segments-usage-plain", "op": "validate_segments", "line": "Water +" },
+    { "id": "validate-segments-ok-null", "op": "validate_segments", "line": "Water + Fire" },
+
+    { "id": "crawl-pairs-sorted-self-pairs", "op": "crawl_pairs", "pool": [["Water", "", false], ["Fire", "", false]] },
+    { "id": "crawl-pairs-insertion-order-invariance", "op": "crawl_pairs", "pool": [["Steam", "", false], ["Fire", "", false], ["Water", "", false]] },
+
+    { "id": "sanitize-strip-and-controls", "op": "sanitize", "name": "  Wa\u0000ter " },
+    { "id": "sanitize-c1-and-separators", "op": "sanitize", "name": "Line\u2028Sep\u009dX\u0007" },
+
+    { "id": "ic-batches-id-remap-sanitize", "op": "ic_batches",
+      "items": [[0, "Water", "💧", false], [1, "  Steam  ", "🌫️", true], [7, "Fire", "🔥", false]],
+      "recipe_refs": [[1, 0, 7], [1, 0, 99]] },
+    { "id": "ic-batches-missing-text-skipped", "op": "ic_batches",
+      "items": [[0, "Water", "", false], [1, "  ", "", false]],
+      "recipe_refs": [[0, 0, 1]] },
+
+    { "id": "lineage-batches-dedup-skip-malformed", "op": "lineage_batches",
+      "steps": [["Fire", "🔥", "Water", "💧", "Steam", "🌫️"], ["Steam", "🌫️", "Wind", "🌬️", "Cloud", "☁️"], ["", "", "Water", "💧", "Broken", ""]] },
+
+    { "id": "export-items-remap-no-dangling", "op": "export_items",
+      "elements": [["Water", "", false], ["Steam", "", true], ["Mystery Gas", "", false], ["Orphan", "", false]],
+      "recipes": {"Steam": [["Mystery Gas", "Water"], ["Orphan", "Water"]]} }
   ]
 }

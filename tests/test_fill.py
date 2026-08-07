@@ -50,10 +50,10 @@ class TestFillMissingRecipes:
 
         with patch("infinite_craft_cli.cli._load_recipes", side_effect=load_recipes):
             with patch("infinite_craft_cli.cli._ib_fetch_quiet", side_effect=[item_data, lineage_data]):
-                with patch("infinite_craft_cli.cli._record_recipe") as mock_record:
+                with patch("infinite_craft_cli.cli._record_recipes_batch") as mock_record:
                     with patch("infinite_craft_cli.cli._sleep_cancellable_async", new_callable=AsyncMock, return_value=False):
                         _fill_missing_recipes(storage)
-        mock_record.assert_called_once_with("Steam", "Water", "Fire")
+        mock_record.assert_called_once_with([("Steam", "Water", "Fire")])
         captured = capsys.readouterr()
         assert "Fetched 1 lineages" in captured.out
 
@@ -117,11 +117,13 @@ class TestFillMissingRecipes:
 
         with patch("infinite_craft_cli.cli._load_recipes", return_value={}):
             with patch("infinite_craft_cli.cli._ib_fetch_quiet", side_effect=[item_data, lineage_data]):
-                with patch("infinite_craft_cli.cli._record_recipe"):
+                with patch("infinite_craft_cli.cli._record_recipes_batch"):
                     with patch("infinite_craft_cli.cli._sleep_cancellable_async", new_callable=AsyncMock, return_value=False):
                         _fill_missing_recipes(storage)
-        # Magma is an intermediate element not originally in storage — should be added
-        storage.add.assert_any_call(name='Magma', emoji='🔴', is_first_discovery=False)
+        # Magma is an intermediate element not originally in storage — the
+        # lineage fold's element batch (insert-or-ignore) must include it
+        batch = storage.add_batch.call_args[0][0]
+        assert ("Magma", "🔴", False) in batch
 
     def test_cancelled_during_sleep_stops_early(self, capsys):
         """SIGINT cancel flag during rate-limit sleep stops promptly."""

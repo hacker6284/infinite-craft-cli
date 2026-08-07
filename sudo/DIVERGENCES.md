@@ -408,12 +408,40 @@ is specifically record/enum nesting, not all composite types.
 
 ---
 
+## Consolidation rulings (2026-08-07, kernel-consolidation release)
+
+Owner rulings from the host-code audit that moved the remaining duplicated
+pure logic into the kernel. Each row names the canonical behavior and which
+host changed. Parity coverage: every area below now has fixtures in
+`tests/parity/fixtures.json` (ops `operands`, `permute_pairs`, `cross_pairs`,
+`with_pairs`, `unfilled`, `validate_segments`, `crawl_pairs`, `sanitize`,
+`ic_batches`, `lineage_batches`, `export_items`).
+
+| # | Ruling | Canonical | Changed host |
+|---|--------|-----------|--------------|
+| 8 | **Operand extraction** (`parse_operands`) — split on the separator's FIRST occurrence; the tail keeps later separators (`"A + B + C"` → `("A", "B + C")`) | Python `str.split(sep, 1)` maxsplit semantics | JS — `String.split`'s length-limit second argument silently truncated the tail (`A + B + C` combined `A` with `B`) |
+| 9 | **Pair generation kernel-owned** — `permute_pairs`, `cross_pairs`, `with_pairs` join `exhaust_pairs` in the kernel; hosts only map boundary tuples back to host objects | (behavior already agreed) | none — 4 duplicated loop copies deleted |
+| 10 | **Unfilled predicate** (`is_unfilled`) — an element whose recipes entry exists but is an EMPTY list is unfilled; base elements are never unfilled; both hosts use kernel `is_base_element`, hard-coded base sets deleted | JS semantics (consistent with `included_element_names`'s empty-list treatment) | Python — key presence alone previously counted as filled |
+| 11 | **Validation errors as segments** — `validate_command_line_segments` returns `(text, highlight)` lists; Python styles highlights with ANSI, the trainer HTML-escapes every segment and wraps highlights in a span; `validate_command_line` = segment concat. Both hosts' DISPATCH paths are validation-first too: every usage/pipe/operator error a classifiable line can produce is rendered from kernel segments, never hand-built. Residue: `/search` and `/recipe` usage strings stay host-side by construction — they are local commands outside `classify_command_line`, so the kernel validator does not model them (trainer `/import` also dispatches before validation: bare `/import` opens the file picker) | kernel segments | both — Python's ~95-line re-implementation (color injection) deleted; trainer previously printed kernel messages as raw HTML, so `  Usage: <element> + <element>` swallowed `<element>` as a tag |
+| 12 | **Crawl generations** (`crawl_generation_pairs`) — pool iterated in sorted-name order; self-pairs included; the seed pair is part of generation 1 (no special-cased initial combine); a generation's results join the pool when not already in it, regardless of prior global discovery; tried-keys are kernel-encoded and returned to the host | Python semantics on all three counts | JS — iterated insertion order, special-cased the seed combine (early-return on Nothing), and admitted only globally-new discoveries |
+| 13 | **Import folds** — `ic_save_to_batches` (accept both `discovery` and `discovered` flags; sanitize names; skip items whose text is missing or sanitizes to empty, dropping refs to their ids; drop refs to unknown ids) and `lineage_steps_to_batches` (tolerant id-or-text extraction; skip steps with any missing name; dedup elements, first occurrence wins) | merged: JS's tolerant field handling + Python's dedup/sanitization; missing-text items skip rather than crash (Python) or store garbage names (JS) | both — Python previously KeyError'd on malformed lineage payloads and on `.ic` items without `text`, and read only `discovery`; JS previously skipped sanitization and dedup and stored `"undefined"` for missing text |
+| 14 | **Export builder** (`build_export_items_boundary`) — fresh sequential ids 0..n over the export closure in storage order; recipe pairs remapped; pairs referencing excluded elements dropped | Python semantics (structurally no dangling ids; original game ids carry no round-trip value once internally consistent) | JS — kept game item ids and copied `item.recipes` verbatim, which could emit dangling recipe ids; trainer exports now also draw recipes from its recipe index rather than raw save data |
+| 15 | **Name sanitization** (`sanitize_element_name`) — storage normalization = strip ASCII whitespace + drop C0 controls, DEL, C1 controls, U+2028/U+2029; applied by both hosts before every storage write; display sanitization (TTY escapes / DOM escaping) stays host-side | kernel rule (ASCII-table approximation of Python's `isprintable()` filter) | both — Python's rule was `str.strip()` + `isprintable()` (exotic unprintables like unassigned code points are now stored rather than dropped; terminal display still filters them at print time); JS previously stored names completely unsanitized, so the two hosts could persist different names for the same payload |
+| 16 | **Orphaned exports adopted** — `storage.add`/`add_batch` (CLI) and `addElement`/`addElementsBatch` (trainer) route the insert-or-ignore decision through `add_element_boundary`/`add_elements_batch_boundary`; `orphan_candidates_boundary` now backs the CLI's `/prune` too. `get_by_name_boundary` stays unadopted by design: both hosts keep an O(1) exact-case index with the identical contract (guarded via the `resolve` parity op); routing every display-path lookup through an O(n) boundary would be pure overhead | kernel decides, host persists | both (mechanical) |
+
+Supersession note: ruling 12's sorted-name generation order is the kernel's
+*generation* order. The planned prioritizer release will reorder *execution*
+within a generation by recipe-usage score (sum, descending); sorted pair key
+remains as tie-break, so determinism survives. Recorded here in advance so
+the two-release sequencing is explicit.
+
 ## Rulings summary
 
 | Source | Count | Status in kernel |
 |--------|-------|------------------|
 | Carried from v1 (canonicalized) | 4 | Unbounded BFS; no flag promotion; case-sensitive + title fallback; export/prune closure |
 | New in v2 extraction | 3 | No glob safety gate; no name truncation; no scan budget / timeout (real `\|` alternation) |
+| Consolidation release 2026-08-07 | 9 | Operand maxsplit; pair generation; unfilled empty-list; segment errors; crawl order/admission/uniform generations; import folds; export id remap; name sanitization; orphaned exports adopted |
 | Dual `_js` implementations | 0 | Deleted; one CLI-aligned kernel only |
 
 When `bookmarklet/trainer.js` switches to the kernel, residual items 3–6 and the

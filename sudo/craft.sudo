@@ -128,6 +128,26 @@ export func title_case(s: text) -> text
     return out
 
 // ---------------------------------------------------------------------------
+// Element-name storage normalization
+// ---------------------------------------------------------------------------
+
+export func sanitize_element_name(name: text) -> text
+    // Normalization applied to API/import element names before storage
+    // (owner ruling 2026-08-07): strip ASCII whitespace at both ends, then
+    // drop control characters — C0 (U+0000–U+001F), DEL (U+007F), C1
+    // (U+0080–U+009F) — and the Unicode line/paragraph separators
+    // U+2028/U+2029. Hosts may additionally sanitize for DISPLAY (TTY
+    // escapes, DOM escaping) at print time; this is the only normalization
+    // that decides what gets persisted, so both hosts store identical
+    // names for identical payloads.
+    out: text = ""
+    for c in strip_spaces(name)
+        if c < 32 or c == 127 or (c >= 128 and c <= 159) or c == 8232 or c == 8233
+            continue
+        out.append(c)
+    return out
+
+// ---------------------------------------------------------------------------
 // Name lookup / resolve
 // ---------------------------------------------------------------------------
 
@@ -201,7 +221,7 @@ func add_elements_batch(elements: inout List<Element>, items: List<(text, text, 
     return added
 
 // ---------------------------------------------------------------------------
-// exhaust_pairs — symmetric-pair dedup
+// Pair generation — exhaust / permute / cross / with
 // ---------------------------------------------------------------------------
 
 func exhaust_pairs(matches: List<Element>, all_elements: List<Element>) -> List<(Element, Element)>
@@ -220,6 +240,72 @@ func exhaust_pairs(matches: List<Element>, all_elements: List<Element>) -> List<
             seen.add(key_text)
             pairs.append((target, other))
     return pairs
+
+func permute_pairs(matches: List<Element>) -> List<(Element, Element)>
+    // Upper triangle: every unordered pair of distinct matches, in match
+    // order — (m[0],m[1]), (m[0],m[2]), ..., (m[n-2],m[n-1]).
+    pairs: List<(Element, Element)> = []
+    for i = 0 to matches.length - 1
+        for j = i + 1 to matches.length - 1
+            pairs.append((matches[i], matches[j]))
+    return pairs
+
+func cross_pairs(left: List<Element>, right: List<Element>) -> List<(Element, Element)>
+    // Left-major product, skipping same-name pairs, deduped on the
+    // symmetric pair key (a+b == b+a).
+    seen: Set<text> = Set()
+    pairs: List<(Element, Element)> = []
+    for a in left
+        for b in right
+            if a.name == b.name
+                continue
+            key = pair_key(a.name, b.name)
+            ka, kb = key
+            key_text = ka + "\u{0}" + kb
+            if seen.has(key_text)
+                continue
+            seen.add(key_text)
+            pairs.append((a, b))
+    return pairs
+
+func with_pairs(target: Element, others: List<Element>) -> List<(Element, Element)>
+    // Target paired with each other match, in match order; the target
+    // itself is skipped. No pair-key dedup needed: others are unique.
+    pairs: List<(Element, Element)> = []
+    for o in others
+        if o.name == target.name
+            continue
+        pairs.append((target, o))
+    return pairs
+
+func sort_elements_by_name(items: inout List<Element>)
+    for j = 1 to items.length - 1
+        i = j
+        while i > 0 and strings.lex_compare(items[i].name, items[i - 1].name) < 0
+            items.swap(i, i - 1)
+            i = i - 1
+
+func crawl_generation_pairs(pool: List<Element>, tried: Set<text>) -> (List<(Element, Element)>, List<text>)
+    // One crawl generation: every untried unordered pair over the pool,
+    // INCLUDING self-pairs (j starts at i). owner rulings 2026-08-07 (see
+    // DIVERGENCES.md): the pool is iterated in sorted-name order, so pair
+    // order is deterministic across hosts regardless of how the pool
+    // accumulated. Returns the pairs plus their encoded keys; the caller
+    // adds the keys to its tried-set (hosts never build keys themselves).
+    sorted_pool = pool
+    sort_elements_by_name(sorted_pool)
+    pairs: List<(Element, Element)> = []
+    new_keys: List<text> = []
+    for i = 0 to sorted_pool.length - 1
+        for j = i to sorted_pool.length - 1
+            key = pair_key(sorted_pool[i].name, sorted_pool[j].name)
+            ka, kb = key
+            key_text = ka + "\u{0}" + kb
+            if tried.has(key_text)
+                continue
+            pairs.append((sorted_pool[i], sorted_pool[j]))
+            new_keys.append(key_text)
+    return (pairs, new_keys)
 
 // ---------------------------------------------------------------------------
 // Deterministic text sort (hand-rolled; do not use sorting.sudo sort_by)
@@ -387,6 +473,20 @@ func export_elements(elements: List<Element>, recipes: Map<text, List<(text, tex
         if included.has(e.name)
             out.append(e)
     return out
+
+// ---------------------------------------------------------------------------
+// Unfilled predicate
+// ---------------------------------------------------------------------------
+
+export func is_unfilled(name: text, recipes: Map<text, List<(text, text)>>) -> bool
+    // owner ruling 2026-08-07: an element whose recipes entry exists but is
+    // an EMPTY list is unfilled — "we know no way to make it". Key presence
+    // alone does not make an element filled (consistent with
+    // included_element_names, which seeds only non-empty recipe results).
+    // Base elements are never unfilled.
+    if is_base_element(name)
+        return false
+    return recipes.get(name).get_or([]).length == 0
 
 // ---------------------------------------------------------------------------
 // Query filter / pattern match (regex.sudo; no safety gates)
@@ -633,34 +733,98 @@ export func split_two_positional_args(rest: text) -> Option<(text, text)>
 export func parse_cross_queries(rest: text) -> Option<(text, text)>
     return split_two_positional_args(rest)
 
-export func slash_combine_crawl_pipe_error(rest: text) -> Option<text>
-    msg = "  Use <element> +| <query> (no space between + and |). Type /help for commands."
+// Validation errors are built as SEGMENT lists: (text, highlight) pairs.
+// The message text lives here once; hosts only style — the Python CLI wraps
+// highlighted segments in ANSI yellow, the browser trainer HTML-escapes every
+// segment and wraps highlighted ones in a color span. Plain-text variants
+// concatenate the segments unchanged.
+
+func seg_concat(segs: List<(text, bool)>) -> text
+    out: text = ""
+    for seg in segs
+        t, hl = seg
+        assert hl == hl
+        out = out + t
+    return out
+
+func plain_segment(msg: text) -> List<(text, bool)>
+    return [(msg, false)]
+
+func query_err_segments(err: Option<text>) -> Option<List<(text, bool)>>
+    if err.is_none()
+        return None
+    return Some(plain_segment(err.unwrap()))
+
+func bad_pipe_segments() -> List<(text, bool)>
+    segs: List<(text, bool)> = []
+    segs.append(("  Use <element> +| <query> (no space between + and |). Type ", false))
+    segs.append(("/help", true))
+    segs.append((" for commands.", false))
+    return segs
+
+func has_spaced_pipe_payload(rest: text) -> bool
     if contains_plus_ws_pipe(rest)
-        return Some(msg)
+        return true
     parsed = parse_two_elements(rest)
     if parsed.is_some()
-        first, second = parsed.unwrap()
-        if second.length > 0 and second[0] == '|'
-            return Some(msg)
+        pfirst, psecond = parsed.unwrap()
+        assert pfirst == pfirst
+        if psecond.length > 0 and psecond[0] == '|'
+            return true
+    return false
+
+export func slash_combine_crawl_pipe_error_segments(rest: text) -> Option<List<(text, bool)>>
+    if has_spaced_pipe_payload(rest)
+        return Some(bad_pipe_segments())
     return None
 
-export func slash_combine_crawl_operator_error(rest: text, kind: text) -> Option<text>
+export func slash_combine_crawl_pipe_error(rest: text) -> Option<text>
+    segs = slash_combine_crawl_pipe_error_segments(rest)
+    if segs.is_none()
+        return None
+    return Some(seg_concat(segs.unwrap()))
+
+export func slash_combine_crawl_operator_error_segments(rest: text, kind: text) -> Option<List<(text, bool)>>
     if not strings.contains(rest, " + ")
         return None
     idx = strings.index_of(rest, " + ").unwrap()
     left = text_slice(rest, 0, idx)
     right = text_from(rest, idx + 3)
     positional = "/" + kind + " " + strip_spaces(left) + " " + strip_spaces(right)
-    return Some("  Slash /" + kind + " uses positional args, not +. Try " + strip_spaces(rest) + " (shorthand) or " + positional + ".")
+    segs: List<(text, bool)> = []
+    segs.append(("  Slash /" + kind + " uses positional args, not +. Try ", false))
+    segs.append((strip_spaces(rest), true))
+    segs.append((" (shorthand) or ", false))
+    segs.append((positional, true))
+    segs.append((".", false))
+    return Some(segs)
 
-export func slash_cross_operator_error(rest: text) -> Option<text>
+export func slash_combine_crawl_operator_error(rest: text, kind: text) -> Option<text>
+    segs = slash_combine_crawl_operator_error_segments(rest, kind)
+    if segs.is_none()
+        return None
+    return Some(seg_concat(segs.unwrap()))
+
+export func slash_cross_operator_error_segments(rest: text) -> Option<List<(text, bool)>>
     if not strings.contains(rest, " * ")
         return None
     idx = strings.index_of(rest, " * ").unwrap()
     left = text_slice(rest, 0, idx)
     right = text_from(rest, idx + 3)
     positional = "/cross " + strip_spaces(left) + " " + strip_spaces(right)
-    return Some("  Slash /cross uses positional args, not *. Try " + strip_spaces(rest) + " (shorthand) or " + positional + ".")
+    segs: List<(text, bool)> = []
+    segs.append(("  Slash /cross uses positional args, not *. Try ", false))
+    segs.append((strip_spaces(rest), true))
+    segs.append((" (shorthand) or ", false))
+    segs.append((positional, true))
+    segs.append((".", false))
+    return Some(segs)
+
+export func slash_cross_operator_error(rest: text) -> Option<text>
+    segs = slash_cross_operator_error_segments(rest)
+    if segs.is_none()
+        return None
+    return Some(seg_concat(segs.unwrap()))
 
 export func validate_query_at_enqueue(query: text) -> Option<text>
     if query.length > 512
@@ -700,85 +864,126 @@ func rsplit_once_space_plus(s: text) -> text
         return s
     return text_slice(s, 0, last)
 
-export func validate_command_line(line: text) -> Option<text>
-    classified = classify_command_line(line)
-    if classified.is_none()
-        if is_slash_command_attempt(line)
-            cmd = first_ws_token(line)
-            return Some("  Unknown command: " + cmd + ". Type /help for commands.")
-        return Some("  Unknown input. Type /help for commands.")
-    kind, payload = classified.unwrap()
-    if kind == "bad+|"
-        return Some("  Use <element> +| <query> (no space between + and |). Type /help for commands.")
-    if kind == "permute" or kind == "permutate" or kind == "exhaust" or kind == "import"
-        if strip_spaces(payload).length == 0
-            if kind == "import"
-                return Some("  Usage: /import <element>")
-            return Some("  Usage: /" + kind + " <query>")
-        if kind == "import"
-            return None
-        return validate_query_at_enqueue(strip_spaces(payload))
-    if kind == "export" or kind == "fill" or kind == "prune"
-        return None
-    if kind == "combine" or kind == "crawl"
-        pipe_err = slash_combine_crawl_pipe_error(payload)
-        if pipe_err.is_some()
-            return pipe_err
-        op_err = slash_combine_crawl_operator_error(payload, kind)
-        if op_err.is_some()
-            return op_err
-        if parse_two_elements(payload).is_none()
-            return Some("  Usage: /" + kind + " <element> <element>")
-        return None
-    if kind == "with"
-        parsed = parse_with_args(payload)
-        if parsed.is_none()
-            return Some("  Usage: /with <element> <query>")
-        with_elem, query = parsed.unwrap()
-        assert with_elem == with_elem
-        return validate_query_at_enqueue(query)
-    if kind == "cross"
-        op_err = slash_cross_operator_error(payload)
-        if op_err.is_some()
-            return op_err
-        parsed = parse_cross_queries(payload)
-        if parsed.is_none()
-            return Some("  Usage: /cross <query> <query>")
-        left_q, right_q = parsed.unwrap()
-        err = validate_query_at_enqueue(left_q)
-        if err.is_some()
-            return err
-        return validate_query_at_enqueue(right_q)
+export func parse_operands(kind: text, payload: text) -> Option<(text, text)>
+    // Operand extraction for the shorthand kinds returned by
+    // classify_command_line ("++", "+|", "*", "+"). Python str.split(sep, 1)
+    // semantics: split on the separator's FIRST occurrence, the right side
+    // keeps any later separators ("A + B + C" -> ("A", "B + C")).
+    // Owner ruling 2026-08-07: JS String.split's second argument is a
+    // result-length limit, which silently truncated the tail; maxsplit
+    // semantics are canonical.
+    left: text = ""
+    right: text = ""
     if kind == "++"
         left, right = split_once(payload, " ++ ")
-        if strip_spaces(left).length == 0 or strip_spaces(right).length == 0
-            return Some("  Usage: <element> ++ <element>")
-        return None
-    if kind == "+|"
+    else if kind == "+|"
         left, right = split_once(payload, "+|")
-        if strip_spaces(left).length == 0 or strip_spaces(right).length == 0
-            return Some("  Usage: <element> +| <query>")
-        return validate_query_at_enqueue(strip_spaces(right))
-    if kind == "*"
+    else if kind == "*"
         left, right = split_once(payload, " * ")
-        if strip_spaces(left).length == 0 or strip_spaces(right).length == 0
-            return Some("  Usage: <query> * <query>")
-        err = validate_query_at_enqueue(strip_spaces(left))
-        if err.is_some()
-            return err
-        return validate_query_at_enqueue(strip_spaces(right))
-    if kind == "+"
-        left: text = ""
-        right: text = ""
+    else if kind == "+"
         if strings.contains(payload, " + ")
             left, right = split_once(payload, " + ")
         else
             left = rsplit_once_space_plus(payload)
             right = ""
-        if strip_spaces(left).length == 0 or strip_spaces(right).length == 0
-            return Some("  Usage: <element> + <element>")
+    else
+        return None
+    l = strip_spaces(left)
+    r = strip_spaces(right)
+    if l.length == 0 or r.length == 0
+        return None
+    return Some((l, r))
+
+export func validate_command_line_segments(line: text) -> Option<List<(text, bool)>>
+    classified = classify_command_line(line)
+    if classified.is_none()
+        if is_slash_command_attempt(line)
+            cmd = first_ws_token(line)
+            segs: List<(text, bool)> = []
+            segs.append(("  Unknown command: ", false))
+            segs.append((cmd, true))
+            segs.append((". Type ", false))
+            segs.append(("/help", true))
+            segs.append((" for commands.", false))
+            return Some(segs)
+        unk: List<(text, bool)> = []
+        unk.append(("  Unknown input. Type ", false))
+        unk.append(("/help", true))
+        unk.append((" for commands.", false))
+        return Some(unk)
+    kind, payload = classified.unwrap()
+    if kind == "bad+|"
+        return Some(bad_pipe_segments())
+    if kind == "permute" or kind == "permutate" or kind == "exhaust" or kind == "import"
+        if strip_spaces(payload).length == 0
+            if kind == "import"
+                return Some(plain_segment("  Usage: /import <element>"))
+            return Some(plain_segment("  Usage: /" + kind + " <query>"))
+        if kind == "import"
+            return None
+        return query_err_segments(validate_query_at_enqueue(strip_spaces(payload)))
+    if kind == "export" or kind == "fill" or kind == "prune"
+        return None
+    if kind == "combine" or kind == "crawl"
+        pipe_err = slash_combine_crawl_pipe_error_segments(payload)
+        if pipe_err.is_some()
+            return pipe_err
+        op_err = slash_combine_crawl_operator_error_segments(payload, kind)
+        if op_err.is_some()
+            return op_err
+        if parse_two_elements(payload).is_none()
+            return Some(plain_segment("  Usage: /" + kind + " <element> <element>"))
+        return None
+    if kind == "with"
+        parsed = parse_with_args(payload)
+        if parsed.is_none()
+            return Some(plain_segment("  Usage: /with <element> <query>"))
+        with_elem, query = parsed.unwrap()
+        assert with_elem == with_elem
+        return query_err_segments(validate_query_at_enqueue(query))
+    if kind == "cross"
+        op_err = slash_cross_operator_error_segments(payload)
+        if op_err.is_some()
+            return op_err
+        parsed = parse_cross_queries(payload)
+        if parsed.is_none()
+            return Some(plain_segment("  Usage: /cross <query> <query>"))
+        left_q, right_q = parsed.unwrap()
+        err = validate_query_at_enqueue(left_q)
+        if err.is_some()
+            return query_err_segments(err)
+        return query_err_segments(validate_query_at_enqueue(right_q))
+    if kind == "++"
+        if parse_operands(kind, payload).is_none()
+            return Some(plain_segment("  Usage: <element> ++ <element>"))
+        return None
+    if kind == "+|"
+        operands = parse_operands(kind, payload)
+        if operands.is_none()
+            return Some(plain_segment("  Usage: <element> +| <query>"))
+        op_left, op_right = operands.unwrap()
+        assert op_left == op_left
+        return query_err_segments(validate_query_at_enqueue(op_right))
+    if kind == "*"
+        operands = parse_operands(kind, payload)
+        if operands.is_none()
+            return Some(plain_segment("  Usage: <query> * <query>"))
+        op_left, op_right = operands.unwrap()
+        err = validate_query_at_enqueue(op_left)
+        if err.is_some()
+            return query_err_segments(err)
+        return query_err_segments(validate_query_at_enqueue(op_right))
+    if kind == "+"
+        if parse_operands(kind, payload).is_none()
+            return Some(plain_segment("  Usage: <element> + <element>"))
         return None
     return None
+
+export func validate_command_line(line: text) -> Option<text>
+    segs = validate_command_line_segments(line)
+    if segs.is_none()
+        return None
+    return Some(seg_concat(segs.unwrap()))
 
 // ---- boundary adapters: tuple/primitive-only shapes for export funcs ----
 // Records/enums must not cross export func signatures (toolchain limitation).
@@ -862,13 +1067,123 @@ export func match_elements_boundary(elements: List<(text, text, bool)>, query: t
     matches, err = match_elements(elements_from_tuples(elements), query)
     return (elements_to_tuples(matches), err)
 
-export func exhaust_pairs_boundary(matches: List<(text, text, bool)>, all_elements: List<(text, text, bool)>) -> List<(text, text, bool, text, text, bool)>
-    pairs = exhaust_pairs(elements_from_tuples(matches), elements_from_tuples(all_elements))
+func element_pairs_to_boundary(pairs: List<(Element, Element)>) -> List<(text, text, bool, text, text, bool)>
     out: List<(text, text, bool, text, text, bool)> = []
     for p in pairs
         a, b = p
         out.append((a.name, a.emoji, a.first, b.name, b.emoji, b.first))
     return out
+
+export func exhaust_pairs_boundary(matches: List<(text, text, bool)>, all_elements: List<(text, text, bool)>) -> List<(text, text, bool, text, text, bool)>
+    return element_pairs_to_boundary(exhaust_pairs(elements_from_tuples(matches), elements_from_tuples(all_elements)))
+
+export func permute_pairs_boundary(matches: List<(text, text, bool)>) -> List<(text, text, bool, text, text, bool)>
+    return element_pairs_to_boundary(permute_pairs(elements_from_tuples(matches)))
+
+export func cross_pairs_boundary(left: List<(text, text, bool)>, right: List<(text, text, bool)>) -> List<(text, text, bool, text, text, bool)>
+    return element_pairs_to_boundary(cross_pairs(elements_from_tuples(left), elements_from_tuples(right)))
+
+export func with_pairs_boundary(target: (text, text, bool), others: List<(text, text, bool)>) -> List<(text, text, bool, text, text, bool)>
+    return element_pairs_to_boundary(with_pairs(element_from_tuple(target), elements_from_tuples(others)))
+
+export func crawl_generation_pairs_boundary(pool: List<(text, text, bool)>, tried_keys: List<text>) -> (List<(text, text, bool, text, text, bool)>, List<text>)
+    tried: Set<text> = Set()
+    for k in tried_keys
+        tried.add(k)
+    pairs, new_keys = crawl_generation_pairs(elements_from_tuples(pool), tried)
+    return (element_pairs_to_boundary(pairs), new_keys)
+
+export func unfilled_names_boundary(elements: List<(text, text, bool)>, recipes: Map<text, List<(text, text)>>) -> List<text>
+    // Element-list order is preserved (both hosts display in storage order).
+    out: List<text> = []
+    for e in elements_from_tuples(elements)
+        if is_unfilled(e.name, recipes)
+            out.append(e.name)
+    return out
+
+// ---- import/export folds ----
+// Hosts do JSON traversal and I/O only; id resolution, name sanitization,
+// dedup, and id remapping all happen here.
+
+export func ic_save_to_batches(items: List<(int, text, text, bool)>, recipe_refs: List<(int, int, int)>) -> (List<(text, text, bool)>, List<(text, text, text)>)
+    // .ic save import: items are (id, text, emoji, discovered) — the host
+    // merges the save's discovery/discovered spellings into one flag —
+    // and recipe_refs are (result_id, a_id, b_id). Names are sanitized;
+    // refs whose ids don't resolve are dropped (no dangling references).
+    id_name: Map<text, text> = Map()
+    elements: List<(text, text, bool)> = []
+    for it in items
+        iid, txt, em, disc = it
+        nm = sanitize_element_name(txt)
+        // Missing or all-control text sanitizes to "": skip the item
+        // entirely — its id stays unresolvable, so refs to it drop too.
+        if nm.length == 0
+            continue
+        id_name[int_to_text(iid)] = nm
+        elements.append((nm, em, disc))
+    recipes_out: List<(text, text, text)> = []
+    for ref in recipe_refs
+        rid, aid, bid = ref
+        rk = int_to_text(rid)
+        ak = int_to_text(aid)
+        bk = int_to_text(bid)
+        if not id_name.has(rk) or not id_name.has(ak) or not id_name.has(bk)
+            continue
+        recipes_out.append((id_name[rk], id_name[ak], id_name[bk]))
+    return (elements, recipes_out)
+
+func lineage_add_unique(elements: inout List<(text, text, bool)>, seen: inout Set<text>, name: text, emoji: text)
+    if seen.has(name)
+        return
+    seen.add(name)
+    elements.append((name, emoji, false))
+
+export func lineage_steps_to_batches(steps: List<(text, text, text, text, text, text)>) -> (List<(text, text, bool)>, List<(text, text, text)>)
+    // Infinibrowser lineage fold: steps are (a_name, a_emoji, b_name,
+    // b_emoji, result_name, result_emoji), after the host's tolerant
+    // id-or-text JSON extraction. Names are sanitized; steps with any
+    // empty name are skipped (owner ruling 2026-08-07: tolerate malformed
+    // payloads instead of erroring). The element batch is deduped by name
+    // (first occurrence wins, a/b/result order per step); the recipe
+    // batch stays in step order.
+    seen: Set<text> = Set()
+    elements: List<(text, text, bool)> = []
+    recipes_out: List<(text, text, text)> = []
+    for st in steps
+        a_raw, a_em, b_raw, b_em, r_raw, r_em = st
+        a = sanitize_element_name(a_raw)
+        b = sanitize_element_name(b_raw)
+        r = sanitize_element_name(r_raw)
+        if a.length == 0 or b.length == 0 or r.length == 0
+            continue
+        recipes_out.append((r, a, b))
+        lineage_add_unique(elements, seen, a, a_em)
+        lineage_add_unique(elements, seen, b, b_em)
+        lineage_add_unique(elements, seen, r, r_em)
+    return (elements, recipes_out)
+
+export func build_export_items_boundary(elements: List<(text, text, bool)>, recipes: Map<text, List<(text, text)>>) -> (List<(int, text, text, bool)>, List<(int, int, int)>)
+    // .ic export builder (owner ruling 2026-08-07): fresh sequential ids
+    // 0..n over the export closure in input (storage) order, recipe pairs
+    // remapped to those ids, pairs referencing excluded elements dropped —
+    // an export can never contain a dangling id.
+    selected = export_elements(elements_from_tuples(elements), recipes)
+    name_id: Map<text, int> = Map()
+    items: List<(int, text, text, bool)> = []
+    idx = 0
+    for e in selected
+        name_id[e.name] = idx
+        items.append((idx, e.name, e.emoji, e.first))
+        idx = idx + 1
+    refs: List<(int, int, int)> = []
+    for e in selected
+        if not recipes.has(e.name)
+            continue
+        for pair in recipes[e.name]
+            pa, pb = pair
+            if name_id.has(pa) and name_id.has(pb)
+                refs.append((name_id[e.name], name_id[pa], name_id[pb]))
+    return (items, refs)
 
 // ===========================================================================
 // Tests
@@ -1083,6 +1398,52 @@ test "validate_command_line error presence"
     assert validate_command_line("Water ++").is_some()
     assert validate_command_line("/import").is_some()
 
+test "parse_operands maxsplit semantics"
+    // The tail keeps later separators (Python split(sep, 1) semantics) —
+    // these four inputs are exactly where the old JS length-limit split
+    // truncated the second operand.
+    r = parse_operands("+", "A + B + C")
+    assert r.is_some()
+    a, b = r.unwrap()
+    assert a == "A"
+    assert b == "B + C"
+    r = parse_operands("++", "A ++ B ++ C")
+    assert r.is_some()
+    a, b = r.unwrap()
+    assert a == "A"
+    assert b == "B ++ C"
+    r = parse_operands("+|", "A+|b+|c")
+    assert r.is_some()
+    a, b = r.unwrap()
+    assert a == "A"
+    assert b == "b+|c"
+    r = parse_operands("*", "x * y * z")
+    assert r.is_some()
+    a, b = r.unwrap()
+    assert a == "x"
+    assert b == "y * z"
+    r = parse_operands("+", "Water + Fire")
+    assert r.is_some()
+    a, b = r.unwrap()
+    assert a == "Water"
+    assert b == "Fire"
+    // operands are stripped
+    r = parse_operands("+|", "  Water  +|  fire*  ")
+    assert r.is_some()
+    a, b = r.unwrap()
+    assert a == "Water"
+    assert b == "fire*"
+    // missing/empty operands
+    assert parse_operands("+", "Water +").is_none()
+    assert parse_operands("+", "Water").is_none()
+    assert parse_operands("++", "A ++ ").is_none()
+    assert parse_operands("++", " ++ B").is_none()
+    assert parse_operands("+|", "A+|").is_none()
+    assert parse_operands("*", " * y").is_none()
+    // non-shorthand kinds are not this function's job
+    assert parse_operands("combine", "Water Fire").is_none()
+    assert parse_operands("", "Water + Fire").is_none()
+
 test "validate_command_line exact messages"
     err = validate_command_line("/combine Water + Fire")
     assert err.is_some()
@@ -1112,6 +1473,47 @@ test "validate_command_line exact messages"
     assert err.is_some()
     assert err.unwrap() == "  Usage: /crawl <element> <element>"
 
+test "validate_command_line segments highlights"
+    segs_opt = validate_command_line_segments("/notacommand")
+    assert segs_opt.is_some()
+    segs = segs_opt.unwrap()
+    assert segs.length == 5
+    t0, h0 = segs[0]
+    assert t0 == "  Unknown command: "
+    assert not h0
+    t1, h1 = segs[1]
+    assert t1 == "/notacommand"
+    assert h1
+    t3, h3 = segs[3]
+    assert t3 == "/help"
+    assert h3
+    op_segs = slash_combine_crawl_operator_error_segments("Water + Fire", "combine")
+    assert op_segs.is_some()
+    o = op_segs.unwrap()
+    assert o.length == 5
+    s1t, s1h = o[1]
+    assert s1t == "Water + Fire"
+    assert s1h
+    s3t, s3h = o[3]
+    assert s3t == "/combine Water Fire"
+    assert s3h
+    x_segs = slash_cross_operator_error_segments("fire* * water*")
+    assert x_segs.is_some()
+    x = x_segs.unwrap()
+    x3t, x3h = x[3]
+    assert x3t == "/cross fire* water*"
+    assert x3h
+    // segments concat == plain validate for every error shape
+    for bad_line in ["Water +", "/notacommand", "Water Fire", "/combine Water + Fire", "Water + | Fire", "/permute", "/with Water", "/cross fire* * water*", "/^fi/"]
+        v = validate_command_line(bad_line)
+        assert v.is_some()
+        sv = validate_command_line_segments(bad_line)
+        assert sv.is_some()
+        assert seg_concat(sv.unwrap()) == v.unwrap()
+    // no-error lines yield no segments
+    assert validate_command_line_segments("Water + Fire").is_none()
+    assert validate_command_line_segments("/combine Water Fire").is_none()
+
 test "pair_key and exhaust_pairs parity"
     k1 = pair_key("Water", "Fire")
     k2 = pair_key("Fire", "Water")
@@ -1136,6 +1538,62 @@ test "pair_key and exhaust_pairs parity"
         ka, kb = pk
         keys.add(ka + "\u{0}" + kb)
     assert keys.items().length == 5
+
+test "permute cross with pair generation"
+    a = Element(name = "A", emoji = "", first = false)
+    b = Element(name = "B", emoji = "", first = false)
+    c = Element(name = "C", emoji = "", first = false)
+    // permute: upper triangle in match order
+    pp = permute_pairs([a, b, c])
+    assert pp.length == 3
+    p0a, p0b = pp[0]
+    assert p0a.name == "A"
+    assert p0b.name == "B"
+    p1a, p1b = pp[1]
+    assert p1a.name == "A"
+    assert p1b.name == "C"
+    p2a, p2b = pp[2]
+    assert p2a.name == "B"
+    assert p2b.name == "C"
+    single: List<Element> = [a]
+    assert permute_pairs(single).length == 0
+    empty_els: List<Element> = []
+    assert permute_pairs(empty_els).length == 0
+    // cross: left-major, same-name skipped, symmetric dedup
+    cp = cross_pairs([a, b], [b, c])
+    // (A,B), (A,C), (B,C) — B+B skipped
+    assert cp.length == 3
+    c0a, c0b = cp[0]
+    assert c0a.name == "A"
+    assert c0b.name == "B"
+    c1a, c1b = cp[1]
+    assert c1a.name == "A"
+    assert c1b.name == "C"
+    c2a, c2b = cp[2]
+    assert c2a.name == "B"
+    assert c2b.name == "C"
+    // overlap dedup: (A,B) from left-major once only even if reversed later
+    cp2 = cross_pairs([a, b], [b, a])
+    assert cp2.length == 1
+    // with: target x others, self skipped, order preserved
+    wp = with_pairs(b, [a, b, c])
+    assert wp.length == 2
+    w0a, w0b = wp[0]
+    assert w0a.name == "B"
+    assert w0b.name == "A"
+    w1a, w1b = wp[1]
+    assert w1a.name == "B"
+    assert w1b.name == "C"
+    // boundary adapters
+    tuples: List<(text, text, bool)> = [("A", "", false), ("B", "", false), ("C", "", false)]
+    assert permute_pairs_boundary(tuples).length == 3
+    bn, be, bf, cn, ce, cf = permute_pairs_boundary(tuples)[2]
+    assert bn == "B"
+    assert cn == "C"
+    left_t: List<(text, text, bool)> = [("A", "", false), ("B", "", false)]
+    right_t: List<(text, text, bool)> = [("B", "", false), ("C", "", false)]
+    assert cross_pairs_boundary(left_t, right_t).length == 3
+    assert with_pairs_boundary(("B", "", false), tuples).length == 2
 
 test "element_matches_pattern branches"
     m, err = element_matches_pattern("Firewall", "fire*")
@@ -1297,6 +1755,59 @@ test "included_element_names orphan export v1.4.2"
     included2 = included_element_names(recipes2)
     assert not included2.has("Ghost")
 
+test "crawl_generation_pairs sorted order tried and self-pairs"
+    w = Element(name = "Water", emoji = "", first = false)
+    f = Element(name = "Fire", emoji = "", first = false)
+    pool: List<Element> = [w, f]
+    tried: Set<text> = Set()
+    pairs, keys = crawl_generation_pairs(pool, tried)
+    // pool insertion order is Water,Fire; sorted-name ruling gives Fire
+    // first; self-pairs included: (Fire,Fire), (Fire,Water), (Water,Water)
+    assert pairs.length == 3
+    assert keys.length == 3
+    p0a, p0b = pairs[0]
+    assert p0a.name == "Fire"
+    assert p0b.name == "Fire"
+    p1a, p1b = pairs[1]
+    assert p1a.name == "Fire"
+    assert p1b.name == "Water"
+    p2a, p2b = pairs[2]
+    assert p2a.name == "Water"
+    assert p2b.name == "Water"
+    // feeding the returned keys back marks everything tried
+    tried2: Set<text> = Set()
+    for k in keys
+        tried2.add(k)
+    pairs2, keys2 = crawl_generation_pairs(pool, tried2)
+    assert pairs2.length == 0
+    assert keys2.length == 0
+    // boundary round-trip
+    pool_t: List<(text, text, bool)> = [("Water", "", false), ("Fire", "", false)]
+    empty_keys: List<text> = []
+    bp, bk = crawl_generation_pairs_boundary(pool_t, empty_keys)
+    assert bp.length == 3
+    assert bk.length == 3
+    bp2, bk2 = crawl_generation_pairs_boundary(pool_t, bk)
+    assert bp2.length == 0
+    assert bk2.length == 0
+
+test "is_unfilled empty list ruling"
+    recipes: Map<text, List<(text, text)>> = Map()
+    empty_pairs: List<(text, text)> = []
+    recipes["Ghost"] = empty_pairs
+    recipes["Steam"] = [("Fire", "Water")]
+    // owner ruling 2026-08-07: empty list = unfilled, absent = unfilled,
+    // non-empty = filled, base elements never unfilled
+    assert is_unfilled("Ghost", recipes)
+    assert is_unfilled("Mystery", recipes)
+    assert not is_unfilled("Steam", recipes)
+    assert not is_unfilled("Water", recipes)
+    els: List<(text, text, bool)> = [("Water", "", false), ("Ghost", "", false), ("Steam", "", false), ("Mystery", "", false)]
+    un = unfilled_names_boundary(els, recipes)
+    assert un.length == 2
+    assert un[0] == "Ghost"
+    assert un[1] == "Mystery"
+
 test "title_case resolve get_by_name add record"
     assert title_case("baker's dozen") == "Baker'S Dozen"
     assert title_case("co2 gas") == "Co2 Gas"
@@ -1339,6 +1850,112 @@ test "title_case resolve get_by_name add record"
     batch.append(("New2", "3", true))
     n = add_elements_batch(els, batch)
     assert n == 2
+
+test "sanitize_element_name strip and control chars"
+    assert sanitize_element_name("  Water  ") == "Water"
+    assert sanitize_element_name("Wa\u{0}ter") == "Water"
+    assert sanitize_element_name("\u{7}Bell\u{1b}") == "Bell"
+    assert sanitize_element_name("\u{9d}C1\u{85}") == "C1"
+    assert sanitize_element_name("Line\u{2028}Sep\u{2029}") == "LineSep"
+    assert sanitize_element_name("\u{0} spaced \u{0}") == " spaced "
+    assert sanitize_element_name("Baker's Dozen") == "Baker's Dozen"
+    assert sanitize_element_name("") == ""
+
+test "ic_save_to_batches id resolution and sanitization"
+    items: List<(int, text, text, bool)> = []
+    items.append((0, "Water", "💧", false))
+    items.append((1, "  Steam\u{0} ", "🌫️", true))
+    items.append((7, "Fire", "🔥", false))
+    refs: List<(int, int, int)> = []
+    refs.append((1, 0, 7))
+    refs.append((1, 0, 99))
+    els, recs = ic_save_to_batches(items, refs)
+    assert els.length == 3
+    n1, e1, d1 = els[1]
+    assert n1 == "Steam"
+    assert d1
+    assert recs.length == 1
+    rr, ra, rb = recs[0]
+    assert rr == "Steam"
+    assert ra == "Water"
+    assert rb == "Fire"
+    // an item with missing/empty text is skipped, and refs to its id drop
+    bad_items: List<(int, text, text, bool)> = []
+    bad_items.append((0, "Water", "", false))
+    bad_items.append((1, "  ", "", false))
+    bad_refs: List<(int, int, int)> = []
+    bad_refs.append((0, 0, 1))
+    bad_els, bad_recs = ic_save_to_batches(bad_items, bad_refs)
+    assert bad_els.length == 1
+    assert bad_recs.length == 0
+
+test "lineage_steps_to_batches dedup and skip malformed"
+    steps: List<(text, text, text, text, text, text)> = []
+    steps.append(("Fire", "🔥", "Water", "💧", "Steam", "🌫️"))
+    steps.append(("Steam", "🌫️", "Wind", "🌬️", "Cloud", "☁️"))
+    steps.append(("", "", "Water", "💧", "Broken", ""))
+    els, recs = lineage_steps_to_batches(steps)
+    // malformed step skipped entirely (no Broken element, no recipe)
+    assert recs.length == 2
+    assert els.length == 5
+    n0, e0, d0 = els[0]
+    assert n0 == "Fire"
+    n2, e2, d2 = els[2]
+    assert n2 == "Steam"
+    n4, e4, d4 = els[4]
+    assert n4 == "Cloud"
+    r0r, r0a, r0b = recs[0]
+    assert r0r == "Steam"
+    r1r, r1a, r1b = recs[1]
+    assert r1r == "Cloud"
+
+test "build_export_items id remap no dangling"
+    els: List<(text, text, bool)> = []
+    els.append(("Water", "", false))
+    els.append(("Steam", "", true))
+    els.append(("Mystery Gas", "", false))
+    els.append(("Orphan", "", false))
+    recipes: Map<text, List<(text, text)>> = Map()
+    recipes["Steam"] = [("Mystery Gas", "Water")]
+    items, refs = build_export_items_boundary(els, recipes)
+    // closure = bases + Steam + Mystery Gas; Orphan is referenced by no
+    // recipe -> excluded; input order kept: Water, Steam, Mystery Gas
+    assert items.length == 3
+    i0, t0, e0, f0 = items[0]
+    assert i0 == 0
+    assert t0 == "Water"
+    i1, t1, e1, f1 = items[1]
+    assert t1 == "Steam"
+    assert f1
+    i2, t2, e2, f2 = items[2]
+    assert t2 == "Mystery Gas"
+    assert refs.length == 1
+    rr, ra, rb = refs[0]
+    assert rr == 1
+    assert ra == 2
+    assert rb == 0
+    // an ingredient the closure includes but discoveries never stored:
+    // its pair is dropped rather than emitted as a dangling id
+    els2: List<(text, text, bool)> = []
+    els2.append(("Water", "", false))
+    els2.append(("Cloud", "", false))
+    recipes2: Map<text, List<(text, text)>> = Map()
+    recipes2["Cloud"] = [("Sky", "Water")]
+    items2, refs2 = build_export_items_boundary(els2, recipes2)
+    // Water + Cloud exported (Sky is in the closure but not stored)
+    assert items2.length == 2
+    assert refs2.length == 0
+    // a referenced-but-recipeless element IS part of the closure: it must
+    // be exported, not treated as an orphan
+    els3: List<(text, text, bool)> = []
+    els3.append(("Water", "", false))
+    els3.append(("Steam", "", false))
+    els3.append(("Mystery Gas", "", false))
+    recipes3: Map<text, List<(text, text)>> = Map()
+    recipes3["Steam"] = [("Mystery Gas", "Water")]
+    items3, refs3 = build_export_items_boundary(els3, recipes3)
+    assert items3.length == 3
+    assert refs3.length == 1
 
 test "trace_recipe outcomes"
     els: List<Element> = []

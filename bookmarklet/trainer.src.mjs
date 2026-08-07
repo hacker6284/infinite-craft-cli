@@ -7,27 +7,36 @@
 import {
   match_elements_boundary as matchElementsBoundary,
   resolve_element_boundary as resolveElementBoundary,
+  add_element_boundary as addElementBoundary,
+  add_elements_batch_boundary as addElementsBatchBoundary,
   record_recipe as recordRecipeKernel,
   trace_recipe_boundary as traceRecipeBoundary,
   export_elements_boundary as exportElementsBoundary,
   orphan_candidates_boundary as orphanCandidatesBoundary,
   exhaust_pairs_boundary as exhaustPairsBoundary,
+  permute_pairs_boundary as permutePairsBoundary,
+  cross_pairs_boundary as crossPairsBoundary,
+  with_pairs_boundary as withPairsBoundary,
+  crawl_generation_pairs_boundary as crawlGenerationPairsBoundary,
+  ic_save_to_batches as icSaveToBatches,
+  lineage_steps_to_batches as lineageStepsToBatches,
+  build_export_items_boundary as buildExportItemsBoundary,
   pair_key as pairKeyKernel,
+  is_base_element as isBaseElement,
+  sanitize_element_name as sanitizeElementName,
+  unfilled_names_boundary as unfilledNamesBoundary,
   is_local_command as isLocalCommand,
   is_slash_command_attempt as isSlashCommandAttempt,
   classify_command_line as classifyCommandLine,
-  validate_command_line as validateCommandLine,
+  validate_command_line_segments as validateCommandLineSegments,
   slash_args as slashArgs,
   parse_two_elements as parseTwoElements,
+  parse_operands as parseOperands,
   parse_with_args as parseWithArgs,
   parse_cross_queries as parseCrossQueries,
-  slash_combine_crawl_pipe_error as slashCombineCrawlPipeError,
-  slash_combine_crawl_operator_error as slashCombineCrawlOperatorError,
-  slash_cross_operator_error as slashCrossOperatorError,
 } from "./_sudo/craft.mjs";
 
 // ── Constants ────────────────────────────────────────────────────────
-const BASE_ELEMENTS = new Set(["Water", "Fire", "Wind", "Earth"]);
 const RATE_LIMIT = 60;
 const RATE_WINDOW = 60000;
 const BULK_WARN = 200;
@@ -59,6 +68,11 @@ function print(html) {
   output.scrollTop = output.scrollHeight;
 }
 function esc(s) { const d = document.createElement("span"); d.textContent = s; return d.innerHTML; }
+// Kernel validation errors arrive as (text, highlight) segment lists; every
+// segment is HTML-escaped here, highlighted ones get the yellow span.
+function renderErrorSegments(segments) {
+  return segments.map(([text, hl]) => (hl ? yellow(esc(text)) : esc(text))).join("");
+}
 // wrap() inserts html into innerHTML — callers must pass pre-escaped text (via esc()).
 function wrap(cls, html) { return `<span class="${cls}">${html}</span>`; }
 function bold(t) { return wrap("ict-bold", t); }
@@ -177,8 +191,19 @@ function getByName(name) {
   return _nameIndex[name] || null;
 }
 
+function toTuples(elements) {
+  return elements.map(e => [e.text, e.emoji || "", !!e.discovered]);
+}
+
 function elementTuples() {
-  return getAllElements().map(e => [e.text, e.emoji || "", !!e.discovered]);
+  return toTuples(getAllElements());
+}
+
+function pairsFromBoundary(rawPairs) {
+  return rawPairs.map(([at, ae, af, bt, be, bf]) => [
+    { text: at, emoji: ae, discovered: af },
+    { text: bt, emoji: be, discovered: bf },
+  ]);
 }
 
 function resolveElement(name) {
@@ -186,21 +211,46 @@ function resolveElement(name) {
   return { text, emoji, discovered };
 }
 
-function addElement(text, emoji, discovered) {
-  const existing = _nameIndex[text];
-  if (existing) return false;
+function _materializeElement(text, emoji, discovered) {
   const item = { id: _nextId++, saveId: _saveId, text, emoji: emoji || "" };
   if (discovered) item.discovered = true;
   _items.push(item);
   _nameIndex[text] = item;
   _idIndex[item.id] = item;
   putItem(item);
+}
+
+function addElement(text, emoji, discovered) {
+  // Kernel storage normalization + insert-or-ignore decision (same rule as
+  // the CLI: no discovered-flag promotion on re-add); the host only
+  // materializes the item and persists.
+  text = sanitizeElementName(text);
+  if (!addElementBoundary(elementTuples(), text, emoji || "", !!discovered)) return false;
+  _materializeElement(text, emoji, discovered);
   return true;
+}
+
+function addElementsBatch(batch) {
+  // Batch variant: one kernel decision pass; appended tuples come back on
+  // the inout list and are materialized in order.
+  const tuples = elementTuples();
+  const before = tuples.length;
+  const normalized = batch.map(([text, emoji, discovered]) => [
+    sanitizeElementName(text),
+    emoji || "",
+    !!discovered,
+  ]);
+  const count = addElementsBatchBoundary(tuples, normalized);
+  for (let i = before; i < tuples.length; i++) {
+    const [text, emoji, discovered] = tuples[i];
+    _materializeElement(text, emoji, discovered);
+  }
+  return count;
 }
 
 async function removeElement(name) {
   const item = _nameIndex[name];
-  if (!item || BASE_ELEMENTS.has(item.text)) return false;
+  if (!item || isBaseElement(item.text)) return false;
   _items = _items.filter(i => i.id !== item.id);
   _allItems = _allItems.filter(i => i.id !== item.id);
   delete _nameIndex[item.text];
@@ -521,14 +571,9 @@ async function doExhaust(query) {
   if (error) { print("  " + red(error)); return; }
   if (!matches.length) { print(`  No elements match: ${esc(query)}`); return; }
 
-  const rawPairs = exhaustPairsBoundary(
-    matches.map(e => [e.text, e.emoji || "", !!e.discovered]),
-    elementTuples()
+  const pairs = pairsFromBoundary(
+    exhaustPairsBoundary(toTuples(matches), elementTuples())
   );
-  const pairs = rawPairs.map(([at, ae, af, bt, be, bf]) => [
-    { text: at, emoji: ae, discovered: af },
-    { text: bt, emoji: be, discovered: bf },
-  ]);
   if (!pairs.length) {
     print(`  No valid pairs for query: ${esc(query)}`);
     return;
@@ -547,37 +592,22 @@ async function doCrawl(aName, bName) {
 
   try {
     beginRun();
-    // Initial combine
-    let pool = new Set();
-    const tried = new Set();
-    const result = await apiPair(a.text, b.text);
-    if (cancelled) { print("  " + yellow("Crawl cancelled.")); return; }
-    tried.add(pairKey(a.text, b.text));
-    if (result) {
-      addElement(a.text, a.emoji, false);
-      addElement(b.text, b.emoji, false);
-      pool.add(a.text);
-      pool.add(b.text);
-      const isNew = addElement(result.text, result.emoji, result.discovered);
-      recordRecipe(result.text, a.text, b.text);
-      history.push({ a: a.text, b: b.text, result: result.text });
-      pool.add(result.text);
-      print(`  ${formatResult(a, b, result)}${isNew ? " " + green("(new)") : ""}`);
-    } else {
-      print(formatResult(a, b, null));
-      return;
-    }
-
+    // Uniform generations from a seeded pool (owner rulings 2026-08-07,
+    // matching the CLI): the seed pair is just part of generation 1
+    // (which also holds the self-pairs), pair order comes from the
+    // kernel's sorted-name generation, and any result not already in the
+    // pool joins the next generation's pool — not only globally-new
+    // discoveries.
+    const pool = new Map([[a.text, a], [b.text, b]]);
+    const triedKeys = [];
     let gen = 1;
     while (!cancelled) {
-      const elements = [...pool].map(n => resolveElement(n));
-      const pairs = [];
-      for (let i = 0; i < elements.length; i++) {
-        for (let j = i; j < elements.length; j++) {
-          const key = pairKey(elements[i].text, elements[j].text);
-          if (!tried.has(key)) { pairs.push([elements[i], elements[j]]); tried.add(key); }
-        }
-      }
+      const [rawPairs, newKeys] = crawlGenerationPairsBoundary(
+        toTuples([...pool.values()]),
+        triedKeys
+      );
+      const pairs = pairsFromBoundary(rawPairs);
+      for (const k of newKeys) triedKeys.push(k);
       if (!pairs.length) { print("  " + dim("No more untried pairs.")); break; }
       print(`  ${dim(`Gen ${gen}:`)} ${pairs.length} pairs to try...`);
       let newInGen = 0;
@@ -586,13 +616,15 @@ async function doCrawl(aName, bName) {
         try {
           const r = await apiPair(pa.text, pb.text);
           if (r) {
+            addElement(pa.text, pa.emoji, false);
+            addElement(pb.text, pb.emoji, false);
             const isNew = addElement(r.text, r.emoji, r.discovered);
             recordRecipe(r.text, pa.text, pb.text);
             history.push({ a: pa.text, b: pb.text, result: r.text });
-            if (isNew && !pool.has(r.text)) {
-              pool.add(r.text);
+            if (!pool.has(r.text)) {
+              pool.set(r.text, { text: r.text, emoji: r.emoji, discovered: r.discovered });
               newInGen++;
-              print(`  ${formatResult(pa, pb, r)} ${green("(new)")}`);
+              print(`  ${formatResult(pa, pb, r)}${isNew ? " " + green("(new)") : ""}`);
             }
           }
         } catch (e) {
@@ -619,12 +651,7 @@ async function doPermute(query) {
     print(`  Only one match: ${formatElement(matches[0])}. Need at least two.`);
     return;
   }
-  const pairs = [];
-  for (let i = 0; i < matches.length; i++) {
-    for (let j = i + 1; j < matches.length; j++) {
-      pairs.push([matches[i], matches[j]]);
-    }
-  }
+  const pairs = pairsFromBoundary(permutePairsBoundary(toTuples(matches)));
   print(`  ${matches.length} elements match, ${pairs.length} unique pairs:`);
   for (const m of matches) print(`    ${formatElement(m)}`);
   await confirmAndRunPairs(pairs);
@@ -654,12 +681,7 @@ async function doPermutate(query) {
         return;
       }
 
-      const pairs = [];
-      for (let i = 0; i < matches.length; i++) {
-        for (let j = i + 1; j < matches.length; j++) {
-          pairs.push([matches[i], matches[j]]);
-        }
-      }
+      const pairs = pairsFromBoundary(permutePairsBoundary(toTuples(matches)));
       print(`  ${dim(`--- Round ${round}:`)} ${matches.length} elements, ${pairs.length} pairs ---`);
 
       if (!confirmed && pairs.length > BULK_WARN) {
@@ -702,17 +724,7 @@ async function doCross(leftQ, rightQ) {
   const right = rightResult.matches;
   if (!left.length) { print(`  No elements match: ${esc(leftQ)}`); return; }
   if (!right.length) { print(`  No elements match: ${esc(rightQ)}`); return; }
-  const seen = new Set();
-  const pairs = [];
-  for (const a of left) {
-    for (const b of right) {
-      if (a.text === b.text) continue;
-      const key = pairKey(a.text, b.text);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      pairs.push([a, b]);
-    }
-  }
+  const pairs = pairsFromBoundary(crossPairsBoundary(toTuples(left), toTuples(right)));
   if (!pairs.length) {
     print("  No valid pairs (all matches overlap).");
     return;
@@ -730,7 +742,9 @@ async function doCombineWithQuery(name, query) {
   const { matches: others, error } = matchElements(query);
   if (error) { print("  " + red(error)); return; }
   if (!others.length) { print(`  No elements match: ${esc(query)}`); return; }
-  const pairs = others.filter(o => o.text !== target.text).map(o => [target, o]);
+  const pairs = pairsFromBoundary(
+    withPairsBoundary(toTuples([target])[0], toTuples(others))
+  );
   if (!pairs.length) { print(`  No other elements match: ${esc(query)}`); return; }
   print(`  Combining ${bold(esc(target.text))} with ${pairs.length} elements matching ${yellow(esc(query))}...`);
   await confirmAndRunPairs(pairs);
@@ -752,23 +766,15 @@ async function fetchRetry(url, maxRetries = 3) {
 }
 
 function processRecipeSteps(steps) {
-  let count = 0;
-  for (const step of steps) {
-    const aText = step.a?.id || step.a?.text;
-    const bText = step.b?.id || step.b?.text;
-    const rText = step.result?.id || step.result?.text;
-    const aEmoji = step.a?.emoji || "";
-    const bEmoji = step.b?.emoji || "";
-    const rEmoji = step.result?.emoji || "";
-    if (aText) addElement(aText, aEmoji, false);
-    if (bText) addElement(bText, bEmoji, false);
-    if (rText) {
-      addElement(rText, rEmoji, false);
-      if (aText && bText) recordRecipe(rText, aText, bText);
-      count++;
-    }
-  }
-  return count;
+  const tuples = steps.map((step) => [
+    String(step.a?.id || step.a?.text || ""), step.a?.emoji || "",
+    String(step.b?.id || step.b?.text || ""), step.b?.emoji || "",
+    String(step.result?.id || step.result?.text || ""), step.result?.emoji || "",
+  ]);
+  const [elementBatch, recipeBatch] = lineageStepsToBatches(tuples);
+  addElementsBatch(elementBatch);
+  for (const [result, a, b] of recipeBatch) recordRecipe(result, a, b);
+  return recipeBatch.length;
 }
 
 function pickFile(accept) {
@@ -802,26 +808,23 @@ async function doImportFile() {
     }
     const items = json.items || [];
     if (!items.length) { print("  No items in save file."); return; }
-    // Build id-to-item lookup from the save file
-    const idToItem = {};
-    for (const item of items) idToItem[item.id] = item;
-    let importedCount = 0, recipeCount = 0;
+    const itemTuples = items.map((item) => [
+      item.id,
+      String(item.text ?? ""),
+      item.emoji || "",
+      !!(item.discovery || item.discovered),
+    ]);
+    const recipeRefs = [];
     for (const item of items) {
-      if (cancelled) break;
-      const text = item.text;
-      const emoji = item.emoji || "";
-      const discovered = !!(item.discovery || item.discovered);
-      const isNew = addElement(text, emoji, discovered);
-      if (isNew) importedCount++;
-      if (item.recipes) {
-        for (const pair of item.recipes) {
-          if (pair.length === 2 && idToItem[pair[0]] && idToItem[pair[1]]) {
-            recordRecipe(text, idToItem[pair[0]].text, idToItem[pair[1]].text);
-            recipeCount++;
-          }
-        }
+      if (!item.recipes) continue;
+      for (const pair of item.recipes) {
+        if (pair.length === 2) recipeRefs.push([item.id, pair[0], pair[1]]);
       }
     }
+    const [elementBatch, recipeBatch] = icSaveToBatches(itemTuples, recipeRefs);
+    const importedCount = addElementsBatch(elementBatch);
+    for (const [result, a, b] of recipeBatch) recordRecipe(result, a, b);
+    const recipeCount = recipeBatch.length;
     rebuildRecipeIndex();
     if (cancelled) print("  " + yellow("Import cancelled."));
     else print(`  Loaded ${green(String(items.length))} elements (${importedCount} new) with ${recipeCount} recipes from ${bold(esc(file.name))}.`);
@@ -857,7 +860,8 @@ async function doImport(name) {
 
 async function doFill() {
   const elements = getAllElements();
-  const missing = elements.filter(e => !BASE_ELEMENTS.has(e.text) && (!recipeIndex[e.text] || !recipeIndex[e.text].length));
+  const missingNames = new Set(unfilledNamesBoundary(elementTuples(), recipeIndex));
+  const missing = elements.filter(e => missingNames.has(e.text));
   if (!missing.length) { print("  All elements have recipes."); return; }
   print(`  ${yellow(String(missing.length))} elements missing recipes. Fetching from Infinibrowser...`);
   let filled = 0, errors = 0;
@@ -891,7 +895,8 @@ async function doFill() {
 
 function doUnfilled() {
   const elements = getAllElements();
-  const missing = elements.filter(e => !BASE_ELEMENTS.has(e.text) && (!recipeIndex[e.text] || !recipeIndex[e.text].length));
+  const missingNames = new Set(unfilledNamesBoundary(elementTuples(), recipeIndex));
+  const missing = elements.filter(e => missingNames.has(e.text));
   if (!missing.length) { print("  All elements have recipes."); return; }
   print(`  ${yellow(String(missing.length))} elements without recipes:`);
   for (const el of missing) print("  " + formatElement(el));
@@ -960,14 +965,17 @@ function exportIncludedCore() {
 }
 
 async function doExport() {
-  const included = exportIncludedCore();
-  const includedNames = new Set(included.map(t => t[0]));
-  const exportItems = _items.filter(item => includedNames.has(item.text)).map(item => {
-    const exportItem = { id: item.id, text: item.text, emoji: item.emoji || "" };
-    if (item.discovered) exportItem.discovery = true;
-    if (item.recipes && item.recipes.length) exportItem.recipes = item.recipes;
+  // Kernel export builder: fresh sequential ids over the closure, recipes
+  // remapped — an export can never reference an excluded item.
+  const [itemTuples, recipeRefs] = buildExportItemsBoundary(elementTuples(), recipeIndex);
+  const exportItems = itemTuples.map(([id, text, emoji, first]) => {
+    const exportItem = { id, text, emoji: emoji || "" };
+    if (first) exportItem.discovery = true;
     return exportItem;
   });
+  for (const [resultId, aId, bId] of recipeRefs) {
+    (exportItems[resultId].recipes ||= []).push([aId, bId]);
+  }
   const now = Date.now();
   const save = { name: "Trainer Export", version: "1.0", created: now, updated: now, instances: [], items: exportItems };
   const json = JSON.stringify(save);
@@ -1061,9 +1069,9 @@ function enqueueCommand(line) {
 }
 
 function tryEnqueue(line) {
-  const error = validateCommandLine(line);
-  if (error) {
-    print(error);
+  const errorSegments = validateCommandLineSegments(line);
+  if (errorSegments) {
+    print(renderErrorSegments(errorSegments));
     return false;
   }
   if (line === currentCommand || commandQueue.includes(line)) {
@@ -1106,85 +1114,61 @@ async function ensureQueueWorker() {
 
 // ── Command dispatcher ───────────────────────────────────────────────
 async function executeClassified(kind, payload, line) {
-  if (kind === "permute") {
-    if (!payload.trim()) print("  Usage: /permute <query>");
-    else await doPermute(payload.trim());
-    return;
-  }
-  if (kind === "permutate") {
-    if (!payload.trim()) print("  Usage: /permutate <query>");
-    else await doPermutate(payload.trim());
-    return;
-  }
+  // Bare /import opens the file picker — deliberately more permissive than
+  // the kernel validator, so it dispatches before the validation gate.
   if (kind === "import") {
     if (!payload.trim()) await doImportFile();
     else if (payload.endsWith(".ic") || payload.includes("/") || payload.includes("\\")) await doImportFile();
     else await doImport(payload.trim());
     return;
   }
+  // Validation-first: every usage/pipe/operator error is the kernel's
+  // (rendered as escaped segments); the branches below run on valid lines.
+  const errorSegments = validateCommandLineSegments(line);
+  if (errorSegments) {
+    print(renderErrorSegments(errorSegments));
+    return;
+  }
+  if (kind === "permute") { await doPermute(payload.trim()); return; }
+  if (kind === "permutate") { await doPermutate(payload.trim()); return; }
   if (kind === "fill") { await doFill(); return; }
   if (kind === "prune") { await doPrune(); return; }
   if (kind === "export") { await doExport(); return; }
-  if (kind === "exhaust") {
-    if (!payload.trim()) print("  Usage: /exhaust <query>");
-    else await doExhaust(payload.trim());
-    return;
-  }
+  if (kind === "exhaust") { await doExhaust(payload.trim()); return; }
   if (kind === "combine" || kind === "crawl") {
-    const pipeErr = slashCombineCrawlPipeError(payload);
-    if (pipeErr) { print(pipeErr); return; }
-    const opErr = slashCombineCrawlOperatorError(payload, kind);
-    if (opErr) { print(opErr); return; }
     const parsed = parseTwoElements(payload);
-    if (!parsed) print(`  Usage: /${kind} <element> <element>`);
-    else if (kind === "combine") await doCombine(parsed[0], parsed[1]);
+    if (kind === "combine") await doCombine(parsed[0], parsed[1]);
     else await doCrawl(parsed[0], parsed[1]);
     return;
   }
   if (kind === "with") {
     const parsed = parseWithArgs(payload);
-    if (!parsed) print("  Usage: /with <element> <query>");
-    else await doCombineWithQuery(parsed[0], parsed[1]);
+    await doCombineWithQuery(parsed[0], parsed[1]);
     return;
   }
   if (kind === "cross") {
-    const opErr = slashCrossOperatorError(payload);
-    if (opErr) { print(opErr); return; }
     const parsed = parseCrossQueries(payload);
-    if (!parsed) print("  Usage: /cross <query> <query>");
-    else await doCross(parsed[0], parsed[1]);
+    await doCross(parsed[0], parsed[1]);
     return;
   }
   if (kind === "++") {
-    const [a, b] = line.split(" ++ ", 2).map(s => s.trim());
-    if (a && b) await doCrawl(a, b);
-    else print("  Usage: <element> ++ <element>");
-    return;
-  }
-  if (kind === "bad+|") {
-    print(`  Use <element> +| <query> (no space between + and |). Type ${yellow("/help")} for commands.`);
+    const parsed = parseOperands(kind, payload);
+    await doCrawl(parsed[0], parsed[1]);
     return;
   }
   if (kind === "+|") {
-    const parts = line.split("+|", 2);
-    const name = parts[0].trim();
-    const query = parts[1].trim();
-    if (name && query) await doCombineWithQuery(name, query);
-    else print("  Usage: <element> +| <query>");
+    const parsed = parseOperands(kind, payload);
+    await doCombineWithQuery(parsed[0], parsed[1]);
     return;
   }
   if (kind === "*") {
-    const [left, right] = line.split(" * ", 2).map(s => s.trim());
-    if (left && right) await doCross(left, right);
-    else print("  Usage: <query> * <query>");
+    const parsed = parseOperands(kind, payload);
+    await doCross(parsed[0], parsed[1]);
     return;
   }
   if (kind === "+") {
-    const parts = line.includes(" + ")
-      ? line.split(" + ", 2).map(s => s.trim())
-      : [line.trimEnd().replace(/ \+$/, "").trim(), ""];
-    if (parts[0] && parts[1]) await doCombine(parts[0], parts[1]);
-    else print("  Usage: <element> + <element>");
+    const parsed = parseOperands(kind, payload);
+    await doCombine(parsed[0], parsed[1]);
   }
 }
 
@@ -1208,8 +1192,8 @@ async function executeCommand(line) {
 
   const classified = classifyCommandLine(line);
   if (!classified) {
-    const error = validateCommandLine(line);
-    print(error);
+    const errorSegments = validateCommandLineSegments(line);
+    if (errorSegments) print(renderErrorSegments(errorSegments));
     return;
   }
   await executeClassified(classified[0], classified[1], line);

@@ -21,6 +21,17 @@ import {
 import {
   classify_command_line,
   validate_command_line,
+  parse_operands,
+  validate_command_line_segments,
+  permute_pairs_boundary,
+  cross_pairs_boundary,
+  with_pairs_boundary,
+  unfilled_names_boundary,
+  crawl_generation_pairs_boundary,
+  sanitize_element_name,
+  ic_save_to_batches,
+  lineage_steps_to_batches,
+  build_export_items_boundary,
 } from "../../bookmarklet/_sudo/craft.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -125,6 +136,79 @@ function runScenario(scenario, fixtures) {
   if (op === "validate") {
     const r = validate_command_line(scenario.line);
     return r === undefined ? null : r;
+  }
+
+  if (op === "operands") {
+    const r = parse_operands(scenario.kind, scenario.payload);
+    return r === null || r === undefined ? null : Array.from(r);
+  }
+
+  if (op === "permute_pairs") {
+    return permute_pairs_boundary(scenario.matches).map((t) => Array.from(t));
+  }
+
+  if (op === "cross_pairs") {
+    return cross_pairs_boundary(scenario.left, scenario.right).map((t) =>
+      Array.from(t)
+    );
+  }
+
+  if (op === "with_pairs") {
+    return with_pairs_boundary(scenario.target, scenario.others).map((t) =>
+      Array.from(t)
+    );
+  }
+
+  if (op === "unfilled") {
+    return Array.from(unfilled_names_boundary(elements, recipes));
+  }
+
+  if (op === "sanitize") {
+    return sanitize_element_name(scenario.name);
+  }
+
+  if (op === "ic_batches") {
+    const [els, recs] = ic_save_to_batches(
+      scenario.items,
+      scenario.recipe_refs || []
+    );
+    return {
+      elements: els.map((t) => Array.from(t)),
+      recipes: recs.map((t) => Array.from(t)),
+    };
+  }
+
+  if (op === "lineage_batches") {
+    const [els, recs] = lineage_steps_to_batches(scenario.steps);
+    return {
+      elements: els.map((t) => Array.from(t)),
+      recipes: recs.map((t) => Array.from(t)),
+    };
+  }
+
+  if (op === "export_items") {
+    const [items, refs] = build_export_items_boundary(elements, recipes);
+    return {
+      items: items.map((t) => Array.from(t)),
+      refs: refs.map((t) => Array.from(t)),
+    };
+  }
+
+  if (op === "crawl_pairs") {
+    const [rawPairs, newKeys] = crawl_generation_pairs_boundary(
+      scenario.pool,
+      scenario.tried_keys || []
+    );
+    return {
+      pairs: rawPairs.map((t) => Array.from(t)),
+      new_keys: Array.from(newKeys),
+    };
+  }
+
+  if (op === "validate_segments") {
+    const segs = validate_command_line_segments(scenario.line);
+    if (segs === null || segs === undefined) return null;
+    return segs.map(([text, hl]) => [text, !!hl]);
   }
 
   throw new Error(`unknown op: ${op}`);

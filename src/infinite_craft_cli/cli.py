@@ -303,8 +303,11 @@ def _tty(text: str) -> str:
 
 
 def _sanitize_element_name(name: str) -> str:
-    """Normalize API/import element names before storage."""
-    return _sanitize_tty_text(name.strip())
+    """Normalize API/import element names before storage.
+
+    The rule lives in the kernel so both hosts persist identical names for
+    identical payloads; TTY-display sanitization stays host-side."""
+    return craft.sanitize_element_name(name)
 
 
 def format_element(elem) -> str:
@@ -336,6 +339,12 @@ def _elements_to_boundary(elements) -> list[tuple[str, str, bool]]:
     nullable fields); this never changes display behavior since both call
     sites treat None and ""/False as equivalently falsy."""
     return [(e.name, e.emoji or "", bool(e.is_first_discovery)) for e in elements]
+
+
+def _pairs_from_boundary(pair_tuples, elements):
+    """Map kernel pair-boundary 6-tuples back to the host's Element objects."""
+    by_name = {e.name: e for e in elements}
+    return [(by_name[an], by_name[bn]) for an, _ae, _af, bn, _be, _bf in pair_tuples]
 
 
 def _resolve_element(storage, name: str):
@@ -551,14 +560,12 @@ async def do_crawl(client, storage, first_name: str, second_name: str):
                 _mark_cancel_notified()
             break
         generation += 1
-        names = sorted(pool.keys())
-        new_pairs = []
-        for i in range(len(names)):
-            for j in range(i, len(names)):
-                key = craft.pair_key(names[i], names[j])
-                if key not in tried:
-                    new_pairs.append((pool[names[i]], pool[names[j]]))
-                    tried.add(key)
+        pool_elements = list(pool.values())
+        pair_tuples, new_keys = craft.crawl_generation_pairs_boundary(
+            _elements_to_boundary(pool_elements), list(tried)
+        )
+        new_pairs = _pairs_from_boundary(pair_tuples, pool_elements)
+        tried.update(new_keys)
 
         if not new_pairs:
             _repl_print_lines(f"  Exhausted all pairs. {len(pool)} elements in pool.")
@@ -612,10 +619,7 @@ async def do_exhaust(client, storage, query: str):
     pair_tuples = craft.exhaust_pairs_boundary(
         _elements_to_boundary(matches), _elements_to_boundary(all_elements)
     )
-    by_name = {e.name: e for e in all_elements}
-    pairs: list[tuple] = [
-        (by_name[an], by_name[bn]) for an, _ae, _af, bn, _be, _bf in pair_tuples
-    ]
+    pairs: list[tuple] = _pairs_from_boundary(pair_tuples, all_elements)
     if not pairs:
         _repl_print_lines(f"  No valid pairs for query: {query}")
         return
@@ -640,7 +644,12 @@ async def do_with(client, storage, element_name: str, query: str):
     if not others:
         _repl_print_lines(f"  No elements match: {query}")
         return
-    pairs = [(target, o) for o in others if o.name != target.name]
+    pairs = _pairs_from_boundary(
+        craft.with_pairs_boundary(
+            _elements_to_boundary([target])[0], _elements_to_boundary(others)
+        ),
+        [target] + list(others),
+    )
     if not pairs:
         _repl_print_lines(f"  No other elements match: {query}")
         return
@@ -651,40 +660,35 @@ async def do_with(client, storage, element_name: str, query: str):
     await _confirm_and_run_pairs(client, storage, pairs)
 
 
+def _render_error_segments(segments) -> str:
+    """Render kernel (text, highlight) error segments with ANSI color."""
+    return "".join(
+        _color(text, YELLOW) if highlight else text for text, highlight in segments
+    )
+
+
 def _slash_combine_crawl_pipe_error(rest: str) -> str | None:
     """Reject slash combine/crawl payloads that use spaced ``+ |`` instead of ``+|``."""
-    if craft.slash_combine_crawl_pipe_error(rest) is None:
+    segments = craft.slash_combine_crawl_pipe_error_segments(rest)
+    if segments is None:
         return None
-    return (
-        "  Use <element> +| <query> "
-        f"(no space between + and |). Type {_color('/help', YELLOW)} for commands."
-    )
+    return _render_error_segments(segments)
 
 
 def _slash_combine_crawl_operator_error(rest: str, kind: str) -> str | None:
     """Reject slash combine/crawl payloads that still use `` + `` operator syntax."""
-    if craft.slash_combine_crawl_operator_error(rest, kind) is None:
+    segments = craft.slash_combine_crawl_operator_error_segments(rest, kind)
+    if segments is None:
         return None
-    parts = rest.split(" + ", 1)
-    positional = f"/{kind} {parts[0].strip()} {parts[1].strip()}"
-    return (
-        f"  Slash /{kind} uses positional args, not +. "
-        f"Try {_color(rest.strip(), YELLOW)} (shorthand) or "
-        f"{_color(positional, YELLOW)}."
-    )
+    return _render_error_segments(segments)
 
 
 def _slash_cross_operator_error(rest: str) -> str | None:
     """Reject slash cross payloads that still use `` * `` operator syntax."""
-    if craft.slash_cross_operator_error(rest) is None:
+    segments = craft.slash_cross_operator_error_segments(rest)
+    if segments is None:
         return None
-    parts = rest.split(" * ", 1)
-    positional = f"/cross {parts[0].strip()} {parts[1].strip()}"
-    return (
-        "  Slash /cross uses positional args, not *. "
-        f"Try {_color(rest.strip(), YELLOW)} (shorthand) or "
-        f"{_color(positional, YELLOW)}."
-    )
+    return _render_error_segments(segments)
 
 
 def _split_two_positional_args(rest: str) -> tuple[str, str] | None:
@@ -1876,7 +1880,9 @@ async def do_permute(client, storage, query: str):
         return
 
     n = len(matches)
-    pairs = [(matches[i], matches[j]) for i in range(n) for j in range(i + 1, n)]
+    pairs = _pairs_from_boundary(
+        craft.permute_pairs_boundary(_elements_to_boundary(matches)), matches
+    )
     _repl_print_lines(f"  {n} elements match, {len(pairs)} unique pairs:")
     for m in matches:
         _repl_print_lines(f"    {format_element(m)}")
@@ -1920,9 +1926,9 @@ async def do_permutate(client, storage, query: str):
                 return
 
             n = len(matches)
-            pairs = [
-                (matches[i], matches[j]) for i in range(n) for j in range(i + 1, n)
-            ]
+            pairs = _pairs_from_boundary(
+                craft.permute_pairs_boundary(_elements_to_boundary(matches)), matches
+            )
             _repl_print_lines(
                 f"  --- Round {round_num}: {n} elements, {len(pairs)} pairs ---"
             )
@@ -2002,17 +2008,12 @@ async def do_cross(client, storage, left_query: str, right_query: str):
         _repl_print_lines(f"  No elements match: {right_query}")
         return
 
-    # Build pairs, skipping duplicates (a+b == b+a)
-    seen = set()
-    pairs = []
-    for a in left:
-        for b in right:
-            if a.name == b.name:
-                continue
-            key = craft.pair_key(a.name, b.name)
-            if key not in seen:
-                seen.add(key)
-                pairs.append((a, b))
+    pairs = _pairs_from_boundary(
+        craft.cross_pairs_boundary(
+            _elements_to_boundary(left), _elements_to_boundary(right)
+        ),
+        left + right,
+    )
 
     if not pairs:
         _repl_print_lines("  No valid pairs (all matches overlap).")
@@ -2063,6 +2064,28 @@ async def _ib_can_fill_async(name: str) -> bool | None:
     return await asyncio.to_thread(_ib_can_fill, name)
 
 
+def _lineage_step_tuples(steps) -> list[tuple[str, str, str, str, str, str]]:
+    """Tolerant JSON extraction of Infinibrowser lineage steps into the
+    kernel's (a, a_emoji, b, b_emoji, result, result_emoji) tuples. Falls
+    back from id to text and passes empty strings for missing fields — the
+    kernel skips malformed steps."""
+
+    def _part(step, key):
+        part = step.get(key) or {}
+        return (
+            str(part.get("id") or part.get("text") or ""),
+            part.get("emoji") or "",
+        )
+
+    tuples = []
+    for step in steps:
+        a_name, a_emoji = _part(step, "a")
+        b_name, b_emoji = _part(step, "b")
+        r_name, r_emoji = _part(step, "result")
+        tuples.append((a_name, a_emoji, b_name, b_emoji, r_name, r_emoji))
+    return tuples
+
+
 async def _import_from_infinibrowser_async(storage, name: str) -> str:
     """Look up an element on Infinibrowser, show its lineage, and import into discoveries."""
     data = await _ib_fetch_async("item", {"id": name})
@@ -2085,36 +2108,22 @@ async def _import_from_infinibrowser_async(storage, name: str) -> str:
         return f"  No lineage available for {format_element(Element(name=name))}."
 
     _repl_print_lines(f"  Lineage ({len(steps)} steps):")
-    imported = set()
-    recipe_batch: list[tuple[str, str, str]] = []
-    import_batch: list[tuple[str, str | None, bool | None]] = []
-    for step in steps:
-        a_name = _sanitize_element_name(step["a"]["id"])
-        a_emoji = step["a"]["emoji"]
-        b_name = _sanitize_element_name(step["b"]["id"])
-        b_emoji = step["b"]["emoji"]
-        r_name = _sanitize_element_name(step["result"]["id"])
-        r_emoji = step["result"]["emoji"]
-        a_elem = Element(name=a_name, emoji=a_emoji or None, is_first_discovery=None)
-        b_elem = Element(name=b_name, emoji=b_emoji or None, is_first_discovery=None)
-        r_elem = Element(name=r_name, emoji=r_emoji or None, is_first_discovery=None)
+    import_batch, recipe_batch = craft.lineage_steps_to_batches(
+        _lineage_step_tuples(steps)
+    )
+    emoji_by_name = {n: em for n, em, _f in import_batch}
+    for r_name, a_name, b_name in recipe_batch:
+        a_elem = Element(name=a_name, emoji=emoji_by_name.get(a_name) or None)
+        b_elem = Element(name=b_name, emoji=emoji_by_name.get(b_name) or None)
+        r_elem = Element(name=r_name, emoji=emoji_by_name.get(r_name) or None)
         _repl_print_lines(
             f"    {format_element(a_elem)} + {format_element(b_elem)} = {format_element(r_elem)}"
         )
-        recipe_batch.append((r_name, a_name, b_name))
-        for elem_name, elem_emoji in [
-            (a_name, a_emoji),
-            (b_name, b_emoji),
-            (r_name, r_emoji),
-        ]:
-            if elem_name not in imported:
-                import_batch.append((elem_name, elem_emoji, False))
-                imported.add(elem_name)
     _record_recipes_batch(recipe_batch)
     storage.add_batch(import_batch)
 
     storage.reload()
-    return f"  Imported {_color(str(len(imported)), GREEN)} elements into discoveries."
+    return f"  Imported {_color(str(len(import_batch)), GREEN)} elements into discoveries."
 
 
 def _import_from_infinibrowser(storage, name: str) -> str:
@@ -2147,28 +2156,22 @@ def _import_from_save(storage, path: str) -> str:
     if len(items) > _MAX_IC_ITEMS:
         return f"  {_color('Too many items in save file', RED)} (max {_MAX_IC_ITEMS:,})"
 
-    # Build id-to-name lookup
-    id_to_item = {item["id"]: item for item in items}
-
-    batch: list[tuple[str, str | None, bool | None]] = []
-    for item in items:
-        batch.append(
-            (
-                _sanitize_element_name(item["text"]),
-                item.get("emoji", ""),
-                item.get("discovery", False),
-            )
+    item_tuples = [
+        (
+            item["id"],
+            str(item.get("text", "")),
+            item.get("emoji", ""),
+            bool(item.get("discovery") or item.get("discovered")),
         )
-    imported_count = storage.add_batch(batch)
-
-    recipe_batch: list[tuple[str, str, str]] = []
+        for item in items
+    ]
+    recipe_refs = []
     for item in items:
-        name = _sanitize_element_name(item["text"])
         for recipe in item.get("recipes", []):
-            if len(recipe) == 2 and recipe[0] in id_to_item and recipe[1] in id_to_item:
-                a_name = _sanitize_element_name(id_to_item[recipe[0]]["text"])
-                b_name = _sanitize_element_name(id_to_item[recipe[1]]["text"])
-                recipe_batch.append((name, a_name, b_name))
+            if len(recipe) == 2:
+                recipe_refs.append((item["id"], recipe[0], recipe[1]))
+    element_batch, recipe_batch = craft.ic_save_to_batches(item_tuples, recipe_refs)
+    imported_count = storage.add_batch(element_batch)
     _record_recipes_batch(recipe_batch)
     recipe_count = len(recipe_batch)
 
@@ -2191,9 +2194,6 @@ def do_import(storage, arg: str) -> str:
     return _run_sync(do_import_async(storage, arg))
 
 
-_BASE_ELEMENTS = {"Water", "Fire", "Wind", "Earth"}
-
-
 async def _fill_missing_recipes_async(storage):
     """Fetch lineages from Infinibrowser for elements missing recipes.
 
@@ -2201,12 +2201,11 @@ async def _fill_missing_recipes_async(storage):
     so we re-check the missing set after each fetch to skip already-filled items.
     """
     recipes = _load_recipes()
-    name_set = {e.name for e in storage.get_all()}
-    missing = {
-        e.name
-        for e in storage.get_all()
-        if e.name not in _BASE_ELEMENTS and e.name not in recipes
-    }
+    missing = set(
+        craft.unfilled_names_boundary(
+            _elements_to_boundary(storage.get_all()), recipes
+        )
+    )
     if not missing:
         _repl_print_lines("  All elements have recipes.")
         return
@@ -2228,7 +2227,7 @@ async def _fill_missing_recipes_async(storage):
                 _mark_cancel_notified()
                 break
             recipes = _load_recipes()
-            if name in recipes or name in failed:
+            if not craft.is_unfilled(name, recipes) or name in failed:
                 skipped += 1
                 continue
             processed += 1
@@ -2245,23 +2244,11 @@ async def _fill_missing_recipes_async(storage):
             if lineage is None:
                 failed.add(name)
                 continue
-            for step in lineage.get("steps", []):
-                a_name, a_emoji = step["a"]["id"], step["a"]["emoji"]
-                b_name, b_emoji = step["b"]["id"], step["b"]["emoji"]
-                r_name, r_emoji = step["result"]["id"], step["result"]["emoji"]
-                _record_recipe(r_name, a_name, b_name)
-                for elem_name, elem_emoji in [
-                    (a_name, a_emoji),
-                    (b_name, b_emoji),
-                    (r_name, r_emoji),
-                ]:
-                    if elem_name not in name_set:
-                        storage.add(
-                            name=_sanitize_element_name(elem_name),
-                            emoji=elem_emoji,
-                            is_first_discovery=False,
-                        )
-                        name_set.add(elem_name)
+            element_batch, recipe_batch = craft.lineage_steps_to_batches(
+                _lineage_step_tuples(lineage.get("steps", []))
+            )
+            _record_recipes_batch(recipe_batch)
+            storage.add_batch(element_batch)
             fetched += 1
             if await _sleep_cancellable_async(0.5):
                 _repl_print_lines("  Stopped early.")
@@ -2287,9 +2274,10 @@ def do_unfilled(storage) -> str:
     """List elements that have no recipes (excluding base elements)."""
     recipes = _load_recipes()
     discoveries = storage.get_all()
-    missing = [
-        e for e in discoveries if e.name not in _BASE_ELEMENTS and e.name not in recipes
-    ]
+    missing_names = set(
+        craft.unfilled_names_boundary(_elements_to_boundary(discoveries), recipes)
+    )
+    missing = [e for e in discoveries if e.name in missing_names]
     if not missing:
         return "  All elements have recipes."
     lines = [f"  {len(missing)} elements without recipes:"]
@@ -2309,8 +2297,13 @@ def _included_element_names(
 
 def _orphan_candidates(storage) -> list:
     """Discoveries with no recipe lineage and not referenced as a constituent."""
-    included = _included_element_names()
-    return [e for e in storage.get_all() if e.name not in included]
+    orphan_names = {
+        name
+        for name, _emoji, _first in craft.orphan_candidates_boundary(
+            _elements_to_boundary(storage.get_all()), _load_recipes()
+        )
+    }
+    return [e for e in storage.get_all() if e.name in orphan_names]
 
 
 def _ib_can_fill(name: str) -> bool | None:
@@ -2418,31 +2411,17 @@ def do_export(storage, path: str = EXPORT_PATH) -> str:
     """
     recipes = _load_recipes()
     discoveries = storage.get_all()
-    selected = _export_included(storage)
-
-    # Build export items for the closure
-    name_to_id = {}
+    item_tuples, recipe_refs = craft.build_export_items_boundary(
+        _elements_to_boundary(discoveries), recipes
+    )
     items = []
-    idx = 0
-    for name, emoji, is_first in selected:
-        name_to_id[name] = idx
-        item = {"id": idx, "text": name, "emoji": emoji or ""}
+    for item_id, name, emoji, is_first in item_tuples:
+        item = {"id": item_id, "text": name, "emoji": emoji or ""}
         if is_first:
             item["discovery"] = True
         items.append(item)
-        idx += 1
-
-    # Attach recipes using local IDs
-    for item in items:
-        name = item["text"]
-        if name in recipes:
-            item_recipes = []
-            for pair in recipes[name]:
-                a, b = pair[0], pair[1]
-                if a in name_to_id and b in name_to_id:
-                    item_recipes.append([name_to_id[a], name_to_id[b]])
-            if item_recipes:
-                item["recipes"] = item_recipes
+    for result_id, a_id, b_id in recipe_refs:
+        items[result_id].setdefault("recipes", []).append([a_id, b_id])
 
     now = int(time.time() * 1000)
     save = {
@@ -2557,102 +2536,14 @@ def _validate_query_at_enqueue(query: str) -> str | None:
 
 
 def _validate_command_line(line: str) -> str | None:
-    """Parse and validate a command before enqueue. Returns error text or None if OK."""
-    classified = _classify_command_line(line)
-    if classified is None:
-        if _is_slash_command_attempt(line):
-            cmd = line.strip().split()[0]
-            return (
-                f"  Unknown command: {_color(cmd, YELLOW)}. "
-                f"Type {_color('/help', YELLOW)} for commands."
-            )
-        return f"  Unknown input. Type {_color('/help', YELLOW)} for commands."
+    """Parse and validate a command before enqueue. Returns error text or None if OK.
 
-    kind, payload = classified
-
-    if kind == "bad+|":
-        return (
-            "  Use <element> +| <query> "
-            f"(no space between + and |). Type {_color('/help', YELLOW)} for commands."
-        )
-
-    if kind in ("permute", "permutate", "exhaust", "import"):
-        if not payload.strip():
-            return (
-                f"  Usage: /{kind} <query>"
-                if kind != "import"
-                else "  Usage: /import <element>"
-            )
-        if kind == "import":
-            return None
-        return _validate_query_at_enqueue(payload.strip())
-
-    if kind == "export":
+    The full decision tree (and every message) lives in the kernel; this
+    just renders the returned segments with ANSI color."""
+    segments = craft.validate_command_line_segments(line)
+    if segments is None:
         return None
-
-    if kind in ("fill", "prune"):
-        return None
-
-    if kind in ("combine", "crawl"):
-        if (pipe_err := _slash_combine_crawl_pipe_error(payload)) is not None:
-            return pipe_err
-        if (op_err := _slash_combine_crawl_operator_error(payload, kind)) is not None:
-            return op_err
-        if _parse_two_elements(payload) is None:
-            return f"  Usage: /{kind} <element> <element>"
-        return None
-
-    if kind == "with":
-        parsed = _parse_with_args(payload)
-        if parsed is None:
-            return "  Usage: /with <element> <query>"
-        _, query = parsed
-        return _validate_query_at_enqueue(query)
-
-    if kind == "cross":
-        if (op_err := _slash_cross_operator_error(payload)) is not None:
-            return op_err
-        parsed = _parse_cross_queries(payload)
-        if parsed is None:
-            return "  Usage: /cross <query> <query>"
-        left_q, right_q = parsed
-        err = _validate_query_at_enqueue(left_q)
-        if err:
-            return err
-        return _validate_query_at_enqueue(right_q)
-
-    if kind == "++":
-        parts = payload.split(" ++ ", 1)
-        if not parts[0].strip() or not parts[1].strip():
-            return "  Usage: <element> ++ <element>"
-        return None
-
-    if kind == "+|":
-        parts = payload.split("+|", 1)
-        if not parts[0].strip() or not parts[1].strip():
-            return "  Usage: <element> +| <query>"
-        return _validate_query_at_enqueue(parts[1].strip())
-
-    if kind == "*":
-        parts = payload.split(" * ", 1)
-        if not parts[0].strip() or not parts[1].strip():
-            return "  Usage: <query> * <query>"
-        left_q, right_q = parts[0].strip(), parts[1].strip()
-        err = _validate_query_at_enqueue(left_q)
-        if err:
-            return err
-        return _validate_query_at_enqueue(right_q)
-
-    if kind == "+":
-        if " + " in payload:
-            parts = payload.split(" + ", 1)
-        else:
-            parts = [payload.rsplit(" +", 1)[0], ""]
-        if not parts[0].strip() or not parts[1].strip():
-            return "  Usage: <element> + <element>"
-        return None
-
-    return None
+    return _render_error_segments(segments)
 
 
 def _is_recognized_command(line: str) -> bool:
@@ -2844,20 +2735,18 @@ async def _dispatch_line(client, storage, line: str) -> None:
     elif line == "/list":
         _repl_print_lines(do_list(storage))
     elif (rest := _slash_args(line, "/permute")) is not None:
-        if not rest:
-            msg = "  Usage: /permute <query>"
-            _repl_print_lines(msg)
+        if (err := _validate_command_line(line)) is not None:
+            _repl_print_lines(err)
         else:
             await do_permute(client, storage, rest)
     elif (rest := _slash_args(line, "/permutate")) is not None:
-        if not rest:
-            msg = "  Usage: /permutate <query>"
-            _repl_print_lines(msg)
+        if (err := _validate_command_line(line)) is not None:
+            _repl_print_lines(err)
         else:
             await do_permutate(client, storage, rest)
     elif (rest := _slash_args(line, "/import")) is not None:
-        if not rest:
-            msg = "  Usage: /import <element>"
+        if (err := _validate_command_line(line)) is not None:
+            msg = err
         else:
             msg = await do_import_async(storage, rest)
         _repl_print_lines(msg)
@@ -2870,58 +2759,35 @@ async def _dispatch_line(client, storage, line: str) -> None:
     elif (rest := _slash_args(line, "/export")) is not None:
         _repl_print_lines(do_export(storage, rest or EXPORT_PATH))
     elif (rest := _slash_args(line, "/exhaust")) is not None:
-        if not rest:
-            msg = "  Usage: /exhaust <query>"
-            _repl_print_lines(msg)
+        if (err := _validate_command_line(line)) is not None:
+            _repl_print_lines(err)
         else:
             await do_exhaust(client, storage, rest)
     elif (rest := _slash_args(line, "/combine")) is not None:
-        if (pipe_err := _slash_combine_crawl_pipe_error(rest)) is not None:
-            _repl_print_lines(pipe_err)
-        elif (
-            op_err := _slash_combine_crawl_operator_error(rest, "combine")
-        ) is not None:
-            _repl_print_lines(op_err)
+        if (err := _validate_command_line(line)) is not None:
+            msg = err
         else:
-            parsed = _parse_two_elements(rest)
-            if parsed is None:
-                msg = "  Usage: /combine <element> <element>"
-            else:
-                first, second = parsed
-                msg = await do_combine(client, storage, first, second)
-            _repl_print_lines(msg)
+            first, second = _parse_two_elements(rest)
+            msg = await do_combine(client, storage, first, second)
+        _repl_print_lines(msg)
     elif (rest := _slash_args(line, "/crawl")) is not None:
-        if (pipe_err := _slash_combine_crawl_pipe_error(rest)) is not None:
-            _repl_print_lines(pipe_err)
-        elif (op_err := _slash_combine_crawl_operator_error(rest, "crawl")) is not None:
-            _repl_print_lines(op_err)
+        if (err := _validate_command_line(line)) is not None:
+            _repl_print_lines(err)
         else:
-            parsed = _parse_two_elements(rest)
-            if parsed is None:
-                msg = "  Usage: /crawl <element> <element>"
-                _repl_print_lines(msg)
-            else:
-                first, second = parsed
-                await do_crawl(client, storage, first, second)
+            first, second = _parse_two_elements(rest)
+            await do_crawl(client, storage, first, second)
     elif (rest := _slash_args(line, "/with")) is not None:
-        parsed = _parse_with_args(rest)
-        if parsed is None:
-            msg = "  Usage: /with <element> <query>"
-            _repl_print_lines(msg)
+        if (err := _validate_command_line(line)) is not None:
+            _repl_print_lines(err)
         else:
-            element, query = parsed
+            element, query = _parse_with_args(rest)
             await do_with(client, storage, element, query)
     elif (rest := _slash_args(line, "/cross")) is not None:
-        if (op_err := _slash_cross_operator_error(rest)) is not None:
-            _repl_print_lines(op_err)
+        if (err := _validate_command_line(line)) is not None:
+            _repl_print_lines(err)
         else:
-            parsed = _parse_cross_queries(rest)
-            if parsed is None:
-                msg = "  Usage: /cross <query> <query>"
-                _repl_print_lines(msg)
-            else:
-                left_q, right_q = parsed
-                await do_cross(client, storage, left_q, right_q)
+            left_q, right_q = _parse_cross_queries(rest)
+            await do_cross(client, storage, left_q, right_q)
     elif line == "/history":
         _repl_print_lines(do_history(storage))
     elif line == "/queue":
@@ -2935,48 +2801,22 @@ async def _dispatch_line(client, storage, line: str) -> None:
             print(f"  {_color('(terminal has no output buffer to clear)', DIM)}")
         else:
             _chrome_sync()
-    elif " ++ " in line:
-        parts = line.split(" ++ ", 1)
-        first = parts[0].strip()
-        second = parts[1].strip()
-        if not first or not second:
-            msg = "  Usage: <element> ++ <element>"
-            _repl_print_lines(msg)
-        else:
-            await do_crawl(client, storage, first, second)
-    elif re.search(r"\+\s+\|", line):
-        msg = (
-            "  Use <element> +| <query> "
-            f"(no space between + and |). Type {_color('/help', YELLOW)} for commands."
-        )
-        _repl_print_lines(msg)
-    elif "+|" in line:
-        parts = line.split("+|", 1)
-        name = parts[0].strip()
-        query = parts[1].strip()
-        if not name or not query:
-            msg = "  Usage: <element> +| <query>"
-            _repl_print_lines(msg)
-        else:
-            await do_with(client, storage, name, query)
-    elif " * " in line:
-        parts = line.split(" * ", 1)
-        left_q = parts[0].strip()
-        right_q = parts[1].strip()
-        if not left_q or not right_q:
-            msg = "  Usage: <query> * <query>"
-            _repl_print_lines(msg)
-        else:
-            await do_cross(client, storage, left_q, right_q)
-    elif " + " in line:
-        parts = line.split(" + ", 1)
-        first = parts[0].strip()
-        second = parts[1].strip()
-        if not first or not second:
-            msg = "  Usage: <element> + <element>"
-            _repl_print_lines(msg)
-        else:
-            res = await do_combine(client, storage, first, second)
+    elif (classified := _classify_command_line(line)) is not None and classified[
+        0
+    ] in ("bad+|", "++", "+|", "*", "+"):
+        kind, payload = classified
+        if kind == "bad+|" or (parsed := craft.parse_operands(kind, payload)) is None:
+            # Same kernel path validation would take; renders the same
+            # bad-pipe or usage message.
+            _repl_print_lines(_validate_command_line(line))
+        elif kind == "++":
+            await do_crawl(client, storage, parsed[0], parsed[1])
+        elif kind == "+|":
+            await do_with(client, storage, parsed[0], parsed[1])
+        elif kind == "*":
+            await do_cross(client, storage, parsed[0], parsed[1])
+        else:  # "+"
+            res = await do_combine(client, storage, parsed[0], parsed[1])
             _repl_print_lines(res)
     else:
         _repl_print_lines(

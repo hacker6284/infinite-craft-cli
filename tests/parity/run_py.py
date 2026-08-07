@@ -118,6 +118,68 @@ def _run_scenario(scenario: dict, fixtures: dict, scratch_root: str):
         if op == "validate":
             return cli._validate_command_line(scenario["line"])
 
+        if op == "operands":
+            result = cli.craft.parse_operands(scenario["kind"], scenario["payload"])
+            return list(result) if result is not None else None
+
+        if op == "permute_pairs":
+            raw = cli.craft.permute_pairs_boundary(scenario["matches"])
+            return [list(t) for t in raw]
+
+        if op == "cross_pairs":
+            raw = cli.craft.cross_pairs_boundary(scenario["left"], scenario["right"])
+            return [list(t) for t in raw]
+
+        if op == "with_pairs":
+            raw = cli.craft.with_pairs_boundary(scenario["target"], scenario["others"])
+            return [list(t) for t in raw]
+
+        if op == "unfilled":
+            return list(
+                cli.craft.unfilled_names_boundary(elements, recipes)
+            )
+
+        if op == "sanitize":
+            return cli.craft.sanitize_element_name(scenario["name"])
+
+        if op == "ic_batches":
+            els, recs = cli.craft.ic_save_to_batches(
+                scenario["items"], scenario.get("recipe_refs", [])
+            )
+            return {
+                "elements": [list(t) for t in els],
+                "recipes": [list(t) for t in recs],
+            }
+
+        if op == "lineage_batches":
+            els, recs = cli.craft.lineage_steps_to_batches(scenario["steps"])
+            return {
+                "elements": [list(t) for t in els],
+                "recipes": [list(t) for t in recs],
+            }
+
+        if op == "export_items":
+            items, refs = cli.craft.build_export_items_boundary(elements, recipes)
+            return {
+                "items": [list(t) for t in items],
+                "refs": [list(t) for t in refs],
+            }
+
+        if op == "crawl_pairs":
+            raw_pairs, new_keys = cli.craft.crawl_generation_pairs_boundary(
+                scenario["pool"], scenario.get("tried_keys", [])
+            )
+            return {
+                "pairs": [list(t) for t in raw_pairs],
+                "new_keys": list(new_keys),
+            }
+
+        if op == "validate_segments":
+            segs = cli.craft.validate_command_line_segments(scenario["line"])
+            if segs is None:
+                return None
+            return [[text, bool(hl)] for text, hl in segs]
+
         raise ValueError(f"unknown op: {op!r}")
     finally:
         cli.RECIPES_PATH = old_recipes_path

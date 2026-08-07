@@ -26,3 +26,14 @@ code changes needed in most cases.
 | `trace` | `{"name": str}` + elements/recipes/`chain` | `{"status", "target", "steps"}` | |
 | `export` | elements/recipes | `[[name, emoji, first], ...]` (sorted by name) | |
 | `validate` | `{"line": str}` | `str \| null` | **New.** Drives `_validate_command_line` (Python) directly on a bare command-line string. Same JS-pending caveat as `classify` above. |
+| `operands` | `{"kind": str, "payload": str}` | `[left, right] \| null` | Drives `parse_operands` through each host's kernel adapter — shorthand operand extraction (`++`, `+\|`, `*`, `+`), Python maxsplit semantics. |
+| `permute_pairs` | `{"matches": [[name, emoji, first], ...]}` | `[[an, ae, af, bn, be, bf], ...]` | Upper-triangle pair generation via each host's kernel adapter. |
+| `cross_pairs` | `{"left": [...], "right": [...]}` | same 6-tuple list | Left-major product, same-name skip, symmetric pair-key dedup. |
+| `with_pairs` | `{"target": [name, emoji, first], "others": [...]}` | same 6-tuple list | Target × others, self skipped. |
+| `unfilled` | elements + recipes | `[name, ...]` | Elements with no known recipe (empty list = unfilled; bases never unfilled), storage order. |
+| `validate_segments` | `{"line": str}` | `[[text, highlight], ...] \| null` | Structured validation-error segments — message text plus highlight flags; hosts only style (ANSI vs HTML span). |
+| `crawl_pairs` | `{"pool": [...], "tried_keys": [...]}` | `{"pairs": [...], "new_keys": [...]}` | One crawl generation: sorted-name pool order, self-pairs included, untried only; keys are kernel-encoded. |
+| `sanitize` | `{"name": str}` | `str` | Storage name normalization: strip + drop C0/C1/DEL and U+2028/9. |
+| `ic_batches` | `{"items": [[id, text, emoji, disc], ...], "recipe_refs": [[rid, aid, bid], ...]}` | `{"elements": [...], "recipes": [...]}` | .ic import fold: id resolution, sanitization, dangling refs dropped. |
+| `lineage_batches` | `{"steps": [[a, a_emoji, b, b_emoji, r, r_emoji], ...]}` | `{"elements": [...], "recipes": [...]}` | Infinibrowser lineage fold: sanitized, deduped elements; malformed steps skipped. |
+| `export_items` | elements + recipes | `{"items": [[id, text, emoji, first], ...], "refs": [[rid, aid, bid], ...]}` | .ic export builder: fresh sequential ids over the closure, recipes remapped, no dangling ids. |
