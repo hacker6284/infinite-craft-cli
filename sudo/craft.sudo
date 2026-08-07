@@ -383,16 +383,16 @@ func prioritize_pairs(pairs: List<(Element, Element)>, recipes: Map<text, List<(
 // Recipe BFS / backtrack / trace (unbounded depth)
 // ---------------------------------------------------------------------------
 
-func is_available(n: text, visited: Set<text>, recipes: Map<text, List<(text, text)>>) -> bool
-    if visited.has(n)
-        return true
-    if is_base_element(n)
-        return true
-    entry = recipes.get(n)
-    if entry.is_none()
-        return true
-    return entry.unwrap().length == 0
-
+// Layered BFS from the four bases: each pass collects every not-yet-visited
+// result whose first ready pair has both ingredients available, then commits
+// them to `visited`/`parent` together, so same-layer results cannot depend
+// on each other. The first ready pair in list order wins for each result.
+//
+// Readiness is inlined against the precomputed `has_pairs` set, the key list
+// is never sorted, and the scan stops the moment `target` is reached. All
+// three avoid work that made `/recipe` hang on real saves; DIVERGENCES.md §1
+// carries the rationale and the invariants that keep them output-equivalent
+// to the old form.
 func compute_layers(target: text, recipes: Map<text, List<(text, text)>>) -> (bool, Map<text, (text, text)>)
     parent: Map<text, (text, text)> = Map()
     visited: Set<text> = Set()
@@ -400,21 +400,33 @@ func compute_layers(target: text, recipes: Map<text, List<(text, text)>>) -> (bo
     visited.add("Fire")
     visited.add("Wind")
     visited.add("Earth")
+    keys = recipes.keys()
+    has_pairs: Set<text> = Set()
+    for k in keys
+        if recipes[k].length > 0
+            has_pairs.add(k)
     found = false
     while not found
         new_names: List<text> = []
         new_pairs: Map<text, (text, text)> = Map()
-        keys = sorted_text_list(recipes.keys())
         for result_name in keys
+            // Target found mid-layer: ancestors are already in `parent` from
+            // prior layers, and backtrack only walks parent links from the
+            // target, so co-layer siblings are unnecessary. Stop scanning.
+            if found
+                break
             if visited.has(result_name)
                 continue
             if new_pairs.has(result_name)
                 continue
+            if not has_pairs.has(result_name)
+                continue
             pairs = recipes[result_name]
             for pair in pairs
                 pa, pb = pair
-                a_ok = is_available(pa, visited, recipes)
-                b_ok = is_available(pb, visited, recipes)
+                // Inlined readiness (see performance notes above).
+                a_ok = visited.has(pa) or is_base_element(pa) or not has_pairs.has(pa)
+                b_ok = visited.has(pb) or is_base_element(pb) or not has_pairs.has(pb)
                 if a_ok and b_ok
                     new_pairs[result_name] = pair
                     new_names.append(result_name)
@@ -2159,6 +2171,102 @@ test "trace_recipe outcomes"
             assert steps.length == 2
             assert steps[0].result == "Steam"
             assert steps[1].result == "Cloud"
+        case NotFound
+            assert false
+        case IsBase(n)
+            assert n.length < 0
+        case NoRecipe(n)
+            assert n.length < 0
+        case Unreachable(n)
+            assert n.length < 0
+
+// Pins the four invariants the compute_layers perf rewrite depends on
+// (DIVERGENCES.md §1). Each would silently regress if readiness were
+// re-expressed, the key sort reintroduced, or the mid-layer break removed.
+test "compute_layers readiness and ordering invariants"
+    // (a) An ingredient with NO recipe entry is available (orphan/base-like).
+    els: List<Element> = []
+    els.append(Element(name = "Widget", emoji = "", first = false))
+    recipes: Map<text, List<(text, text)>> = Map()
+    recipes["Widget"] = [("Gift", "Water")]
+    r = trace_recipe(els, recipes, "Widget")
+    match r
+        case Steps(t, steps)
+            assert t == "Widget"
+            assert steps.length == 1
+            assert steps[0].a == "Gift"
+            assert steps[0].result == "Widget"
+        case NotFound
+            assert false
+        case IsBase(n)
+            assert n.length < 0
+        case NoRecipe(n)
+            assert n.length < 0
+        case Unreachable(n)
+            assert n.length < 0
+
+    // (b) An ingredient whose recipe list is EMPTY is likewise available,
+    // and is itself never emitted as a layer result.
+    els2: List<Element> = []
+    els2.append(Element(name = "Thing", emoji = "", first = false))
+    recipes2: Map<text, List<(text, text)>> = Map()
+    recipes2["Blank"] = []
+    recipes2["Thing"] = [("Blank", "Fire")]
+    r = trace_recipe(els2, recipes2, "Thing")
+    match r
+        case Steps(t, steps)
+            assert t == "Thing"
+            assert steps.length == 1
+            assert steps[0].a == "Blank"
+            assert steps[0].b == "Fire"
+        case NotFound
+            assert false
+        case IsBase(n)
+            assert n.length < 0
+        case NoRecipe(n)
+            assert n.length < 0
+        case Unreachable(n)
+            assert n.length < 0
+
+    // (c) First READY pair wins in list order — an unsatisfiable first pair
+    // falls through to the second rather than stalling the result.
+    els3: List<Element> = []
+    els3.append(Element(name = "Deep", emoji = "", first = false))
+    recipes3: Map<text, List<(text, text)>> = Map()
+    recipes3["Never"] = [("Never", "Water")]
+    recipes3["Deep"] = [("Never", "Water"), ("Fire", "Water")]
+    r = trace_recipe(els3, recipes3, "Deep")
+    match r
+        case Steps(t, steps)
+            assert t == "Deep"
+            assert steps.length == 1
+            assert steps[0].a == "Fire"
+            assert steps[0].b == "Water"
+        case NotFound
+            assert false
+        case IsBase(n)
+            assert n.length < 0
+        case NoRecipe(n)
+            assert n.length < 0
+        case Unreachable(n)
+            assert n.length < 0
+
+    // (d) Keys are unsorted and the scan stops at `target`, so siblings that
+    // ripen in the same layer must not perturb the ancestor chain. Insertion
+    // order deliberately puts the target FIRST and reverse-alphabetical.
+    els4: List<Element> = []
+    els4.append(Element(name = "Zeta", emoji = "", first = false))
+    recipes4: Map<text, List<(text, text)>> = Map()
+    recipes4["Zeta"] = [("Alpha", "Water")]
+    recipes4["Alpha"] = [("Fire", "Wind")]
+    recipes4["Beta"] = [("Water", "Earth")]
+    r = trace_recipe(els4, recipes4, "Zeta")
+    match r
+        case Steps(t, steps)
+            assert t == "Zeta"
+            assert steps.length == 2
+            assert steps[0].result == "Alpha"
+            assert steps[1].result == "Zeta"
         case NotFound
             assert false
         case IsBase(n)

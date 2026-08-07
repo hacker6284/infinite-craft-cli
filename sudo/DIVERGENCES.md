@@ -52,11 +52,44 @@ against `sudo/craft.sudo` and upstream `src/infinite_craft_cli/`.
 
 ### 1. Unbounded trace BFS
 
-`compute_layers` (`craft.sudo` ~255–289) follows Python's shape: `while not
-found`, break only when a layer produces no new names — no iteration ceiling.
-Test `"trace_recipe unbounded depth over 200 layers"` builds `C0`…`C300` and
-asserts `trace_recipe(..., "C300")` returns `Steps` with length **301**. v1's
-JS-only 200-layer cap would have failed that chain.
+`compute_layers` follows Python's shape: `while not found`, break only when a
+layer produces no new names — no iteration ceiling. Test `"trace_recipe
+unbounded depth over 200 layers"` builds `C0`…`C300` and asserts
+`trace_recipe(..., "C300")` returns `Steps` with length **301**. v1's JS-only
+200-layer cap would have failed that chain.
+
+**Why `/recipe` used to hang (canonical rationale; the code comment points
+here).** Three costs were removed, none of which change what `trace_recipe`
+returns:
+
+1. **Readiness is inlined** against a precomputed `has_pairs` set rather than
+   a helper that took the whole recipe `Map` as a parameter. sudoc's JS/Python
+   backends deep-copy every Map/Set arg on entry for value semantics, so the
+   old `is_available(n, visited, recipes)` deep-copied the entire recipe index
+   on *every pair check of every layer* — chain-300 alone took tens of seconds
+   in both hosts. `visited.has(n) or is_base_element(n) or not has_pairs.has(n)`
+   is exactly equivalent: `not has_pairs.has(n)` covers both "absent from
+   `recipes`" and "present with an empty pair list".
+2. **Keys are never sorted.** `sorted_text_list` runs the stdlib
+   `sorting.sort_by`, an insertion sort — O(n²) per layer. Sorting cannot
+   affect the result: a layer's membership is computed against the *previous*
+   layer's `visited`, which is not mutated mid-layer, so the committed set is
+   independent of scan order, and pair choice is per-result list order.
+3. **The scan stops the moment `target` is reached** instead of finishing the
+   layer. Safe because `target`'s ingredients were available at layer start —
+   i.e. committed in a *strictly earlier* layer — and `backtrack_steps` only
+   walks parent links from `target`, never touching co-layer siblings. The
+   returned `parent` map may therefore omit siblings the old code included;
+   nothing reads it except that backtrack.
+
+A reverse-index frontier (`dependents[ing] += result`) was tried and rejected:
+building it is itself O(n²) under value-semantic map updates when many recipes
+share the bases.
+
+Test `"compute_layers readiness and ordering invariants"` pins all four
+behaviours these rest on — orphan and empty-recipe ingredients counting as
+available, first-*ready* pair winning in list order, and an unsorted key list
+with a mid-layer stop still yielding the correct ancestor chain.
 
 ### 2. No discovered-flag promotion on re-add
 
