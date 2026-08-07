@@ -44,7 +44,7 @@ against `sudo/craft.sudo` and upstream `src/infinite_craft_cli/`.
 |---|--------|-----------|
 | 1 | **Unbounded trace BFS** — no depth cap | Matches CLI `do_recipe` / unbounded `while not found`; the 200-layer cap was only a JS browser-safety artifact, never a CLI invariant. |
 | 2 | **No discovered-flag promotion on re-add** | Matches `storage.add` insert-or-ignore; persisted storage is the source of truth. |
-| 3 | **Case-sensitive `get_by_name` + Python `str.title()`-style fallback** | Matches `storage.get_by_name` exact lookup and `_resolve_element` title-casing. |
+| 3 | **Case-sensitive `get_by_name`; `resolve_element` falls back raw → stripped → title-cased → ASCII case-insensitive**. `title_case` is `str.title()` **except** apostrophes do not start a new word | `get_by_name` still matches `storage.get_by_name`'s exact lookup. The apostrophe divergence is deliberate (§3): `str.title()` yields `"You Don'T"`, which missed stored contraction names *and* was sent verbatim to the pair API for undiscovered operands, returning a spurious Nothing. The case-insensitive scan is a last-resort inventory fallback so residual `Don'T`-form names still resolve. |
 | 4 | **Export/prune filter = transitive recipe closure** (`included_element_names(recipes)` only) | Matches v1.4.2 `_included_element_names` (cli.py ~2518–2547); pure orphans are export-excluded and prune targets. |
 | 5 | **No fnmatch/glob safety gate** | Vendored `regex.sudo` is Thompson-NFA / Pike-VM, linear in input length — wildcard-count / consecutive-star heuristics are unnecessary. |
 | 6 | **No 512-char name truncation** | Only the **query** is capped at 512; names match in full. JS `name.slice(0, 512)` existed only to bound in-browser `RegExp` cost. |
@@ -100,9 +100,23 @@ mutating emoji or `first`. Re-add with `first=true` cannot promote a stored
 ### 3. Case-sensitive lookup + title-case fallback
 
 `get_by_name` is exact `e.name == name`. `resolve_element` tries the raw name,
-then `title_case(strip_spaces(name))`, else synthesizes
-`Element(name=title, ...)`. `title_case` (~115–128) is an ASCII approximation
-of Python `str.title()` (see residual JS §5 for cross-impl disagreements).
+then stripped, then `title_case(stripped)`, then an ASCII **case-insensitive**
+inventory scan, else synthesizes `Element(name=title, ...)`. `title_case` is
+an ASCII approximation of Python `str.title()` **except** that apostrophes
+(ASCII `'` and U+2019) do not start a new word — so `"you don't"` →
+`"You Don't"`, not Python's `"You Don'T"`. The Don'T form both missed stored
+contraction names and was sent to the pair API for undiscovered operands
+(trainer screenshot: `Beach + You Don't` displayed/sent as `You Don'T` →
+Nothing).
+
+The rule is stem-length sensitive, not a blanket "never capitalize after an
+apostrophe": a **multi-letter** stem stays in-word (`don't` → `Don't`,
+`baker's` → `Baker's`), while a **single-letter** stem still starts a new word
+(`o'brien` → `O'Brien`), which is what Irish-style names and `O'Clock` need.
+Both apostrophe forms behave identically — sudoc iterates `text` by codepoint,
+so the U+2019 arm is live and covered by test asserts, not dead.
+
+See residual JS §5 for the older `\b\w` replace disagreements.
 
 ### 4. Export/prune transitive closure (re-derived for v1.4.2)
 
@@ -271,15 +285,17 @@ re-add is insert-or-ignore only — no retroactive promotion — matching
 **Current:** `getByName` (~247–249) lowercases both sides; `resolveElement`
 (~251–258) title-cases via `\b\w` replace. **After wiring:** exact
 case-sensitive lookup first, then ASCII-approximated Python-`.title()` fallback
-(`title_case` / `resolve_element`). Known input disagreements (still true;
-`title_case` did not change in this port):
+(`title_case` / `resolve_element`), plus a case-insensitive last resort.
+Known input disagreements (`title_case` now diverges from `str.title()` on
+apostrophes as well — ruling 3 / §3):
 
-| input | Python / kernel `title_case` | JS `\b\w` replace |
-|-------|------------------------------|-------------------|
-| `3d printer` | `3D Printer` | `3d Printer` |
-| `HELLO world` | `Hello World` | `HELLO World` |
-| `under_score name` | `Under_Score Name` | `Under_score Name` |
-| `co2 gas` | `Co2 Gas` | `Co2 Gas` (agree) |
+| input | kernel `title_case` (current) | Python `str.title()` | legacy JS `\b\w` |
+|-------|-------------------------------|----------------------|-------------------|
+| `3d printer` | `3D Printer` | `3D Printer` | `3d Printer` |
+| `HELLO world` | `Hello World` | `Hello World` | `HELLO World` |
+| `under_score name` | `Under_Score Name` | `Under_Score Name` | `Under_score Name` |
+| `co2 gas` | `Co2 Gas` | `Co2 Gas` | `Co2 Gas` |
+| `you don't` | `You Don't` (apostrophe kept in-word) | `You Don'T` | `You Don't` |
 
 ### 6. Export transitive closure
 

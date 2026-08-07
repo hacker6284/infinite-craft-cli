@@ -110,22 +110,55 @@ func repeat_char(c: int, n: int) -> text
     return out
 
 // ---------------------------------------------------------------------------
-// Title-casing — ASCII approximation of Python str.title()
+// Title-casing — ASCII approximation of Python str.title(), with one
+// intentional divergence: apostrophes do not start a new word.
 // ---------------------------------------------------------------------------
 
+func is_apostrophe(c: int) -> bool
+    // ASCII ' (39) and Unicode right single quotation mark U+2019 (8217),
+    // which paste/autocorrect often produce in contractions like "don't".
+    return c == 39 or c == 8217
+
 export func title_case(s: text) -> text
+    // Like Python str.title() for spaces/punctuation/digits, with a targeted
+    // fix for apostrophes in Infinite Craft names:
+    //
+    // Python title() resets the word boundary on every non-letter, so
+    // "you don't" becomes "You Don'T". That form both misses stored
+    // contraction names and is sent to the pair API for undiscovered
+    // operands (screenshot: `Beach + You Don't` → displayed/sent as
+    // `You Don'T` → Nothing).
+    //
+    // Rule: an apostrophe does not start a new word when the letters so
+    // far in the current word are a multi-letter stem (don't → Don't,
+    // baker's → Baker's). A single letter before the apostrophe still
+    // capitalizes the next letter (o'brien → O'Brien), matching names
+    // like O'Brien / O'Clock.
     out: text = ""
     prev_cased = false
+    letters_in_word = 0
     for c in s
         if is_alpha_ascii(c)
-            if prev_cased
-                out.append(lower_char(c))
-            else
+            // Capitalize when starting a word, or right after an
+            // apostrophe that followed a single-letter stem (O'Brien).
+            start_word = not prev_cased
+            if start_word
                 out.append(upper_char(c))
+            else
+                out.append(lower_char(c))
             prev_cased = true
+            letters_in_word = letters_in_word + 1
+        else if is_apostrophe(c)
+            out.append(c)
+            // Multi-letter stem (don't): stay in-word so 't' stays lower.
+            // Single-letter stem (o'): drop in-word so 'b' capitalizes.
+            if letters_in_word == 1
+                prev_cased = false
+            // else leave prev_cased true; letters_in_word unchanged
         else
             out.append(c)
             prev_cased = false
+            letters_in_word = 0
     return out
 
 // ---------------------------------------------------------------------------
@@ -158,15 +191,39 @@ func get_by_name(elements: List<Element>, name: text) -> Option<Element>
             return Some(e)
     return None
 
+func ascii_lower_text(s: text) -> text
+    out: text = ""
+    for c in s
+        out.append(lower_char(c))
+    return out
+
+func get_by_name_ci(elements: List<Element>, name: text) -> Option<Element>
+    // ASCII case-insensitive scan; first hit wins. Used as a last inventory
+    // fallback so "you don't" / residual "You Don'T" still resolve to the
+    // stored "You Don't" even when title_case cannot reconstruct it.
+    needle = ascii_lower_text(name)
+    for e in elements
+        if ascii_lower_text(e.name) == needle
+            return Some(e)
+    return None
+
 func resolve_element(elements: List<Element>, name: text) -> Element
     found = get_by_name(elements, name)
     if found.is_some()
         return found.unwrap()
-    title = title_case(strip_spaces(name))
-    if not (title == name)
+    stripped = strip_spaces(name)
+    if not (stripped == name)
+        found_s = get_by_name(elements, stripped)
+        if found_s.is_some()
+            return found_s.unwrap()
+    title = title_case(stripped)
+    if not (title == stripped)
         found2 = get_by_name(elements, title)
         if found2.is_some()
             return found2.unwrap()
+    found3 = get_by_name_ci(elements, stripped)
+    if found3.is_some()
+        return found3.unwrap()
     return Element(name = title, emoji = "", first = false)
 
 // ---------------------------------------------------------------------------
@@ -1951,7 +2008,17 @@ test "is_unfilled empty list ruling"
     assert un[1] == "Mystery"
 
 test "title_case resolve get_by_name add record"
-    assert title_case("baker's dozen") == "Baker'S Dozen"
+    // Contractions keep the letter after ' lower; single-letter stems
+    // (O'Brien) still capitalize — not Python str.title()'s "Don'T".
+    assert title_case("baker's dozen") == "Baker's Dozen"
+    assert title_case("you don't") == "You Don't"
+    assert title_case("You Don't") == "You Don't"
+    assert title_case("o'brien") == "O'Brien"
+    assert title_case("O'BRIEN") == "O'Brien"
+    // U+2019 curly apostrophe behaves identically to ASCII ' — paste and
+    // phone autocorrect both produce it, so `is_apostrophe` accepts both.
+    assert title_case("you don’t") == "You Don’t"
+    assert title_case("o’brien") == "O’Brien"
     assert title_case("co2 gas") == "Co2 Gas"
     assert title_case("3d printer") == "3D Printer"
     assert title_case("HELLO world") == "Hello World"
@@ -1959,15 +2026,24 @@ test "title_case resolve get_by_name add record"
     els: List<Element> = []
     els.append(Element(name = "Baking Soda", emoji = "🧂", first = false))
     els.append(Element(name = "Fire", emoji = "🔥", first = false))
+    els.append(Element(name = "You Don't", emoji = "🤷", first = false))
     hit = resolve_element(els, "Fire")
     assert hit.name == "Fire"
     assert hit.emoji == "🔥"
     titled = resolve_element(els, "baking soda")
     assert titled.name == "Baking Soda"
+    // Exact + title_case + case-insensitive paths for contractions
+    assert resolve_element(els, "You Don't").name == "You Don't"
+    assert resolve_element(els, "you don't").emoji == "🤷"
+    assert resolve_element(els, "YOU DON'T").name == "You Don't"
     miss = resolve_element(els, "unicorn dust")
     assert miss.name == "Unicorn Dust"
     assert miss.emoji == ""
     assert miss.first == false
+    // Unknown contraction synthesizes English title-case, not Don'T
+    syn = resolve_element(els, "we don't")
+    assert syn.name == "We Don't"
+    assert syn.emoji == ""
     assert get_by_name(els, "fire").is_none()
     assert get_by_name(els, "Fire").is_some()
     assert is_base_element("Water")
