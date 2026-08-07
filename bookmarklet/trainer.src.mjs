@@ -10,6 +10,7 @@ import {
   add_element_boundary as addElementBoundary,
   add_elements_batch_boundary as addElementsBatchBoundary,
   record_recipe as recordRecipeKernel,
+  record_recipes_batch as recordRecipesBatchKernel,
   trace_recipe_boundary as traceRecipeBoundary,
   export_elements_boundary as exportElementsBoundary,
   orphan_candidates_boundary as orphanCandidatesBoundary,
@@ -264,20 +265,26 @@ async function removeElement(name) {
 let recipeIndex = {}; // {resultName: [[aName, bName], ...]}
 
 function rebuildRecipeIndex() {
+  // ONE kernel call for the whole save. The adapter marshals the entire
+  // recipe map in and out per call, so folding pair-by-pair is O(R^2) in
+  // marshalling — on a few thousand recipes that held "Loading game
+  // data..." for a long time. record_recipes_batch folds every entry
+  // inside a single marshal round-trip.
   recipeIndex = {};
+  const entries = [];
   for (const item of _items) {
     if (!item.recipes || !item.recipes.length) continue;
     for (const pair of item.recipes) {
       if (pair.length !== 2) continue;
       const a = _idIndex[pair[0]], b = _idIndex[pair[1]];
       if (!a || !b) continue;
-      recordRecipeKernel(recipeIndex, item.text, a.text, b.text);
+      entries.push([item.text, a.text, b.text]);
     }
   }
+  if (entries.length) recordRecipesBatchKernel(recipeIndex, entries);
 }
 
-function recordRecipe(resultName, aName, bName) {
-  recordRecipeKernel(recipeIndex, resultName, aName, bName);
+function persistRecipe(resultName, aName, bName) {
   // Persist to IndexedDB
   const resultItem = _nameIndex[resultName];
   const aItem = _nameIndex[aName];
@@ -291,6 +298,17 @@ function recordRecipe(resultName, aName, bName) {
       putItem(resultItem);
     }
   }
+}
+
+function recordRecipe(resultName, aName, bName) {
+  recordRecipeKernel(recipeIndex, resultName, aName, bName);
+  persistRecipe(resultName, aName, bName);
+}
+
+function recordRecipesBatch(entries) {
+  if (!entries.length) return;
+  recordRecipesBatchKernel(recipeIndex, entries);
+  for (const [result, a, b] of entries) persistRecipe(result, a, b);
 }
 
 // ── Host-parity test seam (Node-only; browser path is untouched) ─────
@@ -789,7 +807,7 @@ function processRecipeSteps(steps) {
   ]);
   const [elementBatch, recipeBatch] = lineageStepsToBatches(tuples);
   addElementsBatch(elementBatch);
-  for (const [result, a, b] of recipeBatch) recordRecipe(result, a, b);
+  recordRecipesBatch(recipeBatch);
   return recipeBatch.length;
 }
 
@@ -839,7 +857,7 @@ async function doImportFile() {
     }
     const [elementBatch, recipeBatch] = icSaveToBatches(itemTuples, recipeRefs);
     const importedCount = addElementsBatch(elementBatch);
-    for (const [result, a, b] of recipeBatch) recordRecipe(result, a, b);
+    recordRecipesBatch(recipeBatch);
     const recipeCount = recipeBatch.length;
     rebuildRecipeIndex();
     if (cancelled) print("  " + yellow("Import cancelled."));

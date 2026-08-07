@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.8.1] - 2026-08-07
+
+### Fixed
+- **Browser trainer: "Loading game data..." no longer stalls on large
+  saves.** Rebuilding the recipe index called the kernel's `record_recipe`
+  once per recipe pair, and the generated adapter marshals the entire
+  recipe map in and out on every call — quadratic in recipe count, so a
+  few thousand recipes took ages at boot (a v1.5.0-era cost that save
+  growth made visible, not a 1.7/1.8 regression). Boot and both import
+  paths now fold all entries through one `record_recipes_batch` call.
+
 ## [1.8.0] - 2026-08-07
 
 ### Added
