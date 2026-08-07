@@ -1,5 +1,28 @@
 # Changelog
 
+## [1.8.4] - 2026-08-08
+
+### Fixed
+- **Large `/permute` / `/permutate` no longer freezes the browser.** Pair
+  prioritization used `std.sorting.sort_by` (stable insertion sort, O(n²)).
+  A 441-match permute is ~97k pairs; sorting that with insertion sort hung
+  Chrome. `prioritize_pairs` now uses an in-kernel heapsort
+  (`sort_priority_rows`) with the same total order (score descending, pair
+  key, input index) — O(n log n). Comparisons are inlined so sudoc does not
+  re-deep-copy row tuples on every sift step. Candidate to upstream into
+  `std.sorting` as a large-n alternative to insertion sort.
+
+- **Resolve/add stay in the shared kernel (host shortcut reverted).** v1.8.3
+  moved resolve/add onto host name indexes for snappiness; that split logic
+  across backends. Hosts again call `resolve_element_boundary` /
+  `add_element_boundary` / `add_elements_batch_boundary`. The real cost was
+  nested helpers that took the inventory `List` as a parameter: sudoc
+  deep-copies every List arg on entry, so `resolve_element` → `get_by_name`
+  ×4 re-duped the whole save, and `add_elements_batch` → `find_index_by_name`
+  per item did the same on inserts. Membership scans are inlined in
+  `resolve_element`, `add_element`, and `add_elements_batch`; pair-list
+  membership in `record_recipe` is inlined the same way.
+
 ## [1.8.3] - 2026-08-08
 
 ### Fixed

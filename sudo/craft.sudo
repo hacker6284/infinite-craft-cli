@@ -201,8 +201,7 @@ func get_by_name_ci(elements: List<Element>, name: text) -> Option<Element>
     // ASCII case-insensitive scan only — first hit wins. Apostrophe code
     // points are NOT folded: the live pair API treats "You Don't" (U+0027)
     // and "You Don't" (U+2019) as distinct element names, so inventory and
-    // resolve must keep them separate. Typographic vs ASCII forms stay
-    // different elements even if they look identical on screen.
+    // resolve must keep them separate.
     needle = ascii_lower_text(name)
     for e in elements
         if ascii_lower_text(e.name) == needle
@@ -210,25 +209,30 @@ func get_by_name_ci(elements: List<Element>, name: text) -> Option<Element>
     return None
 
 func resolve_element(elements: List<Element>, name: text) -> Element
-    found = get_by_name(elements, name)
-    if found.is_some()
-        return found.unwrap()
+    // Lookups are inlined (not get_by_name / get_by_name_ci). sudoc deep-copies
+    // every List parameter on entry, so calling those helpers would re-dup the
+    // entire inventory up to four times per resolve — multi-second on large
+    // saves when hosts format multi-step /recipe output. One list ownership
+    // here, several linear scans.
+    for e in elements
+        if e.name == name
+            return e
     stripped = strip_spaces(name)
     if not (stripped == name)
-        found_s = get_by_name(elements, stripped)
-        if found_s.is_some()
-            return found_s.unwrap()
+        for e in elements
+            if e.name == stripped
+                return e
     // title_case preserves the input's apostrophe code point (straight or
-    // curly); it only changes letter case. That way a typed ASCII name and
-    // an imported U+2019 name never collapse into one.
+    // curly); it only changes letter case.
     title = title_case(stripped)
     if not (title == stripped)
-        found2 = get_by_name(elements, title)
-        if found2.is_some()
-            return found2.unwrap()
-    found3 = get_by_name_ci(elements, stripped)
-    if found3.is_some()
-        return found3.unwrap()
+        for e in elements
+            if e.name == title
+                return e
+    needle = ascii_lower_text(stripped)
+    for e in elements
+        if ascii_lower_text(e.name) == needle
+            return e
     return Element(name = title, emoji = "", first = false)
 
 // ---------------------------------------------------------------------------
@@ -240,16 +244,17 @@ export func pair_key(a: text, b: text) -> (text, text)
         return (a, b)
     return (b, a)
 
-func pair_in_list(pairs: List<(text, text)>, pair: (text, text)) -> bool
-    for p in pairs
-        if p == pair
-            return true
-    return false
-
 export func record_recipe(recipes: inout Map<text, List<(text, text)>>, result_name: text, a_name: text, b_name: text)
+    // Pair-membership check is inlined: a helper taking the pair list would
+    // deep-copy it on every record_recipe call (sudoc List arg semantics).
     pair = pair_key(a_name, b_name)
     existing = recipes.get(result_name).get_or([])
-    if not pair_in_list(existing, pair)
+    has = false
+    for p in existing
+        if p == pair
+            has = true
+            break
+    if not has
         existing.append(pair)
         recipes[result_name] = existing
 
@@ -262,24 +267,31 @@ export func record_recipes_batch(recipes: inout Map<text, List<(text, text)>>, e
 // add_element / batch (no discovered-flag promotion on re-add)
 // ---------------------------------------------------------------------------
 
-func find_index_by_name(elements: List<Element>, name: text) -> Option<int>
+func add_element(elements: inout List<Element>, name: text, emoji: text, first: bool) -> bool
+    // Membership scan inlined (not find_index_by_name): that helper would
+    // deep-copy the whole element list on every insert-or-ignore check —
+    // catastrophic inside add_elements_batch on large inventories.
     for i = 0 to elements.length - 1
         if elements[i].name == name
-            return Some(i)
-    return None
-
-func add_element(elements: inout List<Element>, name: text, emoji: text, first: bool) -> bool
-    idx = find_index_by_name(elements, name)
-    if idx.is_some()
-        return false
+            return false
     elements.append(Element(name = name, emoji = emoji, first = first))
     return true
 
 func add_elements_batch(elements: inout List<Element>, items: List<(text, text, bool)>) -> int
+    // Single ownership of `elements` for the whole batch: do not call
+    // add_element (a separate function taking the list) per item — each call
+    // would re-enter and, with nested helpers, re-dup. Inline the same
+    // insert-or-ignore rule once per item against the shared list.
     added = 0
     for item in items
         n, em, f = item
-        if add_element(elements, n, em, f)
+        found = false
+        for i = 0 to elements.length - 1
+            if elements[i].name == n
+                found = true
+                break
+        if not found
+            elements.append(Element(name = n, emoji = em, first = f))
             added = added + 1
     return added
 
@@ -423,6 +435,86 @@ func priority_row_less(a: (int, text, text, int), b: (int, text, text, int)) -> 
         return c2 < 0
     return a_idx < b_idx
 
+// Heapsort under priority_row_less (ascending). std.sorting.sort_by is
+// insertion sort — O(n²) — and freezes the trainer on /permute|/permutate
+// with ~10^5 pairs (441 choose-2 ≈ 97k). Heapsort is O(n log n), not stable,
+// but priority_row_less includes input index so the order is still total and
+// deterministic. Candidate for upstreaming into std.sorting as an alternative
+// to insertion sort for large n.
+//
+// Critical: do NOT call helpers that take the row list or the row tuples as
+// parameters from inside the sift loop. sudoc deep-copies every List/tuple
+// arg on entry — a less(a, b) or before_at(items, i, j) helper would re-dup
+// the whole 10^5-row list (or both rows) on every comparison and hang again.
+// The comparison body is therefore fully inlined in the sift.
+func priority_heap_sift_down(items: inout List<(int, text, text, int)>, start: int, end: int)
+    root = start
+    while true
+        child = 2 * root + 1
+        if child > end
+            break
+        // Prefer the child that should sort later (not before sibling).
+        if child + 1 <= end
+            // items[child] before items[child+1]? then take child+1 as larger.
+            c_score, c_k1, c_k2, c_idx = items[child]
+            d_score, d_k1, d_k2, d_idx = items[child + 1]
+            take_right = false
+            if c_score != d_score
+                take_right = c_score > d_score
+            else
+                cc = strings.lex_compare(c_k1, d_k1)
+                if cc != 0
+                    take_right = cc < 0
+                else
+                    cc2 = strings.lex_compare(c_k2, d_k2)
+                    if cc2 != 0
+                        take_right = cc2 < 0
+                    else
+                        take_right = c_idx < d_idx
+            if take_right
+                child = child + 1
+        // items[root] before items[child]? then swap down.
+        r_score, r_k1, r_k2, r_idx = items[root]
+        k_score, k_k1, k_k2, k_idx = items[child]
+        root_before = false
+        if r_score != k_score
+            root_before = r_score > k_score
+        else
+            rc = strings.lex_compare(r_k1, k_k1)
+            if rc != 0
+                root_before = rc < 0
+            else
+                rc2 = strings.lex_compare(r_k2, k_k2)
+                if rc2 != 0
+                    root_before = rc2 < 0
+                else
+                    root_before = r_idx < k_idx
+        if root_before
+            items.swap(root, child)
+            root = child
+        else
+            break
+
+func sort_priority_rows(items: inout List<(int, text, text, int)>)
+    n = items.length
+    if n < 2
+        return
+    // Build max-heap (parent not before children under priority order).
+    // Sift is a separate function taking inout List — that is one ownership
+    // transfer per sift call (not a deep copy of the list contents into a
+    // fresh structure when the backend implements inout by reference). Do not
+    // factor the comparison into yet another list-taking helper.
+    start = (n - 2) / 2
+    while start >= 0
+        priority_heap_sift_down(items, start, n - 1)
+        start = start - 1
+    end = n - 1
+    while end > 0
+        items.swap(0, end)
+        end = end - 1
+        if end > 0
+            priority_heap_sift_down(items, 0, end)
+
 func prioritize_pairs(pairs: List<(Element, Element)>, recipes: Map<text, List<(text, text)>>) -> List<(Element, Element)>
     counts = ingredient_usage_counts(recipes)
     rows: List<(int, text, text, int)> = []
@@ -433,7 +525,7 @@ func prioritize_pairs(pairs: List<(Element, Element)>, recipes: Map<text, List<(
         ka, kb = pair_key(a.name, b.name)
         rows.append((score, ka, kb, idx))
         idx = idx + 1
-    sorting.sort_by(rows, priority_row_less)
+    sort_priority_rows(rows)
     out: List<(Element, Element)> = []
     for row in rows
         r_score, r_k1, r_k2, r_idx = row

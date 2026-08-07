@@ -6,6 +6,9 @@
 // edit them by hand (they are not committed to the repo).
 import {
   match_elements_boundary as matchElementsBoundary,
+  resolve_element_boundary as resolveElementBoundary,
+  add_element_boundary as addElementBoundary,
+  add_elements_batch_boundary as addElementsBatchBoundary,
   record_recipe as recordRecipeKernel,
   record_recipes_batch as recordRecipesBatchKernel,
   trace_recipe_boundary as traceRecipeBoundary,
@@ -23,7 +26,6 @@ import {
   pair_key as pairKeyKernel,
   is_base_element as isBaseElement,
   sanitize_element_name as sanitizeElementName,
-  title_case as titleCase,
   unfilled_names_boundary as unfilledNamesBoundary,
   is_local_command as isLocalCommand,
   is_slash_command_attempt as isSlashCommandAttempt,
@@ -206,52 +208,9 @@ function pairsFromBoundary(rawPairs) {
   ]);
 }
 
-// ASCII whitespace strip matching kernel strip_spaces (not String.trim —
-// trim also drops Unicode spaces the kernel leaves alone).
-function stripSpacesAscii(s) {
-  let start = 0, end = s.length;
-  const isSp = (c) => c === 32 || c === 9 || c === 10 || c === 13 || c === 11 || c === 12;
-  while (start < end && isSp(s.charCodeAt(start))) start++;
-  while (end > start && isSp(s.charCodeAt(end - 1))) end--;
-  return s.slice(start, end);
-}
-
-function asciiLower(s) {
-  let out = "";
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-    out += (c >= 65 && c <= 90) ? String.fromCharCode(c + 32) : s[i];
-  }
-  return out;
-}
-
-function itemToEl(item) {
-  return { text: item.text, emoji: item.emoji || "", discovered: !!item.discovered };
-}
-
 function resolveElement(name) {
-  // Host-side resolve against _nameIndex — same rules as kernel
-  // resolve_element (exact → stripped → title_case → ASCII-ci), but without
-  // rematerializing the entire save into tuples and deep-copying it through
-  // the sudoc adapter on every call. That path made /recipe display and
-  // multi-operand formatting feel multi-second on large inventories.
-  let item = _nameIndex[name];
-  if (item) return itemToEl(item);
-  const stripped = stripSpacesAscii(name);
-  if (stripped !== name) {
-    item = _nameIndex[stripped];
-    if (item) return itemToEl(item);
-  }
-  const title = titleCase(stripped);
-  if (title !== stripped) {
-    item = _nameIndex[title];
-    if (item) return itemToEl(item);
-  }
-  const needle = asciiLower(stripped);
-  for (const el of _items) {
-    if (asciiLower(el.text) === needle) return itemToEl(el);
-  }
-  return { text: title, emoji: "", discovered: false };
+  const [text, emoji, discovered] = resolveElementBoundary(elementTuples(), name);
+  return { text, emoji, discovered };
 }
 
 function _materializeElement(text, emoji, discovered) {
@@ -264,19 +223,29 @@ function _materializeElement(text, emoji, discovered) {
 }
 
 function addElement(text, emoji, discovered) {
-  // Kernel sanitize + host insert-or-ignore (no discovered-flag promotion).
-  // Avoids add_element_boundary rematerializing the whole inventory per add
-  // — critical during /fill and /import lineages.
+  // Kernel storage normalization + insert-or-ignore decision (same rule as
+  // the CLI: no discovered-flag promotion on re-add); the host only
+  // materializes the item and persists.
   text = sanitizeElementName(text);
-  if (!text || _nameIndex[text]) return false;
+  if (!addElementBoundary(elementTuples(), text, emoji || "", !!discovered)) return false;
   _materializeElement(text, emoji, discovered);
   return true;
 }
 
 function addElementsBatch(batch) {
-  let count = 0;
-  for (const [text, emoji, discovered] of batch) {
-    if (addElement(text, emoji || "", !!discovered)) count++;
+  // Batch variant: one kernel decision pass; appended tuples come back on
+  // the inout list and are materialized in order.
+  const tuples = elementTuples();
+  const before = tuples.length;
+  const normalized = batch.map(([text, emoji, discovered]) => [
+    sanitizeElementName(text),
+    emoji || "",
+    !!discovered,
+  ]);
+  const count = addElementsBatchBoundary(tuples, normalized);
+  for (let i = before; i < tuples.length; i++) {
+    const [text, emoji, discovered] = tuples[i];
+    _materializeElement(text, emoji, discovered);
   }
   return count;
 }

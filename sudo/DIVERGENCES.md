@@ -91,7 +91,7 @@ behaviours these rest on — orphan and empty-recipe ingredients counting as
 available, first-*ready* pair winning in list order, and an unsorted key list
 with a mid-layer stop still yielding the correct ancestor chain.
 
-**Related host/kernel snappiness (same sudoc Map/List cost model):**
+**Related kernel snappiness (same sudoc Map/List cost model):**
 
 - `unfilled_names_boundary` precomputes a filled set once (never call
   `is_unfilled` per element — each call deep-copies the recipe map).
@@ -99,12 +99,15 @@ with a mid-layer stop still yielding the correct ancestor chain.
   no longer sort keys/items; insertion-sort was pure overhead for commutative
   aggregates / set fixed-points. The public included-names boundary still
   returns a sorted list for stable display.
-- Hosts must **not** rematerialize the full element list through
-  `resolve_element_boundary` / `add_element_boundary` on every operand or
-  add — use a name index (trainer `_nameIndex`, CLI `storage.get_by_name`)
-  and only call string-level kernel helpers (`title_case`,
-  `sanitize_element_name`). Full-list boundary calls stay for match / bulk
-  pair generation where the whole inventory is needed.
+- **Do not reimplement resolve/add on the host for speed.** Shared kernel
+  ownership is the point. Nested helpers that take the inventory `List` as a
+  parameter re-deep-copy it on every call — `resolve_element` therefore
+  inlines membership scans (not `get_by_name` ×4), and `add_elements_batch`
+  inlines insert-or-ignore (not `find_index_by_name` / `add_element` per item).
+- **`prioritize_pairs` uses heapsort** (`sort_priority_rows`), not
+  `std.sorting.sort_by` (insertion sort). ~10⁵ pairs from a large
+  `/permutate` made insertion sort hang the browser; heapsort is O(n log n).
+  Candidate to upstream into `std.sorting` as a large-n alternative.
 
 ### 2. No discovered-flag promotion on re-add
 

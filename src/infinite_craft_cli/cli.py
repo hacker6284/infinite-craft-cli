@@ -348,31 +348,14 @@ def _pairs_from_boundary(pair_tuples, elements):
 
 
 def _resolve_element(storage, name: str):
-    """Look up an element by name in discoveries; fall back to bare Element.
-
-    Host-side resolution (exact → stripped → title_case → ASCII-ci) matching
-    the kernel, without rematerializing the entire save through
-    resolve_element_boundary on every call — that was multi-second on large
-    inventories when formatting multi-step /recipe output.
-    """
-    found = storage.get_by_name(name)
+    """Look up an element by name in discoveries; fall back to bare Element."""
+    resolved_name, _emoji, _first = craft.resolve_element_boundary(
+        _elements_to_boundary(storage.get_all()), name
+    )
+    found = storage.get_by_name(resolved_name)
     if found is not None:
         return found
-    stripped = name.strip()  # display names are ASCII; strip is sufficient
-    if stripped != name:
-        found = storage.get_by_name(stripped)
-        if found is not None:
-            return found
-    title = craft.title_case(stripped)
-    if title != stripped:
-        found = storage.get_by_name(title)
-        if found is not None:
-            return found
-    needle = stripped.lower()
-    for el in storage.get_all():
-        if el.name.lower() == needle:
-            return el
-    return Element(name=title)
+    return Element(name=resolved_name)
 
 
 # Runtime cache for pair results — avoids re-hitting the API for the same combo
