@@ -12,3 +12,15 @@ MODULE.bazel.lock
 # Generated sudo-kernel adapters (built by Bazel: //src/infinite_craft_cli:_sudo, //bookmarklet:_sudo)
 src/infinite_craft_cli/_sudo/
 bookmarklet/_sudo/
+
+# Local dev helper: CORS static server for testing the bookmarklet by hand.
+bookmarklet/serve.py
+
+# Chrome Web Store listing screenshots plus the Puppeteer harness that shoots
+# them — ~61MB, mostly node_modules, and regenerated on demand.
+extension/screenshots/
+
+# uv is not this project's dependency source of truth: Bazel resolves Python
+# deps from requirements_lock.txt (//:requirements_lock.txt). A uv.lock is a
+# local by-product and would be a second, silently-drifting pin.
+uv.lock
