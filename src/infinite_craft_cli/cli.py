@@ -1761,7 +1761,29 @@ def _run_sync(coro):
 
 
 async def _combine_pairs(client, storage, pairs: list[tuple]):
-    """Combine a list of (element, element) pairs with light parallelism."""
+    """Combine a list of (element, element) pairs with light parallelism.
+
+    Pairs execute in kernel priority order — proven combiners first
+    (ingredient-usage score descending, pair-key tie-break). This is the
+    single choke point, so permute/cross/with/exhaust and each crawl
+    generation all get the same ordering."""
+    if len(pairs) > 1:
+        pair_elements = {e.name: e for pair in pairs for e in pair}
+        pair_tuples = craft.prioritize_pairs_boundary(
+            [
+                (
+                    a.name,
+                    a.emoji or "",
+                    bool(a.is_first_discovery),
+                    b.name,
+                    b.emoji or "",
+                    bool(b.is_first_discovery),
+                )
+                for a, b in pairs
+            ],
+            _load_recipes(),
+        )
+        pairs = _pairs_from_boundary(pair_tuples, pair_elements.values())
     total = len(pairs)
     new_count = 0
     nothing_count = 0

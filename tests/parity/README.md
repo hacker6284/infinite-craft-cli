@@ -37,3 +37,4 @@ code changes needed in most cases.
 | `ic_batches` | `{"items": [[id, text, emoji, disc], ...], "recipe_refs": [[rid, aid, bid], ...]}` | `{"elements": [...], "recipes": [...]}` | .ic import fold: id resolution, sanitization, dangling refs dropped. |
 | `lineage_batches` | `{"steps": [[a, a_emoji, b, b_emoji, r, r_emoji], ...]}` | `{"elements": [...], "recipes": [...]}` | Infinibrowser lineage fold: sanitized, deduped elements; malformed steps skipped. |
 | `export_items` | elements + recipes | `{"items": [[id, text, emoji, first], ...], "refs": [[rid, aid, bid], ...]}` | .ic export builder: fresh sequential ids over the closure, recipes remapped, no dangling ids. |
+| `prioritize_pairs` | `{"pairs": [6-tuples], "recipes": {...}}` | same 6-tuple list, reordered | Batch execution order: ingredient-usage score (sum) descending, ascending pair-key tie-break. |

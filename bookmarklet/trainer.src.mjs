@@ -18,6 +18,7 @@ import {
   cross_pairs_boundary as crossPairsBoundary,
   with_pairs_boundary as withPairsBoundary,
   crawl_generation_pairs_boundary as crawlGenerationPairsBoundary,
+  prioritize_pairs_boundary as prioritizePairsBoundary,
   ic_save_to_batches as icSaveToBatches,
   lineage_steps_to_batches as lineageStepsToBatches,
   build_export_items_boundary as buildExportItemsBoundary,
@@ -427,8 +428,23 @@ function endRun() {
   try { stopBtn.style.display = "none"; } catch {}
 }
 
+function pairTuples(pairs) {
+  return pairs.map(([a, b]) => [
+    a.text, a.emoji || "", !!a.discovered,
+    b.text, b.emoji || "", !!b.discovered,
+  ]);
+}
+
+function prioritizePairs(pairs) {
+  // Kernel priority order — proven combiners first (ingredient-usage
+  // score descending, pair-key tie-break); same ordering as the CLI.
+  if (pairs.length < 2) return pairs;
+  return pairsFromBoundary(prioritizePairsBoundary(pairTuples(pairs), recipeIndex));
+}
+
 // ── Bulk pair processor ──────────────────────────────────────────────
 async function runPairsInner(pairs) {
+  pairs = prioritizePairs(pairs);
   let done = 0, newCount = 0, nothingCount = 0, errors = 0;
   const total = pairs.length;
   for (const [a, b] of pairs) {
@@ -606,7 +622,7 @@ async function doCrawl(aName, bName) {
         toTuples([...pool.values()]),
         triedKeys
       );
-      const pairs = pairsFromBoundary(rawPairs);
+      const pairs = prioritizePairs(pairsFromBoundary(rawPairs));
       for (const k of newKeys) triedKeys.push(k);
       if (!pairs.length) { print("  " + dim("No more untried pairs.")); break; }
       print(`  ${dim(`Gen ${gen}:`)} ${pairs.length} pairs to try...`);

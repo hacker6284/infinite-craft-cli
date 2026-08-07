@@ -133,6 +133,16 @@
 
     { "id": "export-items-remap-no-dangling", "op": "export_items",
       "elements": [["Water", "", false], ["Steam", "", true], ["Mystery Gas", "", false], ["Orphan", "", false]],
-      "recipes": {"Steam": [["Mystery Gas", "Water"], ["Orphan", "Water"]]} }
+      "recipes": {"Steam": [["Mystery Gas", "Water"], ["Orphan", "Water"]]} },
+
+    { "id": "prioritize-pairs-score-descending", "op": "prioritize_pairs",
+      "pairs": [["Zzz", "", false, "Earth", "", false], ["Fire", "", false, "Earth", "", false], ["Water", "", false, "Zzz", "", false], ["Water", "", false, "Fire", "", false]],
+      "recipes": {"Steam": [["Fire", "Water"]], "Mud": [["Earth", "Water"]], "Lake": [["Water", "Water"]]} },
+    { "id": "prioritize-pairs-tie-break-pair-key", "op": "prioritize_pairs",
+      "pairs": [["C", "", false, "D", "", false], ["A", "", false, "B", "", false], ["B", "", false, "A", "", false]],
+      "recipes": {} },
+    { "id": "prioritize-pairs-empty-recipes-alphabetical", "op": "prioritize_pairs",
+      "pairs": [["Wind", "", false, "Earth", "", false], ["Fire", "", false, "Water", "", false]],
+      "recipes": {} }
   ]
 }

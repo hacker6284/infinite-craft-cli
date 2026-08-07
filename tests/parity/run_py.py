@@ -165,6 +165,10 @@ def _run_scenario(scenario: dict, fixtures: dict, scratch_root: str):
                 "refs": [list(t) for t in refs],
             }
 
+        if op == "prioritize_pairs":
+            raw = cli.craft.prioritize_pairs_boundary(scenario["pairs"], recipes)
+            return [list(t) for t in raw]
+
         if op == "crawl_pairs":
             raw_pairs, new_keys = cli.craft.crawl_generation_pairs_boundary(
                 scenario["pool"], scenario.get("tried_keys", [])

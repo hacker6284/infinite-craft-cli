@@ -4,6 +4,7 @@
 
 import std.strings
 import std.regex
+import std.sorting
 
 record Element
     name: text
@@ -221,6 +222,27 @@ func add_elements_batch(elements: inout List<Element>, items: List<(text, text, 
     return added
 
 // ---------------------------------------------------------------------------
+// Deterministic sorts — std.sorting.sort_by (stable insertion sort) with
+// top-level comparators; sudo has no closures, so anything a comparison
+// needs must live in the sorted items themselves.
+// NOTE for future Rust/Zig backends: sorting.sort_by historically hit a
+// Rust-backend cross-module `inout` codegen bug (see DIVERGENCES.md,
+// "sudo language friction"). This repo builds the py/js backends only,
+// where sort_by is fine.
+// ---------------------------------------------------------------------------
+
+func text_lex_less(a: text, b: text) -> bool
+    return strings.lex_compare(a, b) < 0
+
+func element_name_less(a: Element, b: Element) -> bool
+    return strings.lex_compare(a.name, b.name) < 0
+
+func sorted_text_list(items: List<text>) -> List<text>
+    out = items
+    sorting.sort_by(out, text_lex_less)
+    return out
+
+// ---------------------------------------------------------------------------
 // Pair generation — exhaust / permute / cross / with
 // ---------------------------------------------------------------------------
 
@@ -278,13 +300,6 @@ func with_pairs(target: Element, others: List<Element>) -> List<(Element, Elemen
         pairs.append((target, o))
     return pairs
 
-func sort_elements_by_name(items: inout List<Element>)
-    for j = 1 to items.length - 1
-        i = j
-        while i > 0 and strings.lex_compare(items[i].name, items[i - 1].name) < 0
-            items.swap(i, i - 1)
-            i = i - 1
-
 func crawl_generation_pairs(pool: List<Element>, tried: Set<text>) -> (List<(Element, Element)>, List<text>)
     // One crawl generation: every untried unordered pair over the pool,
     // INCLUDING self-pairs (j starts at i). owner rulings 2026-08-07 (see
@@ -293,7 +308,7 @@ func crawl_generation_pairs(pool: List<Element>, tried: Set<text>) -> (List<(Ele
     // accumulated. Returns the pairs plus their encoded keys; the caller
     // adds the keys to its tried-set (hosts never build keys themselves).
     sorted_pool = pool
-    sort_elements_by_name(sorted_pool)
+    sorting.sort_by(sorted_pool, element_name_less)
     pairs: List<(Element, Element)> = []
     new_keys: List<text> = []
     for i = 0 to sorted_pool.length - 1
@@ -308,20 +323,60 @@ func crawl_generation_pairs(pool: List<Element>, tried: Set<text>) -> (List<(Ele
     return (pairs, new_keys)
 
 // ---------------------------------------------------------------------------
-// Deterministic text sort (hand-rolled; do not use sorting.sudo sort_by)
-// FIXME(zig): generic sort_by hits a Rust-backend cross-module inout bug.
+// Pair prioritization (owner rulings 2026-08-07, prioritizer release):
+// batch API pairs execute proven combiners first. Score = ingredient-usage
+// count of a + count of b, descending; ties break on ascending canonical
+// pair key. The sort is spelled out here — no host may rely on its own
+// sort's stability or ordering.
 // ---------------------------------------------------------------------------
 
-func sort_texts(items: inout List<text>)
-    for j = 1 to items.length - 1
-        i = j
-        while i > 0 and strings.lex_compare(items[i], items[i - 1]) < 0
-            items.swap(i, i - 1)
-            i = i - 1
+export func ingredient_usage_counts(recipes: Map<text, List<(text, text)>>) -> Map<text, int>
+    // +1 per ingredient slot per recorded recipe: a self-pair [X, X]
+    // counts X twice; results do not count, only ingredient slots.
+    counts: Map<text, int> = Map()
+    keys = sorted_text_list(recipes.keys())
+    for name in keys
+        for pair in recipes[name]
+            pa, pb = pair
+            counts[pa] = counts.get(pa).get_or(0) + 1
+            counts[pb] = counts.get(pb).get_or(0) + 1
+    return counts
 
-func sorted_text_list(items: List<text>) -> List<text>
-    out = items
-    sort_texts(out)
+func priority_row_less(a: (int, text, text, int), b: (int, text, text, int)) -> bool
+    // Decorated row: (score, key_first, key_second, input_index).
+    // Higher score first; equal scores order by ascending canonical pair
+    // key; identical (score, key) falls back to input order, making the
+    // order a total one independent of sort stability.
+    a_score, a_k1, a_k2, a_idx = a
+    b_score, b_k1, b_k2, b_idx = b
+    if a_score != b_score
+        return a_score > b_score
+    c = strings.lex_compare(a_k1, b_k1)
+    if c != 0
+        return c < 0
+    c2 = strings.lex_compare(a_k2, b_k2)
+    if c2 != 0
+        return c2 < 0
+    return a_idx < b_idx
+
+func prioritize_pairs(pairs: List<(Element, Element)>, recipes: Map<text, List<(text, text)>>) -> List<(Element, Element)>
+    counts = ingredient_usage_counts(recipes)
+    rows: List<(int, text, text, int)> = []
+    idx = 0
+    for p in pairs
+        a, b = p
+        score = counts.get(a.name).get_or(0) + counts.get(b.name).get_or(0)
+        ka, kb = pair_key(a.name, b.name)
+        rows.append((score, ka, kb, idx))
+        idx = idx + 1
+    sorting.sort_by(rows, priority_row_less)
+    out: List<(Element, Element)> = []
+    for row in rows
+        r_score, r_k1, r_k2, r_idx = row
+        assert r_score == r_score
+        assert r_k1 == r_k1
+        assert r_k2 == r_k2
+        out.append(pairs[r_idx])
     return out
 
 // ---------------------------------------------------------------------------
@@ -1086,6 +1141,16 @@ export func cross_pairs_boundary(left: List<(text, text, bool)>, right: List<(te
 export func with_pairs_boundary(target: (text, text, bool), others: List<(text, text, bool)>) -> List<(text, text, bool, text, text, bool)>
     return element_pairs_to_boundary(with_pairs(element_from_tuple(target), elements_from_tuples(others)))
 
+func element_pairs_from_boundary(pairs: List<(text, text, bool, text, text, bool)>) -> List<(Element, Element)>
+    out: List<(Element, Element)> = []
+    for p in pairs
+        an, ae, af, bn, be, bf = p
+        out.append((Element(name = an, emoji = ae, first = af), Element(name = bn, emoji = be, first = bf)))
+    return out
+
+export func prioritize_pairs_boundary(pairs: List<(text, text, bool, text, text, bool)>, recipes: Map<text, List<(text, text)>>) -> List<(text, text, bool, text, text, bool)>
+    return element_pairs_to_boundary(prioritize_pairs(element_pairs_from_boundary(pairs), recipes))
+
 export func crawl_generation_pairs_boundary(pool: List<(text, text, bool)>, tried_keys: List<text>) -> (List<(text, text, bool, text, text, bool)>, List<text>)
     tried: Set<text> = Set()
     for k in tried_keys
@@ -1754,6 +1819,71 @@ test "included_element_names orphan export v1.4.2"
     recipes2["Ghost"] = empty_pairs
     included2 = included_element_names(recipes2)
     assert not included2.has("Ghost")
+
+test "ingredient_usage_counts and prioritize_pairs"
+    recipes: Map<text, List<(text, text)>> = Map()
+    recipes["Steam"] = [("Fire", "Water")]
+    recipes["Mud"] = [("Earth", "Water")]
+    recipes["Lake"] = [("Water", "Water")]
+    counts = ingredient_usage_counts(recipes)
+    // Water: Steam +1, Mud +1, Lake self-pair +2 = 4
+    assert counts.get("Water").get_or(0) == 4
+    assert counts.get("Fire").get_or(0) == 1
+    assert counts.get("Earth").get_or(0) == 1
+    // results never count as usage
+    assert counts.get("Steam").get_or(0) == 0
+    assert counts.get("Zzz").get_or(0) == 0
+    water = Element(name = "Water", emoji = "", first = false)
+    fire = Element(name = "Fire", emoji = "", first = false)
+    earth = Element(name = "Earth", emoji = "", first = false)
+    zzz = Element(name = "Zzz", emoji = "", first = false)
+    pairs: List<(Element, Element)> = []
+    pairs.append((zzz, earth))
+    pairs.append((fire, earth))
+    pairs.append((water, zzz))
+    pairs.append((water, fire))
+    ordered = prioritize_pairs(pairs, recipes)
+    // scores: Zzz+Earth=1, Fire+Earth=2, Water+Zzz=4, Water+Fire=5
+    o0a, o0b = ordered[0]
+    assert o0a.name == "Water"
+    assert o0b.name == "Fire"
+    o1a, o1b = ordered[1]
+    assert o1a.name == "Water"
+    assert o1b.name == "Zzz"
+    o2a, o2b = ordered[2]
+    assert o2a.name == "Fire"
+    assert o2b.name == "Earth"
+    o3a, o3b = ordered[3]
+    assert o3a.name == "Zzz"
+    assert o3b.name == "Earth"
+    // ties break on ascending canonical pair key, and the result is
+    // independent of input order
+    a = Element(name = "A", emoji = "", first = false)
+    b = Element(name = "B", emoji = "", first = false)
+    c = Element(name = "C", emoji = "", first = false)
+    d = Element(name = "D", emoji = "", first = false)
+    empty_recipes: Map<text, List<(text, text)>> = Map()
+    tie1: List<(Element, Element)> = [(c, d), (a, b), (b, a)]
+    t1 = prioritize_pairs(tie1, empty_recipes)
+    t0a, t0b = t1[0]
+    assert t0a.name == "A"
+    t1a2, t1b2 = t1[1]
+    assert t1a2.name == "B"
+    assert t1b2.name == "A"
+    t2a, t2b = t1[2]
+    assert t2a.name == "C"
+    // reversed-order pair (b, a) sorts by its CANONICAL key (A, B) but is
+    // not reordered internally — (a,b) and (b,a) tie exactly, so their
+    // input order is preserved by the stable insertion sort
+    // boundary adapter round-trip
+    bpairs: List<(text, text, bool, text, text, bool)> = []
+    bpairs.append(("Zzz", "", false, "Earth", "", false))
+    bpairs.append(("Water", "", false, "Fire", "", false))
+    bp = prioritize_pairs_boundary(bpairs, recipes)
+    assert bp.length == 2
+    bn0, be0, bf0, bn1, be1, bf1 = bp[0]
+    assert bn0 == "Water"
+    assert bn1 == "Fire"
 
 test "crawl_generation_pairs sorted order tried and self-pairs"
     w = Element(name = "Water", emoji = "", first = false)

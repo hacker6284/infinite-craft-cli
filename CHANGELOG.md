@@ -1,5 +1,30 @@
 # Changelog
 
+## [1.8.0] - 2026-08-07
+
+### Added
+- **Batch API requests now run in priority order — proven combiners first.**
+  Every bulk command (`/permute`, `/cross`, `/with`, `/exhaust`, and each
+  crawl generation, in both the CLI and the browser trainer) scores each
+  pair by how many recorded recipes its two elements already appear in as
+  ingredients (self-pairs count twice), and executes highest-scoring pairs
+  first. Ties break on the canonical pair key, so ordering is fully
+  deterministic — on a fresh recipe index the queue degrades to alphabetical
+  pair order. The scoring and sort live in the shared sudo kernel
+  (`prioritize_pairs`, ruling 17 in `sudo/DIVERGENCES.md`); the ordering is
+  computed once at batch start, and crawls re-score each generation as the
+  recipes learned in the previous generation land. Cancelling a batch early
+  now leaves the least-promising pairs untried instead of a random tail.
+
+### Changed
+- **All kernel sorts now go through `std.sorting.sort_by`** (stable insertion
+  sort, explicit top-level comparators) instead of hand-rolled same-module
+  insertion sorts — one sort implementation for text lists, the crawl pool's
+  name order, and the prioritizer's scored rows. The historical reason for
+  hand-rolling (a Rust-backend cross-module `inout` codegen bug in sudoc)
+  does not affect the py/js backends this project builds; the caveat stays
+  documented in `sudo/DIVERGENCES.md` for future backend adopters.
+
 ## [1.7.0] - 2026-08-07
 
 ### Changed

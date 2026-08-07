@@ -290,10 +290,16 @@ that remain true of the v2 kernel, then findings new to this extraction.
   inline in a `for` header — `for a, b in ...` is Map key/value iteration only).
   Multi-field values read more than once are more ergonomic as `record`s.
 
-- **`List<T>.sort()` only for `int` / `float`.** Sorting `List<text>` needs a
-  hand-rolled insertion sort (`sort_texts` / `sorted_text_list` in `craft.sudo`)
-  rather than a one-shot method. (v1 also hit the Rust cross-module `inout` bug
-  on `sorting.sort_by` — see below; that is why the hand-rolled path remains.)
+- **`List<T>.sort()` only for `int` / `float`.** Sorting anything else goes
+  through `std.sorting.sort_by` (a stable insertion sort) with a top-level
+  comparator. **Updated v1.8.0:** `craft.sudo` now does exactly that for all
+  three of its sorts (`sorted_text_list`, the crawl pool's name order, and
+  the prioritizer's decorated rows) — the hand-rolled same-module insertion
+  sorts are gone. This is viable because this repo builds only the py/js
+  backends; the Rust cross-module `inout` bug below still stands as a
+  caveat for prospective Rust/Zig backend adopters. With no closures, the
+  prioritizer's comparator reads everything it needs (score, pair key,
+  input index) from the decorated tuples themselves.
 
 - **Function values are top-level refs only** (no closures, no safe
   module-qualified pass-through as a function value). A local wrapper would
@@ -323,9 +329,11 @@ that remain true of the v2 kernel, then findings new to this extraction.
 
 - **Rust cross-module `inout` codegen bug.** Looking up callee param signatures
   only in the current module means cross-module `inout` (e.g.
-  `sorting.sort_by`) drops `&mut` and fails to typecheck. `craft.sudo` keeps
-  same-module `sort_texts` instead; `sorting.sudo` may still be vendored but is
-  not required for the kernel path.
+  `sorting.sort_by`) drops `&mut` and fails to typecheck. **Updated v1.8.0:**
+  `craft.sudo` now imports `std.sorting` and uses `sort_by` throughout — safe
+  because this repo's lockstep builds py/js only, where the bug does not
+  reproduce. Any future Rust/Zig backend adoption must fix this codegen bug
+  first (or reintroduce same-module sorts).
 
 - **Record/enum-through-export-signature loses boundary intent.** `text` fields
   nested under a named `record`/`enum` in an `export func` signature degrade to
@@ -415,7 +423,8 @@ pure logic into the kernel. Each row names the canonical behavior and which
 host changed. Parity coverage: every area below now has fixtures in
 `tests/parity/fixtures.json` (ops `operands`, `permute_pairs`, `cross_pairs`,
 `with_pairs`, `unfilled`, `validate_segments`, `crawl_pairs`, `sanitize`,
-`ic_batches`, `lineage_batches`, `export_items`).
+`ic_batches`, `lineage_batches`, `export_items`, and — as of the v1.8.0
+prioritizer release — `prioritize_pairs`).
 
 | # | Ruling | Canonical | Changed host |
 |---|--------|-----------|--------------|
@@ -429,11 +438,13 @@ host changed. Parity coverage: every area below now has fixtures in
 | 15 | **Name sanitization** (`sanitize_element_name`) — storage normalization = strip ASCII whitespace + drop C0 controls, DEL, C1 controls, U+2028/U+2029; applied by both hosts before every storage write; display sanitization (TTY escapes / DOM escaping) stays host-side | kernel rule (ASCII-table approximation of Python's `isprintable()` filter) | both — Python's rule was `str.strip()` + `isprintable()` (exotic unprintables like unassigned code points are now stored rather than dropped; terminal display still filters them at print time); JS previously stored names completely unsanitized, so the two hosts could persist different names for the same payload |
 | 16 | **Orphaned exports adopted** — `storage.add`/`add_batch` (CLI) and `addElement`/`addElementsBatch` (trainer) route the insert-or-ignore decision through `add_element_boundary`/`add_elements_batch_boundary`; `orphan_candidates_boundary` now backs the CLI's `/prune` too. `get_by_name_boundary` stays unadopted by design: both hosts keep an O(1) exact-case index with the identical contract (guarded via the `resolve` parity op); routing every display-path lookup through an O(n) boundary would be pure overhead | kernel decides, host persists | both (mechanical) |
 
+| 17 | **Batch execution order is prioritized** (`prioritize_pairs`, v1.8.0) — every batch of API pairs executes proven combiners first: pair score = ingredient-usage count of a + count of b (`ingredient_usage_counts`: +1 per ingredient slot per recorded recipe, self-pairs count twice, results never count), descending; ties break on ascending canonical pair key. Sorted once at batch start (no live re-scoring). Wired at each host's single batch choke point (`_combine_pairs` / `runPairsInner` + the crawl generation loop), so permute, cross, with, exhaust, and every crawl generation share it | kernel sort, spelled out explicitly — no host sort-stability reliance | both — all batches previously ran in generation order |
+
 Supersession note: ruling 12's sorted-name generation order is the kernel's
-*generation* order. The planned prioritizer release will reorder *execution*
-within a generation by recipe-usage score (sum, descending); sorted pair key
-remains as tie-break, so determinism survives. Recorded here in advance so
-the two-release sequencing is explicit.
+*generation* order (and the prioritizer's tie-break). As of ruling 17,
+*execution* order within a generation is priority order — recipe-usage score
+descending, sorted pair key on ties — so determinism survives: on an empty
+recipe index the prioritizer degrades exactly to pair-key order.
 
 ## Rulings summary
 

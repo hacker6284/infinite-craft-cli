@@ -28,6 +28,7 @@ import {
   with_pairs_boundary,
   unfilled_names_boundary,
   crawl_generation_pairs_boundary,
+  prioritize_pairs_boundary,
   sanitize_element_name,
   ic_save_to_batches,
   lineage_steps_to_batches,
@@ -192,6 +193,12 @@ function runScenario(scenario, fixtures) {
       items: items.map((t) => Array.from(t)),
       refs: refs.map((t) => Array.from(t)),
     };
+  }
+
+  if (op === "prioritize_pairs") {
+    return prioritize_pairs_boundary(scenario.pairs, recipes).map((t) =>
+      Array.from(t)
+    );
   }
 
   if (op === "crawl_pairs") {
