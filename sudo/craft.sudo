@@ -284,8 +284,8 @@ func add_elements_batch(elements: inout List<Element>, items: List<(text, text, 
 // needs must live in the sorted items themselves.
 // NOTE: sorting.sort_by historically hit a Rust-backend cross-module
 // `inout` codegen bug (see DIVERGENCES.md, "sudo language friction");
-// fixed in sudoc v0.3.0 (the toolchain this repo pins), regression-
-// covered upstream by conformance/multimodule/xmod_inout.
+// fixed in sudoc v0.3.0, so present in the v0.4.0 toolchain this repo
+// pins; regression-covered upstream by conformance/multimodule/xmod_inout.
 // ---------------------------------------------------------------------------
 
 func text_lex_less(a: text, b: text) -> bool
