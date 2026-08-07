@@ -1,5 +1,42 @@
 # Changelog
 
+## [1.8.2] - 2026-08-07
+
+### Fixed
+- **`/recipe` no longer hangs on real saves.** Tracing a recipe ran an
+  `is_available(name, visited, recipes)` helper that took the whole recipe map
+  as a parameter, and sudoc's Python/JS backends deep-copy every map argument
+  on entry for value semantics — so the entire recipe index was duplicated on
+  every ingredient check of every BFS layer. The per-layer key sort compounded
+  it (insertion sort, O(n²)). Readiness is now inlined against a precomputed
+  set, keys are never sorted, and the scan stops as soon as the target is
+  reached. Traced paths are unchanged; the kernel's own suite dropped from
+  285s to ~5s, and the host parity suite from 102s to ~5s.
+
+- **Element names with apostrophes resolve correctly.** Title-casing followed
+  Python's `str.title()`, which restarts a word at every non-letter and so
+  produced `You Don'T` from `you don't`. That form missed the stored element
+  on lookup *and* was sent verbatim to the pair API for undiscovered operands,
+  coming back as a spurious Nothing (`Beach + You Don't`). Apostrophes now
+  keep the word open after a multi-letter stem (`Don't`, `Baker's`) while a
+  single-letter stem still capitalizes (`O'Brien`); both ASCII `'` and the
+  curly U+2019 are handled. `resolve_element` also gained a last-resort
+  case-insensitive inventory scan so names already stored in the old `Don'T`
+  form still resolve.
+
+### Changed
+- **sudocode toolchain bumped v0.3.0 → v0.4.0.** `MODULE.bazel` now pins the
+  v0.4.0 matched-pair release (ruleset tarball + `sudoc` / `lockstep_diff` /
+  `capture_run` / `emit_unpack` binaries). No generated code changed — every
+  downstream test stayed cache-identical across the bump, and the 18-test x
+  2-backend lockstep suite passes on the new toolchain.
+
+  v0.4.0's breaking change (`record`/`enum` names may no longer contain `_`)
+  does not touch `craft.sudo`: `Element`, `RecipeStep`, and `RecipeResult` are
+  already underscore-free. The ruleset itself is unchanged apart from
+  `versions.bzl`, so `rules_sudo` stays at module version 1.0.0 /
+  compatibility level 2 and no rule attributes moved.
+
 ## [1.8.1] - 2026-08-07
 
 ### Fixed
