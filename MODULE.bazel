@@ -40,25 +40,31 @@ register_toolchains("@rust_toolchains//:all")
 # Consumed from a matched-pair release (design §8 Phase 5 Task 8), which
 # publishes BOTH the ruleset tarball AND the matched binary SET (sudoc +
 # lockstep_diff + capture_run + emit_unpack). Each binary's per-platform sha256 is
-# pinned in the tarball's versions.bzl, so sudo.toolchain(version = "v0.4.0")
+# pinned in the tarball's versions.bzl, so sudo.toolchain(version = "v0.5.0")
 # resolves the whole set with no local sha overrides.
 #
-# v0.4.0 is a sudocode-language release, not a ruleset one: the only rule-side
-# change vs v0.3.0 is versions.bzl (the generic INJECT-RELEASE block replacing
-# the v0.3.0-specific one, plus the backfilled v0.3.0 shas), so the module stays
-# at 1.0.0 / compatibility_level 2 and no rule attributes moved. The language
-# break -- `record`/`enum` names may no longer contain `_` -- does not touch
-# craft.sudo (Element, RecipeStep, RecipeResult are all underscore-free).
+# The ruleset has not moved since v0.3.0: diffing the v0.4.0 and v0.5.0
+# tarballs, versions.bzl is the ONLY file that differs (defs.bzl,
+# extensions.bzl and private/*.bzl are byte-identical), so the module stays at
+# 1.0.0 / compatibility_level 2 and no rule attributes moved. These are
+# compiler releases -- what changes is the pinned `sudoc` binary:
+#
+#   v0.4.0  breaking: `record`/`enum` names may no longer contain `_`.
+#           No effect here -- Element, RecipeStep and RecipeResult are
+#           already underscore-free.
+#   v0.5.0  no language change. Haskell `List<T>` moved to Data.Sequence
+#           (this project builds py/js only) and `sudoc check` now reports
+#           every signature-pass error instead of just the first.
 bazel_dep(name = "rules_sudo", version = "1.0.0")
 archive_override(
     module_name = "rules_sudo",
-    urls = ["https://github.com/hacker6284/sudocode/releases/download/v0.4.0/rules_sudo-v0.4.0.tar.gz"],
+    urls = ["https://github.com/hacker6284/sudocode/releases/download/v0.5.0/rules_sudo-v0.5.0.tar.gz"],
     strip_prefix = "rules_sudo",
-    sha256 = "0fd8304b2d68bc1a4bce767235c958da915be46bbf6e9a973848880fa7885a93",
+    sha256 = "f04cf6c023fdac54ebe3ac1a39b75564a70d8092d975c907df9a2de6b9558ad9",
 )
 
 sudo = use_extension("@rules_sudo//:extensions.bzl", "sudo")
-sudo.toolchain(version = "v0.4.0")
+sudo.toolchain(version = "v0.5.0")
 use_repo(sudo, "sudo_toolchain")
 
 # Hermetic esbuild (bundles the bookmarklet; replaces npx esbuild/terser).
