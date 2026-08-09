@@ -31,7 +31,12 @@ import {
   is_ib_command as isIbCommandKernel,
   command_queue_lane as commandQueueLane,
   parse_target_arg as parseTargetArg,
+  apply_target_state as applyTargetState,
   is_target_hit as isTargetHitKernel,
+  confirm_should_continue as confirmShouldContinue,
+  rate_slots_left as rateSlotsLeft,
+  rate_next_slot_frac_milli as rateNextSlotFracMilli,
+  rate_bar_fills as rateBarFills,
   is_slash_command_attempt as isSlashCommandAttempt,
   classify_command_line as classifyCommandLine,
   validate_command_line_segments as validateCommandLineSegments,
@@ -393,28 +398,30 @@ function pruneRateTimestamps(now = Date.now()) {
 
 function rateBudgetRemaining(now = Date.now()) {
   pruneRateTimestamps(now);
-  return Math.max(0, RATE_LIMIT - timestamps.length);
+  return rateSlotsLeft(timestamps.length, RATE_LIMIT);
 }
 
 /**
- * Progress [0,1] toward the next slot free.
+ * Progress [0,1] toward the next slot free (kernel pure math).
  * Resets when a timestamp drops off; fills over (nextDrop - lastDrop), not the full window.
  */
 function nextSlotFrac(now = Date.now()) {
   if (!timestamps.length) return 1.0;
-  const nextFree = timestamps[0] + RATE_WINDOW;
-  let start = lastSlotFreedAt;
-  // If nothing has freed yet (or last free predates this oldest), start at oldest's birth.
-  if (start == null || start < timestamps[0]) start = timestamps[0];
-  const span = nextFree - start;
-  if (span <= 0) return 1.0;
-  return Math.min(1, Math.max(0, (now - start) / span));
+  const milli = rateNextSlotFracMilli(
+    now,
+    timestamps[0],
+    lastSlotFreedAt == null ? 0 : lastSlotFreedAt,
+    RATE_WINDOW,
+    true,
+    lastSlotFreedAt != null
+  );
+  return milli / 1000;
 }
 
 /** @returns {{ remaining: number, max: number, oldestFrac: number }} */
 function rateChromeSnapshot(now = Date.now()) {
   pruneRateTimestamps(now);
-  const remaining = Math.max(0, RATE_LIMIT - timestamps.length);
+  const remaining = rateSlotsLeft(timestamps.length, RATE_LIMIT);
   return { remaining, max: RATE_LIMIT, oldestFrac: nextSlotFrac(now) };
 }
 
@@ -541,24 +548,26 @@ function isIbCommand(line) {
 
 function doTarget(arg) {
   const [action, name] = parseTargetArg(arg || "");
+  const current = targetElement || "";
+  const next = applyTargetState(current, action, name);
   if (action === "show") {
-    if (!targetElement) {
+    if (!next) {
       print(`  No target set. Usage: ${yellow("/target <element>")}`);
       return;
     }
-    print(`  Target: ${bold(yellow(esc(targetElement)))}`);
+    print(`  Target: ${bold(yellow(esc(next)))}`);
     return;
   }
   if (action === "clear") {
     const prev = targetElement;
-    targetElement = null;
+    targetElement = next || null;
     if (!prev) print("  No target was set.");
     else print(`  Target cleared (was ${yellow(esc(prev))}).`);
     updateChrome();
     return;
   }
   // set
-  targetElement = name;
+  targetElement = next || null;
   print(`  Target set: ${bold(yellow(esc(targetElement)))} — batch work pauses when this is crafted.`);
   updateChrome();
 }
@@ -582,7 +591,7 @@ async function acknowledgeTargetHit(aName, bName, resultName) {
     );
     print(`  Press ${bold("y")} to continue, ${bold("n")} / Esc / Stop to halt the batch.`);
     const answer = await waitForConfirmKey();
-    if (cancelled || answer === "__cancelled__" || answer !== "y") {
+    if (cancelled || answer === "__cancelled__" || !confirmShouldContinue(answer)) {
       cancelled = true;
       print("  " + yellow("Stopped after target hit."));
       return true;
@@ -665,7 +674,7 @@ async function confirmAndRunPairs(pairs) {
     if (pairs.length > BULK_WARN) {
       print(`  ${yellow(`${pairs.length} pairs`)} — press ${bold("y")} to continue, ${bold("n")} / Esc / Stop to cancel.`);
       const answer = await waitForConfirmKey();
-      if (cancelled || answer === "__cancelled__" || answer !== "y") {
+      if (cancelled || answer === "__cancelled__" || !confirmShouldContinue(answer)) {
         print("  Cancelled.");
         return;
       }
@@ -947,7 +956,7 @@ async function doPermutate(query) {
       if (!confirmed && pairs.length > BULK_WARN) {
         print(`  ${yellow(`${pairs.length} pairs per round`)} — press ${bold("y")} to continue, ${bold("n")} / Esc / Stop to cancel.`);
         const answer = await waitForConfirmKey();
-        if (cancelled || answer === "__cancelled__" || answer !== "y") {
+        if (cancelled || answer === "__cancelled__" || !confirmShouldContinue(answer)) {
           print("  Cancelled.");
           return;
         }
@@ -1365,8 +1374,10 @@ function rateBarSegment(filled, width) {
 }
 
 function rateBarHtml(remaining, max, oldestFrac) {
-  const leftFilled = Math.round(Math.max(0, Math.min(1, oldestFrac)) * RATE_BAR_LEFT);
-  const rightFilled = max <= 0 ? 0 : Math.round((remaining / max) * RATE_BAR_RIGHT);
+  const fracMilli = Math.round(Math.max(0, Math.min(1, oldestFrac)) * 1000);
+  const [leftFilled, rightFilled] = rateBarFills(
+    remaining, max, fracMilli, RATE_BAR_LEFT, RATE_BAR_RIGHT
+  );
   const left = rateBarSegment(leftFilled, RATE_BAR_LEFT);
   const right = rateBarSegment(rightFilled, RATE_BAR_RIGHT);
   // No separator: purple next-slot wait (left 1/2) + cyan capacity (right 1/2).

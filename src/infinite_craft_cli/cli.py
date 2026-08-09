@@ -1844,6 +1844,21 @@ def _rate_bar_segment(filled: int, width: int) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
+def _rate_bar_fills(
+    remaining: int,
+    maximum: int,
+    oldest_frac: float = 1.0,
+    *,
+    left_width: int = _RATE_BAR_LEFT,
+    right_width: int = _RATE_BAR_RIGHT,
+) -> tuple[int, int]:
+    """Kernel pure fill counts for the segmented rate bar."""
+    frac_milli = int(round(max(0.0, min(1.0, oldest_frac)) * 1000))
+    return craft.rate_bar_fills(
+        remaining, maximum, frac_milli, left_width, right_width
+    )
+
+
 def _rate_bar_text(
     remaining: int,
     maximum: int,
@@ -1853,15 +1868,13 @@ def _rate_bar_text(
     right_width: int = _RATE_BAR_RIGHT,
 ) -> str:
     """Plain (uncolored) segmented bar: left age + right remaining capacity."""
-    if left_width < 0:
-        left_width = 0
-    if right_width < 0:
-        right_width = 0
-    left_filled = int(round(max(0.0, min(1.0, oldest_frac)) * left_width))
-    if maximum <= 0:
-        right_filled = 0
-    else:
-        right_filled = int(round((remaining / maximum) * right_width))
+    left_filled, right_filled = _rate_bar_fills(
+        remaining,
+        maximum,
+        oldest_frac,
+        left_width=left_width,
+        right_width=right_width,
+    )
     return _rate_bar_segment(left_filled, left_width) + _rate_bar_segment(
         right_filled, right_width
     )
@@ -1876,11 +1889,13 @@ def _rate_bar_colored(
     right_width: int = _RATE_BAR_RIGHT,
 ) -> str:
     """Segmented bar with purple/magenta next-slot wait + cyan capacity (no separator)."""
-    left_filled = int(round(max(0.0, min(1.0, oldest_frac)) * left_width))
-    if maximum <= 0:
-        right_filled = 0
-    else:
-        right_filled = int(round((remaining / maximum) * right_width))
+    left_filled, right_filled = _rate_bar_fills(
+        remaining,
+        maximum,
+        oldest_frac,
+        left_width=left_width,
+        right_width=right_width,
+    )
     left_part = _rate_bar_segment(left_filled, left_width)
     right_part = _rate_bar_segment(right_filled, right_width)
     # MAGENTA reads as purple in most terminals; cyan matches the trainer.
@@ -2119,7 +2134,7 @@ async def _confirm_and_run_pairs(client, storage, pairs: list[tuple]):
                     _repl_print_lines("  Cancelled.")
                     _mark_cancel_notified()
                     return
-                if answer != "y":
+                if not craft.confirm_should_continue(answer):
                     _repl_print_lines("  Cancelled.")
                     _mark_cancel_notified()
                     return
@@ -2220,7 +2235,7 @@ async def do_permutate(client, storage, query: str):
                             _repl_print_lines("  Cancelled.")
                             _mark_cancel_notified()
                             return
-                        if answer != "y":
+                        if not craft.confirm_should_continue(answer):
                             _repl_print_lines("  Cancelled.")
                             _mark_cancel_notified()
                             return
@@ -2824,19 +2839,24 @@ def do_target(arg: str) -> str:
     """Set, clear, or show the combination target element (rules in kernel)."""
     global _target_element
     action, name = craft.parse_target_arg(arg)
+    current = _target_element or ""
+    new_state = craft.apply_target_state(current, action, name)
     if action == "show":
-        if _target_element is None:
+        if not new_state:
             return f"  No target set. Usage: {_color('/target <element>', YELLOW)}"
-        return f"  Target: {_color(_target_element, BOLD + YELLOW)}"
+        return f"  Target: {_color(new_state, BOLD + YELLOW)}"
     if action == "clear":
         prev = _target_element
-        _target_element = None
+        _target_element = new_state or None
         if prev is None:
             return "  No target was set."
         return f"  Target cleared (was {_color(prev, YELLOW)})."
     # action == "set"
-    _target_element = name
-    return f"  Target set: {_color(name, BOLD + YELLOW)} — batch work pauses when this is crafted."
+    _target_element = new_state or None
+    return (
+        f"  Target set: {_color(new_state, BOLD + YELLOW)} — "
+        "batch work pauses when this is crafted."
+    )
 
 
 async def _acknowledge_target_hit(a_name: str, b_name: str, result_name: str) -> bool:
@@ -2865,7 +2885,7 @@ async def _acknowledge_target_hit(a_name: str, b_name: str, result_name: str) ->
             _mark_cancel_notified()
             _repl_print_lines("  Stopped after target hit.")
             return True
-        if answer != "y":
+        if not craft.confirm_should_continue(answer):
             _cancelled = True
             _mark_cancel_notified()
             _repl_print_lines("  Stopped after target hit.")

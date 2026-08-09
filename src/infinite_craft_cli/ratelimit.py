@@ -1,9 +1,16 @@
-"""Sliding window rate limiter for API requests."""
+"""Sliding window rate limiter for API requests.
+
+Pure chrome math (slots left, next-slot fraction, bar fills) lives in the
+shared kernel; this module owns the clock, deque, async acquire, and HTTP
+integration seams.
+"""
 
 import asyncio
 import time
 from collections import deque
 from typing import Callable
+
+from infinite_craft_cli._sudo import craft
 
 # Returned by acquire(); pass to release() to drop a specific slot.
 RateLimitToken = float | None
@@ -11,6 +18,11 @@ RateLimitToken = float | None
 
 class RateLimitCancelled(Exception):
     """acquire() was interrupted before a request slot became available."""
+
+
+def _ms(t: float) -> int:
+    """Monotonic/wall seconds → integer milliseconds for kernel math."""
+    return int(t * 1000)
 
 
 class RateLimiter:
@@ -35,24 +47,20 @@ class RateLimiter:
             self._last_freed_at = now
 
     def _next_slot_frac(self, now: float) -> float:
-        """Progress [0,1] toward the next slot free in the sliding window.
-
-        Resets to 0 when a timestamp drops off the log (or is released), then
-        fills over the interval until the *next* drop — not the full window.
-        Idle (no in-window requests) → 1.0 (left half full).
-        """
+        """Progress [0,1] toward the next slot free (kernel pure math)."""
         if not self._timestamps:
             return 1.0
-        next_free = self._timestamps[0] + self._window
-        # Segment starts at the last free, or at the current oldest's birth if
-        # nothing has freed yet (or last free was before this oldest existed).
-        start = self._last_freed_at
-        if start is None or start < self._timestamps[0]:
-            start = self._timestamps[0]
-        span = next_free - start
-        if span <= 0:
-            return 1.0
-        return max(0.0, min(1.0, (now - start) / span))
+        oldest = self._timestamps[0]
+        last_freed = self._last_freed_at if self._last_freed_at is not None else 0.0
+        milli = craft.rate_next_slot_frac_milli(
+            _ms(now),
+            _ms(oldest),
+            _ms(last_freed),
+            _ms(self._window),
+            True,
+            self._last_freed_at is not None,
+        )
+        return milli / 1000.0
 
     async def acquire(
         self,
@@ -147,6 +155,6 @@ class RateLimiter:
             return (0, 0, 1.0)
         now = time.monotonic()
         self._evict_expired(now)
-        left = max(0, self._max - len(self._timestamps))
+        left = craft.rate_slots_left(len(self._timestamps), self._max)
         frac = self._next_slot_frac(now)
         return (left, self._max, frac)

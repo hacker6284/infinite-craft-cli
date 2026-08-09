@@ -883,6 +883,95 @@ export func is_target_hit(target: text, result_name: text) -> bool
         return false
     return target == result_name
 
+// Apply parse_target_arg action to session target (empty text = no target).
+export func apply_target_state(current: text, action: text, name: text) -> text
+    if action == "show"
+        return current
+    if action == "clear"
+        return ""
+    // "set"
+    return name
+
+// Confirm policy: single-key y continues; anything else stops.
+export func confirm_should_continue(answer: text) -> bool
+    return strip_spaces(ascii_lower_text(answer)) == "y"
+
+// ---------------------------------------------------------------------------
+// Rate-window chrome math (pure). Hosts own clocks, deques, HTTP, paint.
+// Times are integer milliseconds (or any consistent unit).
+// ---------------------------------------------------------------------------
+
+export func rate_slots_left(used: int, max_requests: int) -> int
+    if max_requests <= 0
+        return 0
+    left = max_requests - used
+    if left < 0
+        return 0
+    return left
+
+// Progress toward the next free slot, in thousandths [0, 1000].
+// Idle (no timestamps) → 1000 (left bar full). Resets when a slot frees
+// (has_last_freed + last_freed_ms), then fills over the inter-drop interval.
+export func rate_next_slot_frac_milli(
+    now_ms: int,
+    oldest_ms: int,
+    last_freed_ms: int,
+    window_ms: int,
+    has_timestamps: bool,
+    has_last_freed: bool
+) -> int
+    if not has_timestamps
+        return 1000
+    if window_ms <= 0
+        return 1000
+    next_free = oldest_ms + window_ms
+    start = oldest_ms
+    if has_last_freed and last_freed_ms >= oldest_ms
+        start = last_freed_ms
+    span = next_free - start
+    if span <= 0
+        return 1000
+    elapsed = now_ms - start
+    if elapsed <= 0
+        return 0
+    milli = (elapsed * 1000) / span
+    if milli < 0
+        return 0
+    if milli > 1000
+        return 1000
+    return milli
+
+// Segmented bar cell counts: left = next-slot wait, right = remaining capacity.
+// frac_milli is [0, 1000]. Rounding matches common half-up via +width/2 style.
+export func rate_bar_fills(
+    remaining: int,
+    max_requests: int,
+    frac_milli: int,
+    left_width: int,
+    right_width: int
+) -> (int, int)
+    left_filled = 0
+    if left_width > 0
+        fm = frac_milli
+        if fm < 0
+            fm = 0
+        if fm > 1000
+            fm = 1000
+        left_filled = (fm * left_width + 500) / 1000
+        if left_filled > left_width
+            left_filled = left_width
+    right_filled = 0
+    if right_width > 0 and max_requests > 0
+        rem = remaining
+        if rem < 0
+            rem = 0
+        if rem > max_requests
+            rem = max_requests
+        right_filled = (rem * right_width + max_requests / 2) / max_requests
+        if right_filled > right_width
+            right_filled = right_width
+    return (left_filled, right_filled)
+
 export func is_slash_command_attempt(line: text) -> bool
     // Port of re.match(r"/[^/]+/", line) then re.match(r"/\w", line).
     if line.length == 0 or line[0] != '/'
@@ -1564,6 +1653,36 @@ test "queue lane and target pure rules"
     assert not is_target_hit("Steam", "steam")
     assert not is_target_hit("", "Steam")
     assert not is_target_hit("Steam", "")
+    assert apply_target_state("Steam", "show", "") == "Steam"
+    assert apply_target_state("Steam", "clear", "") == ""
+    assert apply_target_state("", "set", "Lava") == "Lava"
+    assert confirm_should_continue("y")
+    assert confirm_should_continue(" Y ")
+    assert not confirm_should_continue("n")
+    assert not confirm_should_continue("")
+    assert not confirm_should_continue("yes")
+    assert rate_slots_left(0, 60) == 60
+    assert rate_slots_left(15, 60) == 45
+    assert rate_slots_left(60, 60) == 0
+    assert rate_slots_left(0, 0) == 0
+    // Idle
+    assert rate_next_slot_frac_milli(1000, 0, 0, 60000, false, false) == 1000
+    // Just acquired at t=0, now=0 → empty left bar
+    assert rate_next_slot_frac_milli(0, 0, 0, 1000, true, false) == 0
+    // Half way through first segment (oldest birth → expiry)
+    assert rate_next_slot_frac_milli(500, 0, 0, 1000, true, false) == 500
+    // After free at t=800, next free at oldest(100)+1000=1100, span=300
+    // now=950 → 150/300 → 500
+    assert rate_next_slot_frac_milli(950, 100, 800, 1000, true, true) == 500
+    lf, rf = rate_bar_fills(60, 60, 1000, 9, 9)
+    assert lf == 9
+    assert rf == 9
+    lf, rf = rate_bar_fills(0, 60, 0, 9, 9)
+    assert lf == 0
+    assert rf == 0
+    lf, rf = rate_bar_fills(30, 60, 500, 9, 9)
+    assert lf == 5
+    assert rf == 5
 
 test "parse_query_filter parity"
     p, ex, on = parse_query_filter("!fire*")
