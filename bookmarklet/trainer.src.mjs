@@ -68,6 +68,9 @@ let ibWorkerRunning = false;
 // IB job progress (separate from pair jobDone/jobTotal so chrome can dual-run).
 let ibJobDone = 0;
 let ibJobTotal = 0;
+// /target: pause batches when this element name is crafted
+let targetElement = null; // string | null
+let targetHitChain = Promise.resolve(); // serialize target acks
 
 // DOM refs — initialized in initBrowserUI() so module evaluation is Node-safe
 let output, input, body, toggle, stopBtn, queueEl, rateEl, jobEl, promptEl;
@@ -481,7 +484,12 @@ async function doCombine(aName, bName) {
       const isNew = addElement(result.text, result.emoji, result.discovered);
       recordRecipe(result.text, a.text, b.text);
       history.push({ a: a.text, b: b.text, result: result.text });
-      print(formatResult(a, b, result) + (isNew ? " " + green("(new)") : ""));
+      let extra = isNew ? " " + green("(new)") : "";
+      if (isTargetHit(result.text)) extra += " " + bold(yellow("★ TARGET ★"));
+      print(formatResult(a, b, result) + extra);
+      if (isTargetHit(result.text)) {
+        await acknowledgeTargetHit(a.text, b.text, result.text);
+      }
     } else {
       history.push({ a: a.text, b: b.text, result: "Nothing" });
       print(formatResult(a, b, null));
@@ -528,6 +536,64 @@ function isIbCommand(line) {
   return cmd === "/import" || cmd === "/fill" || cmd === "/prune";
 }
 
+function isLocalCommandHost(line) {
+  if (line === "/target" || line.startsWith("/target ")) return true;
+  return isLocalCommand(line);
+}
+
+function doTarget(arg) {
+  const rest = (arg || "").trim();
+  if (!rest) {
+    if (!targetElement) {
+      print(`  No target set. Usage: ${yellow("/target <element>")}`);
+      return;
+    }
+    print(`  Target: ${bold(yellow(esc(targetElement)))}`);
+    return;
+  }
+  if (["clear", "off", "none", "-"].includes(rest.toLowerCase())) {
+    const prev = targetElement;
+    targetElement = null;
+    if (!prev) print("  No target was set.");
+    else print(`  Target cleared (was ${yellow(esc(prev))}).`);
+    updateChrome();
+    return;
+  }
+  targetElement = rest;
+  print(`  Target set: ${bold(yellow(esc(targetElement)))} — batch work pauses when this is crafted.`);
+  updateChrome();
+}
+
+function isTargetHit(resultName) {
+  return !!(resultName && targetElement && resultName === targetElement);
+}
+
+/** Pause for y/n after target hit. Returns true if batch should stop. */
+async function acknowledgeTargetHit(aName, bName, resultName) {
+  // Serialize concurrent hits (API concurrency / multi-gen).
+  const prev = targetHitChain;
+  let release;
+  targetHitChain = new Promise((r) => { release = r; });
+  await prev;
+  try {
+    if (cancelled) return true;
+    print(
+      `  ${bold(yellow("★ TARGET HIT ★"))} ${esc(aName)} + ${esc(bName)} = ${bold(yellow(esc(resultName)))}`
+    );
+    print(`  Press ${bold("y")} to continue, ${bold("n")} / Esc / Stop to halt the batch.`);
+    const answer = await waitForConfirmKey();
+    if (cancelled || answer === "__cancelled__" || answer !== "y") {
+      cancelled = true;
+      print("  " + yellow("Stopped after target hit."));
+      return true;
+    }
+    print("  " + dim("Continuing…"));
+    return false;
+  } finally {
+    release();
+  }
+}
+
 function pairTuples(pairs) {
   return pairs.map(([a, b]) => [
     a.text, a.emoji || "", !!a.discovered,
@@ -563,9 +629,19 @@ async function runPairsInner(pairs) {
         const isNew = addElement(result.text, result.emoji, result.discovered);
         recordRecipe(result.text, a.text, b.text);
         history.push({ a: a.text, b: b.text, result: result.text });
+        let extra = "";
         if (isNew) {
           newCount++;
-          print(`  ${dim(`[${done}/${total}]`)} ${formatResult(a, b, result)} ${green("(new)")}`);
+          extra += " " + green("(new)");
+        }
+        if (isTargetHit(result.text)) {
+          extra += " " + bold(yellow("★ TARGET ★"));
+        }
+        if (extra) {
+          print(`  ${dim(`[${done}/${total}]`)} ${formatResult(a, b, result)}${extra}`);
+        }
+        if (isTargetHit(result.text)) {
+          if (await acknowledgeTargetHit(a.text, b.text, result.text)) break;
         }
       } else {
         nothingCount++;
@@ -654,7 +730,7 @@ function waitForConfirmKey() {
           e.stopImmediatePropagation();
           return; // blank Enter ignored
         }
-        if (isLocalCommand(val)) return; // main handler runs locals
+        if (isLocalCommandHost(val)) return; // main handler runs locals
         e.preventDefault();
         e.stopImmediatePropagation();
         if (input) input.value = "";
@@ -798,7 +874,14 @@ async function doCrawl(aName, bName) {
             if (!pool.has(r.text)) {
               pool.set(r.text, { text: r.text, emoji: r.emoji, discovered: r.discovered });
               newInGen++;
-              print(`  ${formatResult(pa, pb, r)}${isNew ? " " + green("(new)") : ""}`);
+            }
+            let extra = isNew ? " " + green("(new)") : "";
+            if (isTargetHit(r.text)) extra += " " + bold(yellow("★ TARGET ★"));
+            if (isNew || isTargetHit(r.text)) {
+              print(`  ${formatResult(pa, pb, r)}${extra}`);
+            }
+            if (isTargetHit(r.text)) {
+              if (await acknowledgeTargetHit(pa.text, pb.text, r.text)) break;
             }
           }
         } catch (e) {
@@ -1228,6 +1311,7 @@ function doHelp() {
     ${cyan("/prune")}                      Remove orphan elements Infinibrowser can't fill
     ${cyan("/export")}                     Download discoveries as .ic save file
     ${cyan("/history")}                    Show combinations this session
+    ${cyan("/target [element|clear]")}     Watch for a result; pause batch on hit
     ${cyan("/clear")}                      Clear output (browser only)
     ${cyan("/help")}                       Show this help`);
 }
@@ -1554,6 +1638,7 @@ async function executeCommand(line) {
   }
   if ((rest = slashArgs(line, "/list")) !== null) { doList(); return; }
   if ((rest = slashArgs(line, "/history")) !== null) { doHistory(); return; }
+  if ((rest = slashArgs(line, "/target")) !== null) { doTarget(rest); return; }
   if ((rest = slashArgs(line, "/clear")) !== null) { output.innerHTML = ""; return; }
   if ((rest = slashArgs(line, "/unfilled")) !== null) { doUnfilled(); return; }
 
@@ -1567,7 +1652,7 @@ async function executeCommand(line) {
 }
 
 async function dispatch(line) {
-  if (isLocalCommand(line)) {
+  if (isLocalCommandHost(line)) {
     await executeCommand(line);
     return;
   }
@@ -1702,7 +1787,7 @@ function initBrowserUI() {
     // During confirm the capture handler owns y/n/Esc/API enqueue; allow
     // local commands (e.g. /search, /list) through here on Enter.
     if (waitingForConfirm) {
-      if (e.key !== "Enter" || !isLocalCommand(input.value.trim())) return;
+      if (e.key !== "Enter" || !isLocalCommandHost(input.value.trim())) return;
     }
     if (e.key === "Enter") {
       const line = input.value.trim();
@@ -1747,7 +1832,7 @@ function initBrowserUI() {
     rebuildIndexes();
     rebuildRecipeIndex();
     output.innerHTML = "";
-    print(bold(cyan("=== Infinite Craft Trainer ===")));
+    print(bold(cyan("=== Infinite Craft Trainer ===")) + dim("  (local build)"));
     print(`  Active save: ${bold(esc(saveName))} (id=${_saveId})`);
     print(`  ${green(String(_items.length))} elements loaded.`);
     const withRecipes = _items.filter(i => i.recipes && i.recipes.length).length;

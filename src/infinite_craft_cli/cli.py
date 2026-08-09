@@ -184,7 +184,7 @@ def _reset_test_state() -> None:
     _rate_limit_waiting = False
     _discard_queue_after_cancel = False
     global _job_done, _job_total, _ib_job_done, _ib_job_total
-    global _last_pair, _active_client, _rate_ticker_task
+    global _last_pair, _active_client, _rate_ticker_task, _target_element
     _job_done = 0
     _job_total = 0
     _ib_job_done = 0
@@ -192,6 +192,7 @@ def _reset_test_state() -> None:
     _last_pair = None
     _active_client = None
     _rate_ticker_task = None
+    _target_element = None
     _skip_summary_shown = False
     _sigint_previous = None
     _winch_previous = None
@@ -446,7 +447,13 @@ async def do_combine(client, storage, first_name: str, second_name: str) -> str:
         res = _color("Nothing", DIM)
     else:
         res = format_element(result)
-    return f"  {format_element(first)} + {format_element(second)} = {res}"
+    line = f"  {format_element(first)} + {format_element(second)} = {res}"
+    if result.name is not None and _is_target_hit(result.name):
+        line += " " + _color("★ TARGET ★", BOLD + YELLOW + MAGENTA)
+        stop = await _acknowledge_target_hit(first.name, second.name, result.name)
+        if stop:
+            raise CommandCancelled()
+    return line
 
 
 def _slash_args(line: str, command: str) -> str | None:
@@ -751,6 +758,9 @@ _ib_job_total: int = 0
 _last_pair: tuple[str, str] | None = None
 _active_client = None  # InfiniteCraftClient | None
 _rate_ticker_task: asyncio.Task | None = None
+# /target: pause batch when this element name is produced by a combination.
+_target_element: str | None = None
+_target_hit_lock = asyncio.Lock()
 
 
 def _reset_cancelled():
@@ -2054,10 +2064,16 @@ async def _combine_pairs(client, storage, pairs: list[tuple]):
                 tag = " " + _color("[NEW]", BOLD + GREEN)
                 new_count += 1
                 known_names.add(result.name)
+            if _is_target_hit(result.name):
+                tag += " " + _color("★ TARGET ★", BOLD + YELLOW + MAGENTA)
             _repl_print_lines(
                 f"  [{done_count}/{total}] {format_element(a)} + {format_element(b)} = "
                 f"{format_element(result)}{tag}"
             )
+            if _is_target_hit(result.name):
+                stop = await _acknowledge_target_hit(a.name, b.name, result.name)
+                if stop:
+                    return
 
     # Process in batches of API_CONCURRENCY to avoid overwhelming the rate limiter
     try:
@@ -2729,6 +2745,11 @@ def do_help() -> str:
     /permutate <query>          Permute repeatedly until no new discoveries
     /exhaust <query>            Each match combined with all discoveries
 
+  Target:
+    /target <element>           Pause batches when this result is crafted
+    /target                     Show current target
+    /target clear               Clear target
+
   Query syntax (/search, /with, /permute, /permutate, /cross, /exhaust, shorthands):
     substring                   Default: case-insensitive substring
     * ? []                      fnmatch wildcards (e.g. fire*, mu?)
@@ -2748,6 +2769,7 @@ def do_help() -> str:
     /prune                      Remove orphan elements Infinibrowser can't fill
     /export [path]              Export discoveries as .ic save file
     /history                    Show combinations tried this session
+    /target [element|clear]     Watch for a result; pause batch on hit
     /clear                      Clear output (browser only)
     /queue                      Show running and pending commands (status also appears above the prompt)
     /help                       Show this help
@@ -2795,6 +2817,69 @@ def _is_ib_command(line: str) -> bool:
         return False
     head = line.split()[0]
     return head in _IB_QUEUE_COMMANDS
+
+
+def _is_target_hit(result_name: str | None) -> bool:
+    """True when a combination result matches the active /target name (exact)."""
+    if not result_name or _target_element is None:
+        return False
+    return result_name == _target_element
+
+
+def do_target(arg: str) -> str:
+    """Set, clear, or show the combination target element."""
+    global _target_element
+    rest = arg.strip()
+    if not rest:
+        if _target_element is None:
+            return f"  No target set. Usage: {_color('/target <element>', YELLOW)}"
+        return f"  Target: {_color(_target_element, BOLD + YELLOW)}"
+    if rest.lower() in ("clear", "off", "none", "-"):
+        prev = _target_element
+        _target_element = None
+        if prev is None:
+            return "  No target was set."
+        return f"  Target cleared (was {_color(prev, YELLOW)})."
+    # Normalize like other element args (title-case / resolve is deferred to compare
+    # against API result names as returned).
+    name = _sanitize_element_name(rest)
+    _target_element = name
+    return f"  Target set: {_color(name, BOLD + YELLOW)} — batch work pauses when this is crafted."
+
+
+async def _acknowledge_target_hit(a_name: str, b_name: str, result_name: str) -> bool:
+    """Pause for confirm after a target hit. Returns True if the batch should stop.
+
+    y continues; n / empty / Esc cancels remaining work (sets _cancelled).
+    """
+    global _cancelled
+    async with _target_hit_lock:
+        if _cancelled:
+            return True
+        _repl_print_lines(
+            f"  {_color('★ TARGET HIT ★', BOLD + YELLOW)} "
+            f"{_tty(a_name)} + {_tty(b_name)} = {_color(_tty(result_name), BOLD + YELLOW + MAGENTA)}"
+        )
+        _repl_print_lines(
+            f"  Press {_color('y', BOLD)} to continue, {_color('n', BOLD)} / Esc to stop the batch."
+        )
+        if not sys.stdin.isatty() and not _interactive_mode_active:
+            # Non-interactive: report hit and keep going (no prompt available).
+            return False
+        try:
+            answer = (await _await_confirmation("")).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            _cancelled = True
+            _mark_cancel_notified()
+            _repl_print_lines("  Stopped after target hit.")
+            return True
+        if answer != "y":
+            _cancelled = True
+            _mark_cancel_notified()
+            _repl_print_lines("  Stopped after target hit.")
+            return True
+        _repl_print_lines(f"  {_color('Continuing…', DIM)}")
+        return False
 
 
 def _is_slash_command_attempt(line: str) -> bool:
@@ -3016,6 +3101,8 @@ def _craft_prompt() -> str:
         or pair_q
         or ib_q
     ):
+        if _target_element:
+            return base + _color(f"[target:{_target_element}] ", DIM)
         return base
     pending = (
         len(pair_q)
@@ -3024,6 +3111,8 @@ def _craft_prompt() -> str:
         + (1 if _current_ib_command else 0)
     )
     hint = _color(f"[{pending} active] ", DIM)
+    if _target_element:
+        hint += _color(f"[target:{_target_element}] ", DIM)
     if (_current_command or _current_ib_command) and _tty_input_available():
         hint += _color("[Esc skip] ", DIM)
     return base + hint
@@ -3115,6 +3204,8 @@ async def _dispatch_line(client, storage, line: str) -> None:
             await do_cross(client, storage, left_q, right_q)
     elif line == "/history":
         _repl_print_lines(do_history(storage))
+    elif (rest := _slash_args(line, "/target")) is not None:
+        _repl_print_lines(do_target(rest))
     elif line == "/queue":
         _paint_queue_panel(force=True)
         if (
@@ -3361,7 +3452,10 @@ async def interactive_mode():
     _active_client = None
     _rate_ticker_task = None
 
-    print(_color("=== Infinite Craft CLI ===", BOLD + CYAN))
+    print(
+        _color("=== Infinite Craft CLI ===", BOLD + CYAN)
+        + _color(f"  v{__version__}", DIM)
+    )
     print()
 
     storage = DiscoveryStorage(DISCOVERIES_PATH)

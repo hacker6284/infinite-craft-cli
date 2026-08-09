@@ -1278,12 +1278,39 @@ class TestCommandQueueHelpers:
             ("/import Steam", False),
             ("/export", False),
             ("Water + Fire", False),
+            ("/target", True),
+            ("/target Steam", True),
+            ("/target clear", True),
         ],
     )
     def test_is_local_command(self, line, expected):
         from infinite_craft_cli.cli import _is_local_command
 
         assert _is_local_command(line) is expected
+
+    def test_do_target_set_show_clear(self):
+        from infinite_craft_cli.cli import do_target
+        import infinite_craft_cli.cli as cli
+
+        cli._target_element = None
+        assert "No target" in do_target("")
+        assert "Target set" in do_target("Steam")
+        assert cli._target_element == "Steam"
+        assert "Steam" in do_target("")
+        assert "cleared" in do_target("clear").lower()
+        assert cli._target_element is None
+
+    def test_is_target_hit(self):
+        from infinite_craft_cli.cli import _is_target_hit
+        import infinite_craft_cli.cli as cli
+
+        cli._target_element = "Steam"
+        assert _is_target_hit("Steam") is True
+        assert _is_target_hit("steam") is False
+        assert _is_target_hit("Fire") is False
+        assert _is_target_hit(None) is False
+        cli._target_element = None
+        assert _is_target_hit("Steam") is False
 
     @pytest.mark.parametrize(
         "line,expected",

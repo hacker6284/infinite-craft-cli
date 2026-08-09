@@ -24,3 +24,4 @@ extension/screenshots/
 # deps from requirements_lock.txt (//:requirements_lock.txt). A uv.lock is a
 # local by-product and would be a second, silently-drifting pin.
 uv.lock
+.cache/

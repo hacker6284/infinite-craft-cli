@@ -833,6 +833,8 @@ export func is_local_command(line: text) -> bool
         return true
     if line == "/recipe" or strings.starts_with(line, "/recipe ")
         return true
+    if line == "/target" or strings.starts_with(line, "/target ")
+        return true
     return false
 
 export func is_slash_command_attempt(line: text) -> bool
@@ -1473,6 +1475,9 @@ test "is_local_command parity"
     assert is_local_command("/search water")
     assert is_local_command("/recipe")
     assert is_local_command("/recipe Fire")
+    assert is_local_command("/target")
+    assert is_local_command("/target Steam")
+    assert is_local_command("/target clear")
     assert not is_local_command("/combine Water + Fire")
     assert not is_local_command("/fill")
     assert not is_local_command("/prune")
