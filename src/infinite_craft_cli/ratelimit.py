@@ -21,6 +21,38 @@ class RateLimiter:
         self._window = window_seconds
         self._timestamps: deque[float] = deque()
         self._lock = asyncio.Lock()
+        # Monotonic time of the last slot free (window expiry or release).
+        # Left half of the rate bar resets here and fills until the next free.
+        self._last_freed_at: float | None = None
+
+    def _evict_expired(self, now: float) -> None:
+        """Drop timestamps outside the window; record free time for the rate bar."""
+        freed = False
+        while self._timestamps and self._timestamps[0] + self._window <= now:
+            self._timestamps.popleft()
+            freed = True
+        if freed:
+            self._last_freed_at = now
+
+    def _next_slot_frac(self, now: float) -> float:
+        """Progress [0,1] toward the next slot free in the sliding window.
+
+        Resets to 0 when a timestamp drops off the log (or is released), then
+        fills over the interval until the *next* drop — not the full window.
+        Idle (no in-window requests) → 1.0 (left half full).
+        """
+        if not self._timestamps:
+            return 1.0
+        next_free = self._timestamps[0] + self._window
+        # Segment starts at the last free, or at the current oldest's birth if
+        # nothing has freed yet (or last free was before this oldest existed).
+        start = self._last_freed_at
+        if start is None or start < self._timestamps[0]:
+            start = self._timestamps[0]
+        span = next_free - start
+        if span <= 0:
+            return 1.0
+        return max(0.0, min(1.0, (now - start) / span))
 
     async def acquire(
         self,
@@ -45,9 +77,7 @@ class RateLimiter:
         while True:
             async with self._lock:
                 now = time.monotonic()
-                # Evict expired timestamps
-                while self._timestamps and self._timestamps[0] + self._window <= now:
-                    self._timestamps.popleft()
+                self._evict_expired(now)
 
                 if len(self._timestamps) < self._max:
                     token = time.monotonic()
@@ -89,5 +119,34 @@ class RateLimiter:
         async with self._lock:
             try:
                 self._timestamps.remove(token)
+                self._last_freed_at = time.monotonic()
             except ValueError:
                 pass
+
+    def remaining(self) -> tuple[int, int]:
+        """Return ``(slots_left, max_requests)`` in the current sliding window.
+
+        Pure snapshot for chrome/UI; does not acquire a slot. Evicts expired
+        timestamps on the calling thread without the async lock (best-effort
+        display only — concurrent acquire may race slightly).
+        """
+        left, maximum, _frac = self.chrome_snapshot()
+        return (left, maximum)
+
+    def chrome_snapshot(self) -> tuple[int, int, float]:
+        """Return ``(slots_left, max_requests, next_slot_frac)`` for the rate bar.
+
+        ``next_slot_frac`` is in ``[0, 1]``: progress from the last slot free
+        (or the current oldest's birth) until the next free. Resets to 0 when
+        something drops off the window log, then fills over that inter-drop
+        interval — so a 2s gap to the next free fills the left half in 2s,
+        not 60s. ``1.0`` when idle (no in-window requests). Best-effort display
+        only (no async lock).
+        """
+        if self._max <= 0:
+            return (0, 0, 1.0)
+        now = time.monotonic()
+        self._evict_expired(now)
+        left = max(0, self._max - len(self._timestamps))
+        frac = self._next_slot_frac(now)
+        return (left, self._max, frac)

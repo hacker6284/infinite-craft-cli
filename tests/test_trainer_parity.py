@@ -490,15 +490,17 @@ class TestMatchElementsParity:
 
 
 class TestTrainerSourceParity:
-    def test_wait_for_input_uses_try_enqueue(self):
+    def test_wait_for_confirm_uses_try_enqueue(self):
+        """Confirm key handler must enqueue non-y/n lines via tryEnqueue (not raw enqueue)."""
         source = trainer_js_path().read_text(encoding="utf-8")
         assert "function tryEnqueue(line)" in source
         assert "tryEnqueue(val)" in source
         handler = re.search(
-            r"function waitForInput\(\)[\s\S]*?function handler\(e\)[\s\S]*?\n      \}",
+            r"function waitForConfirmKey\(\)[\s\S]*?function handler\(e\)[\s\S]*?\n      \}",
             source,
         )
-        assert handler is not None
+        assert handler is not None, "waitForConfirmKey handler not found in trainer.js"
+        assert "tryEnqueue(val)" in handler.group(0)
         assert "enqueueCommand(val)" not in handler.group(0)
 
 

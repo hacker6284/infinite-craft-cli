@@ -1397,16 +1397,19 @@ class TestCommandQueueHelpers:
         cli._current_command = None
         cli._command_queue = []
 
-    def test_format_queue_display_empty_when_idle(self):
+    def test_format_queue_display_rate_line_when_idle(self):
         from infinite_craft_cli.cli import _format_queue_display
         import infinite_craft_cli.cli as cli
 
-        # LEGACY
+        # Permanent rate bar is always shown (even when queue is idle).
         cli._current_command = None
         cli._command_queue = []
-        assert _format_queue_display() == ""
+        display = _format_queue_display()
+        assert "rate" in display
+        assert "running" not in display
+        assert "pending" not in display
 
-    def test_paint_queue_panel_clears_when_idle(self, capsys):
+    def test_paint_queue_panel_shows_rate_when_idle(self, capsys):
         from infinite_craft_cli.cli import _paint_queue_panel, _format_queue_display
         import infinite_craft_cli.cli as cli
 
@@ -1420,8 +1423,10 @@ class TestCommandQueueHelpers:
         cli._current_command = None
         with patch("sys.stdout.isatty", return_value=False):
             _paint_queue_panel()
-        assert capsys.readouterr().out == ""
-        assert _format_queue_display() == ""
+        out = capsys.readouterr().out
+        assert "rate" in out
+        assert "running" not in out
+        assert "rate" in _format_queue_display()
 
     def test_enqueue_ack_only_when_deferred(self, capsys):
         from infinite_craft_cli.cli import _enqueue_command_line

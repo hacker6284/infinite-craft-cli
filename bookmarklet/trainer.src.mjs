@@ -52,15 +52,38 @@ const cmdHistory = [];
 let cmdHistoryIdx = -1;
 let cancelled = false;
 let running = false;
+let activeRuns = 0; // refcount: pair + IB can run concurrently
 let waitingForConfirm = false;
 let confirmResolve = null;
-const commandQueue = [];
+// Two independent queues: neal.fun pair API vs Infinibrowser (import/fill/prune).
+const pairQueue = [];
+const ibQueue = [];
+let currentPairCommand = null;
+let currentIbCommand = null;
+/** @deprecated use currentPairCommand; kept as alias for chrome/confirm during pair bulk */
 let currentCommand = null;
 let activeAbort = null;
-let queueWorkerRunning = false;
+let pairWorkerRunning = false;
+let ibWorkerRunning = false;
+// IB job progress (separate from pair jobDone/jobTotal so chrome can dual-run).
+let ibJobDone = 0;
+let ibJobTotal = 0;
 
 // DOM refs — initialized in initBrowserUI() so module evaluation is Node-safe
-let output, input, body, toggle, stopBtn, queueEl;
+let output, input, body, toggle, stopBtn, queueEl, rateEl, jobEl, promptEl;
+
+// Sticky chrome job state (pair-API budget bar is derived from timestamps)
+let jobDone = 0;
+let jobTotal = 0;
+let lastPairA = null; // text | null — last pair considered this command
+let lastPairB = null;
+let rateTickerId = null;
+const RATE_TICK_MS = 300;
+// Segmented rate bar: left 1/2 = next-slot wait refill, right 1/2 = remaining.
+const RATE_BAR_LEFT = 9;
+const RATE_BAR_RIGHT = 9;
+const RATE_BAR_WIDTH = RATE_BAR_LEFT + RATE_BAR_RIGHT;
+
 
 // ── Output helpers ───────────────────────────────────────────────────
 function print(html) {
@@ -348,17 +371,59 @@ function sleepCancellable(ms) {
   });
 }
 
+// Time of last slot free (window expiry). Left half resets here and fills
+// until the next free — interval-scaled, not always a full 60s.
+let lastSlotFreedAt = null;
+
+function pruneRateTimestamps(now = Date.now()) {
+  let freed = false;
+  while (timestamps.length && timestamps[0] <= now - RATE_WINDOW) {
+    timestamps.shift();
+    freed = true;
+  }
+  if (freed) lastSlotFreedAt = now;
+}
+
+function rateBudgetRemaining(now = Date.now()) {
+  pruneRateTimestamps(now);
+  return Math.max(0, RATE_LIMIT - timestamps.length);
+}
+
+/**
+ * Progress [0,1] toward the next slot free.
+ * Resets when a timestamp drops off; fills over (nextDrop - lastDrop), not the full window.
+ */
+function nextSlotFrac(now = Date.now()) {
+  if (!timestamps.length) return 1.0;
+  const nextFree = timestamps[0] + RATE_WINDOW;
+  let start = lastSlotFreedAt;
+  // If nothing has freed yet (or last free predates this oldest), start at oldest's birth.
+  if (start == null || start < timestamps[0]) start = timestamps[0];
+  const span = nextFree - start;
+  if (span <= 0) return 1.0;
+  return Math.min(1, Math.max(0, (now - start) / span));
+}
+
+/** @returns {{ remaining: number, max: number, oldestFrac: number }} */
+function rateChromeSnapshot(now = Date.now()) {
+  pruneRateTimestamps(now);
+  const remaining = Math.max(0, RATE_LIMIT - timestamps.length);
+  return { remaining, max: RATE_LIMIT, oldestFrac: nextSlotFrac(now) };
+}
+
 function acquireRate() {
   return new Promise((resolve, reject) => {
     function tryAcquire() {
       if (cancelled) { reject(new Error("Cancelled")); return; }
       const now = Date.now();
-      while (timestamps.length && timestamps[0] <= now - RATE_WINDOW) timestamps.shift();
+      pruneRateTimestamps(now);
       if (timestamps.length < RATE_LIMIT) {
         timestamps.push(now);
+        updateChrome();
         resolve();
       } else {
         const wait = timestamps[0] + RATE_WINDOW - now + 10;
+        updateChrome();
         sleepCancellable(wait).then(tryAcquire).catch(reject);
       }
     }
@@ -405,7 +470,10 @@ async function doCombine(aName, bName) {
   const b = resolveElement(bName);
   try {
     beginRun();
+    setJobProgress(0, 1);
+    setLastPair(a.text, b.text);
     const result = await apiPair(a.text, b.text);
+    setJobProgress(1, 1);
     if (cancelled) return;
     if (result) {
       addElement(a.text, a.emoji, false);
@@ -433,17 +501,31 @@ function matchElements(query) {
 }
 
 // ── Run state helpers (DOM-facing; assigned stopBtn after init) ───────
+// Refcounted so pair work and IB work can run concurrently without one
+// endRun() hiding Stop or clearing the other's cancel/abort mid-flight.
 function beginRun() {
-  cancelled = false;
+  if (activeRuns === 0) {
+    cancelled = false;
+    activeAbort = new AbortController();
+  }
+  activeRuns++;
   running = true;
-  activeAbort = new AbortController();
   try { stopBtn.style.display = "inline"; } catch {}
 }
 
 function endRun() {
-  running = false;
-  activeAbort = null;
-  try { stopBtn.style.display = "none"; } catch {}
+  activeRuns = Math.max(0, activeRuns - 1);
+  if (activeRuns === 0) {
+    running = false;
+    activeAbort = null;
+    try { stopBtn.style.display = "none"; } catch {}
+  }
+}
+
+/** Infinibrowser-backed long commands — independent of the pair-API queue. */
+function isIbCommand(line) {
+  const cmd = (line || "").trim().split(/\s+/)[0];
+  return cmd === "/import" || cmd === "/fill" || cmd === "/prune";
 }
 
 function pairTuples(pairs) {
@@ -465,12 +547,18 @@ async function runPairsInner(pairs) {
   pairs = prioritizePairs(pairs);
   let done = 0, newCount = 0, nothingCount = 0, errors = 0;
   const total = pairs.length;
-  for (const [a, b] of pairs) {
+  setJobProgress(0, total);
+  for (let i = 0; i < pairs.length; i++) {
+    const [a, b] = pairs[i];
     if (cancelled) { print("  " + yellow("Cancelled.")); break; }
+    // Bump progress when the pair *starts* so chrome never sits at 0/N
+    // while a fetch (or rate-limit wait) is in flight.
+    setLastPair(a.text, b.text);
+    setJobProgress(i + 1, total);
     try {
       const result = await apiPair(a.text, b.text);
       if (cancelled) { print("  " + yellow("Cancelled.")); break; }
-      done++;
+      done = i + 1;
       if (result) {
         const isNew = addElement(result.text, result.emoji, result.discovered);
         recordRecipe(result.text, a.text, b.text);
@@ -485,7 +573,7 @@ async function runPairsInner(pairs) {
       }
     } catch (e) {
       if (cancelled) { print("  " + yellow("Cancelled.")); break; }
-      done++;
+      done = i + 1;
       errors++;
     }
     await new Promise(r => setTimeout(r, 0));
@@ -499,9 +587,9 @@ async function confirmAndRunPairs(pairs) {
   try {
     beginRun();
     if (pairs.length > BULK_WARN) {
-      print(`  ${yellow(`${pairs.length} pairs`)} — type ${bold("y")} or ${bold("yes")} to continue, anything else to cancel.`);
-      const answer = await waitForInput();
-      if (cancelled || answer === "__cancelled__" || !["y", "yes"].includes(answer.toLowerCase())) {
+      print(`  ${yellow(`${pairs.length} pairs`)} — press ${bold("y")} to continue, ${bold("n")} / Esc / Stop to cancel.`);
+      const answer = await waitForConfirmKey();
+      if (cancelled || answer === "__cancelled__" || answer !== "y") {
         print("  Cancelled.");
         return;
       }
@@ -514,32 +602,75 @@ async function confirmAndRunPairs(pairs) {
   }
 }
 
-function waitForInput() {
+function waitForConfirmKey() {
+  // Instant single-key y/n (no Enter) when the input is empty.
+  // Esc / Stop cancel. Blank Enter ignored. Other Enter lines enqueue
+  // (tryEnqueue) so API commands can queue during confirm; local commands
+  // fall through to the main keydown handler.
   return new Promise((resolve) => {
     waitingForConfirm = true;
     confirmResolve = resolve;
+    if (promptEl) promptEl.textContent = "confirm [y/n]>";
+    if (input) {
+      input.value = "";
+      input.placeholder = "y / n";
+      try { input.readOnly = false; } catch {}
+    }
+    updateChrome();
     function cleanup() {
       waitingForConfirm = false;
       confirmResolve = null;
+      if (promptEl) promptEl.textContent = "craft>";
+      if (input) {
+        input.placeholder = "Type /help for commands";
+        try { input.readOnly = false; } catch {}
+      }
       try { input.removeEventListener("keydown", handler, true); } catch {}
+      updateChrome();
+    }
+    function finish(val) {
+      cleanup();
+      resolve(val);
     }
     function handler(e) {
-      if (e.key === "Enter") {
-        const val = input.value.trim();
-        if (isLocalCommand(val)) return;
+      if (e.key === "Escape") {
+        e.preventDefault();
         e.stopImmediatePropagation();
-        input.value = "";
+        finish("__cancelled__");
+        return;
+      }
+      // Instant y/n only when the field is empty (not mid-command).
+      const empty = !input || !input.value;
+      if (empty && (e.key === "y" || e.key === "Y" || e.key === "n" || e.key === "N")) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        finish(e.key.toLowerCase());
+        return;
+      }
+      if (e.key === "Enter") {
+        const val = input ? input.value.trim() : "";
+        if (!val) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          return; // blank Enter ignored
+        }
+        if (isLocalCommand(val)) return; // main handler runs locals
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        if (input) input.value = "";
         const answer = val.toLowerCase();
-        if (answer === "y" || answer === "yes" || answer === "n" || answer === "no" || answer === "") {
-          cleanup();
-          resolve(val);
+        if (answer === "y" || answer === "n") {
+          finish(answer);
         } else {
           tryEnqueue(val);
         }
+        return;
       }
+      // Other keys: allow typing a command while confirm is open.
     }
     try {
       input.addEventListener("keydown", handler, true);
+      input.focus();
     } catch (err) {
       cleanup();
       throw err;
@@ -645,10 +776,19 @@ async function doCrawl(aName, bName) {
       if (!pairs.length) { print("  " + dim("No more untried pairs.")); break; }
       print(`  ${dim(`Gen ${gen}:`)} ${pairs.length} pairs to try...`);
       let newInGen = 0;
-      for (const [pa, pb] of pairs) {
+      let genDone = 0;
+      const genTotal = pairs.length;
+      setJobProgress(0, genTotal);
+      for (let i = 0; i < pairs.length; i++) {
+        const [pa, pb] = pairs[i];
         if (cancelled) break;
+        // Progress = current pair index (1-based), updated *before* the fetch so
+        // gen transitions never look frozen at 0/N with a live last-pair.
+        setLastPair(pa.text, pb.text);
+        setJobProgress(i + 1, genTotal);
         try {
           const r = await apiPair(pa.text, pb.text);
+          genDone = i + 1;
           if (r) {
             addElement(pa.text, pa.emoji, false);
             addElement(pb.text, pb.emoji, false);
@@ -662,6 +802,9 @@ async function doCrawl(aName, bName) {
             }
           }
         } catch (e) {
+          // Count the attempt even on error (parity with runPairsInner) so a
+          // run of API failures can't pin the chrome at 0/N while pairs advance.
+          genDone = i + 1;
           if (cancelled) break;
         }
         await new Promise(r => setTimeout(r, 0));
@@ -719,9 +862,9 @@ async function doPermutate(query) {
       print(`  ${dim(`--- Round ${round}:`)} ${matches.length} elements, ${pairs.length} pairs ---`);
 
       if (!confirmed && pairs.length > BULK_WARN) {
-        print(`  ${yellow(`${pairs.length} pairs per round`)} — type ${bold("y")} or ${bold("yes")} to continue.`);
-        const answer = await waitForInput();
-        if (cancelled || answer === "__cancelled__" || !["y", "yes"].includes(answer.toLowerCase())) {
+        print(`  ${yellow(`${pairs.length} pairs per round`)} — press ${bold("y")} to continue, ${bold("n")} / Esc / Stop to cancel.`);
+        const answer = await waitForConfirmKey();
+        if (cancelled || answer === "__cancelled__" || answer !== "y") {
           print("  Cancelled.");
           return;
         }
@@ -903,9 +1046,11 @@ async function doFill() {
   let filled = 0, errors = 0, skipped = 0;
   try {
     beginRun();
+    setIbJobProgress(0, missing.length);
     for (let i = 0; i < missing.length; i++) {
       if (cancelled) { print("  " + yellow("Fill cancelled.")); break; }
       const el = missing[i];
+      setIbJobProgress(i + 1, missing.length);
       // Prior lineage may have already recorded a recipe for this name.
       if (!stillMissing.has(el.text)) {
         skipped++;
@@ -980,9 +1125,11 @@ async function doPrune() {
   let pruned = 0, kept = 0, skipped = 0;
   try {
     beginRun();
+    setIbJobProgress(0, candidates.length);
     for (let i = 0; i < candidates.length; i++) {
       if (cancelled) { print("  " + yellow("Prune cancelled.")); break; }
       const el = candidates[i];
+      setIbJobProgress(i + 1, candidates.length);
       const fillable = await ibCanFill(el.text);
       if (fillable === null) {
         skipped++;
@@ -1085,32 +1232,149 @@ function doHelp() {
     ${cyan("/help")}                       Show this help`);
 }
 
-function updateQueueDisplay() {
-  if (!currentCommand && !commandQueue.length) {
-    queueEl.style.display = "none";
-    queueEl.innerHTML = "";
-    return;
+function setJobProgress(done, total) {
+  jobDone = done;
+  jobTotal = total;
+  updateChrome();
+}
+
+function setLastPair(a, b) {
+  lastPairA = a;
+  lastPairB = b;
+  updateChrome();
+}
+
+function clearJobChrome() {
+  jobDone = 0;
+  jobTotal = 0;
+  lastPairA = null;
+  lastPairB = null;
+  // IB progress is cleared by the IB worker when its command ends.
+  updateChrome();
+}
+
+function setIbJobProgress(done, total) {
+  ibJobDone = done;
+  ibJobTotal = total;
+  updateChrome();
+}
+
+function ellipsizeEnd(s, maxChars) {
+  if (maxChars <= 0) return "";
+  if (s.length <= maxChars) return s;
+  if (maxChars === 1) return "…";
+  return s.slice(0, maxChars - 1) + "…";
+}
+
+function formatPairForWidth(a, b, availChars) {
+  // End-ellipsis per operand; split remaining width after " + ".
+  const sep = " + ";
+  if (availChars <= sep.length + 2) return ellipsizeEnd(`${a}${sep}${b}`, availChars);
+  const each = Math.floor((availChars - sep.length) / 2);
+  const leftExtra = (availChars - sep.length) - each * 2;
+  return ellipsizeEnd(a, each + leftExtra) + sep + ellipsizeEnd(b, each);
+}
+
+function rateBarSegment(filled, width) {
+  const n = Math.max(0, Math.min(width, filled));
+  return "█".repeat(n) + "░".repeat(width - n);
+}
+
+function rateBarHtml(remaining, max, oldestFrac) {
+  const leftFilled = Math.round(Math.max(0, Math.min(1, oldestFrac)) * RATE_BAR_LEFT);
+  const rightFilled = max <= 0 ? 0 : Math.round((remaining / max) * RATE_BAR_RIGHT);
+  const left = rateBarSegment(leftFilled, RATE_BAR_LEFT);
+  const right = rateBarSegment(rightFilled, RATE_BAR_RIGHT);
+  // No separator: purple next-slot wait (left 1/2) + cyan capacity (right 1/2).
+  return (
+    `<span class="ict-rate-bar ict-rate-bar-age">${left}</span>` +
+    `<span class="ict-rate-bar ict-rate-bar-cap">${right}</span>` +
+    ` <span class="ict-rate-num">${remaining}/${max}</span>`
+  );
+}
+
+function updateChrome() {
+  if (!rateEl || !jobEl || !queueEl) return;
+
+  // Permanent rate line: segmented bar + optional last pair (pair lane only).
+  const { remaining, max, oldestFrac } = rateChromeSnapshot();
+  const ratePrefix = `<span class="ict-rate-label">rate</span> ${rateBarHtml(remaining, max, oldestFrac)}`;
+  if (currentPairCommand && lastPairA != null && lastPairB != null) {
+    // Width-aware: measure leftover cells after painting the rate segment once.
+    rateEl.innerHTML = ratePrefix + ` <span class="ict-rate-sep">·</span> <span class="ict-rate-pair"></span>`;
+    const pairSpan = rateEl.querySelector(".ict-rate-pair");
+    const totalPx = rateEl.clientWidth || 320;
+    const ageW = rateEl.querySelector(".ict-rate-bar-age")?.offsetWidth || 0;
+    const capW = rateEl.querySelector(".ict-rate-bar-cap")?.offsetWidth || 0;
+    const usedPx = (rateEl.querySelector(".ict-rate-label")?.offsetWidth || 0)
+      + ageW + capW
+      + (rateEl.querySelector(".ict-rate-num")?.offsetWidth || 0)
+      + (rateEl.querySelector(".ict-rate-sep")?.offsetWidth || 0)
+      + 16;
+    const charPx = 7.2; // monospace ~13px font
+    const avail = Math.max(8, Math.floor((totalPx - usedPx) / charPx));
+    if (pairSpan) pairSpan.textContent = formatPairForWidth(lastPairA, lastPairB, avail);
+  } else {
+    rateEl.innerHTML = ratePrefix;
   }
-  queueEl.style.display = "block";
-  let html = "";
-  if (currentCommand) {
-    html += `<div class="ict-queue-running">Running: ${esc(currentCommand)}</div>`;
+  rateEl.style.display = "block";
+
+  // Job line(s): pair and/or IB can run concurrently (interlaced status).
+  const jobParts = [];
+  if (waitingForConfirm) {
+    jobParts.push(`<div class="ict-job-row"><span class="ict-job-mark">◆</span> <span class="ict-job-label">confirm</span> <span class="ict-job-cmd">${esc(currentPairCommand || currentCommand || "")}</span> <span class="ict-job-hint">y / n</span></div>`);
+  } else if (currentPairCommand) {
+    const prog = jobTotal > 0 ? ` <span class="ict-job-prog">${jobDone}/${jobTotal}</span>` : "";
+    jobParts.push(`<div class="ict-job-row"><span class="ict-job-mark">▶</span> <span class="ict-job-label">running</span> <span class="ict-job-cmd">${esc(currentPairCommand)}</span>${prog}</div>`);
   }
-  if (commandQueue.length) {
-    html += `<div class="ict-queue-label">Queue:</div>`;
-    for (const cmd of commandQueue) {
+  if (currentIbCommand) {
+    const prog = ibJobTotal > 0 ? ` <span class="ict-job-prog">${ibJobDone}/${ibJobTotal}</span>` : "";
+    jobParts.push(`<div class="ict-job-row"><span class="ict-job-mark">▶</span> <span class="ict-job-label">running</span> <span class="ict-job-cmd">${esc(currentIbCommand)}</span>${prog}</div>`);
+  }
+  if (jobParts.length) {
+    jobEl.style.display = "block";
+    jobEl.innerHTML = jobParts.join("");
+  } else {
+    jobEl.style.display = "none";
+    jobEl.innerHTML = "";
+  }
+
+  // Queue: pending from both lanes, interlaced (pair first then ib is fine —
+  // they drain independently).
+  const pending = [...pairQueue, ...ibQueue];
+  if (pending.length) {
+    queueEl.style.display = "block";
+    let html = `<div class="ict-queue-label">Queue:</div>`;
+    for (const cmd of pending) {
       html += `<div class="ict-queue-item">${esc(cmd)}</div>`;
     }
+    queueEl.innerHTML = html;
+  } else {
+    queueEl.style.display = "none";
+    queueEl.innerHTML = "";
   }
-  queueEl.innerHTML = html;
+}
+
+/** @deprecated name kept for call sites during transition */
+function updateQueueDisplay() {
+  updateChrome();
+}
+
+function totalPending() {
+  return pairQueue.length + ibQueue.length;
 }
 
 function enqueueCommand(line) {
-  const deferred = queueWorkerRunning || currentCommand !== null || waitingForConfirm;
-  commandQueue.push(line);
-  updateQueueDisplay();
-  if (deferred) print("  " + dim(`Queued: ${esc(line)}`));
-  ensureQueueWorker();
+  const ib = isIbCommand(line);
+  const laneBusy = ib
+    ? (ibWorkerRunning || currentIbCommand !== null)
+    : (pairWorkerRunning || currentPairCommand !== null || waitingForConfirm);
+  if (ib) ibQueue.push(line);
+  else pairQueue.push(line);
+  updateChrome();
+  if (laneBusy) print("  " + dim(`Queued: ${esc(line)}`));
+  if (ib) ensureIbWorker();
+  else ensurePairWorker();
 }
 
 function tryEnqueue(line) {
@@ -1119,11 +1383,21 @@ function tryEnqueue(line) {
     print(renderErrorSegments(errorSegments));
     return false;
   }
-  if (line === currentCommand || commandQueue.includes(line)) {
+  const ib = isIbCommand(line);
+  if (ib) {
+    if (line === currentIbCommand || ibQueue.includes(line)) {
+      print("  " + dim("Already queued."));
+      return false;
+    }
+  } else if (
+    line === currentPairCommand ||
+    line === currentCommand ||
+    pairQueue.includes(line)
+  ) {
     print("  " + dim("Already queued."));
     return false;
   }
-  if (commandQueue.length >= MAX_QUEUE_DEPTH) {
+  if (totalPending() >= MAX_QUEUE_DEPTH) {
     print("  " + yellow(`Queue full (max ${MAX_QUEUE_DEPTH}).`));
     return false;
   }
@@ -1131,15 +1405,19 @@ function tryEnqueue(line) {
   return true;
 }
 
-async function ensureQueueWorker() {
-  if (queueWorkerRunning) return;
-  queueWorkerRunning = true;
+async function ensurePairWorker() {
+  if (pairWorkerRunning) return;
+  pairWorkerRunning = true;
   try {
-    while (commandQueue.length) {
-      const line = commandQueue.shift();
-      updateQueueDisplay();
-      currentCommand = line;
-      updateQueueDisplay();
+    while (pairQueue.length) {
+      const line = pairQueue.shift();
+      currentPairCommand = line;
+      currentCommand = line; // bulk confirm / chrome alias
+      jobDone = 0;
+      jobTotal = 0;
+      lastPairA = null;
+      lastPairB = null;
+      updateChrome();
       cancelled = false;
       try {
         await executeCommand(line);
@@ -1147,14 +1425,58 @@ async function ensureQueueWorker() {
         endRun();
         waitingForConfirm = false;
         confirmResolve = null;
+        if (promptEl) promptEl.textContent = "craft>";
+        if (input) {
+          input.placeholder = "Type /help for commands";
+          try { input.readOnly = false; } catch {}
+        }
         print("  " + red("Error: " + esc(err && err.message || String(err))));
       }
+      currentPairCommand = null;
       currentCommand = null;
-      updateQueueDisplay();
+      jobDone = 0;
+      jobTotal = 0;
+      lastPairA = null;
+      lastPairB = null;
+      updateChrome();
     }
   } finally {
-    queueWorkerRunning = false;
+    pairWorkerRunning = false;
+    updateChrome();
   }
+}
+
+async function ensureIbWorker() {
+  if (ibWorkerRunning) return;
+  ibWorkerRunning = true;
+  try {
+    while (ibQueue.length) {
+      const line = ibQueue.shift();
+      currentIbCommand = line;
+      ibJobDone = 0;
+      ibJobTotal = 0;
+      updateChrome();
+      // Do not clear global cancelled here — pair lane may still be running.
+      try {
+        await executeCommand(line);
+      } catch (err) {
+        endRun();
+        print("  " + red("Error: " + esc(err && err.message || String(err))));
+      }
+      currentIbCommand = null;
+      ibJobDone = 0;
+      ibJobTotal = 0;
+      updateChrome();
+    }
+  } finally {
+    ibWorkerRunning = false;
+    updateChrome();
+  }
+}
+
+/** @deprecated name kept for call sites; routes to pair worker */
+async function ensureQueueWorker() {
+  return ensurePairWorker();
 }
 
 // ── Command dispatcher ───────────────────────────────────────────────
@@ -1280,10 +1602,25 @@ function initBrowserUI() {
     #ict-body{background:#1a1a2e;color:#e0e0e0;display:flex;flex-direction:column}
     #ict-output{overflow-y:auto;max-height:300px;padding:6px 10px;white-space:pre-wrap;word-break:break-word}
     #ict-output div{margin:1px 0}
+    #ict-rate{display:block;border-top:1px solid #0f3460;padding:4px 10px;background:#0d1526;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    #ict-rate .ict-rate-label{color:#888;margin-right:6px}
+    #ict-rate .ict-rate-bar{letter-spacing:0}
+    #ict-rate .ict-rate-bar-age{color:#7c4dff}
+    #ict-rate .ict-rate-bar-cap{color:#00bcd4}
+    #ict-rate .ict-rate-num{color:#e0e0e0;margin-left:2px}
+    #ict-rate .ict-rate-sep{color:#555;margin:0 4px}
+    #ict-rate .ict-rate-pair{color:#e0e0e0}
+    #ict-job{display:none;border-top:1px solid #0f3460;padding:4px 10px;background:#12182b;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    #ict-job .ict-job-mark{color:#ffeb3b;margin-right:4px}
+    #ict-job .ict-job-label{color:#888;margin-right:6px}
+    #ict-job .ict-job-cmd{color:#ffeb3b}
+    #ict-job .ict-job-prog{color:#00bcd4;margin-left:8px}
+    #ict-job .ict-job-hint{color:#888;margin-left:8px}
     #ict-queue{display:none;border-top:1px solid #0f3460;padding:4px 10px;background:#12182b;font-size:12px;max-height:80px;overflow-y:auto}
     #ict-queue .ict-queue-label{color:#ffeb3b;margin-bottom:2px}
     #ict-queue .ict-queue-item{margin:1px 0;opacity:.85}
-    #ict-queue .ict-queue-running{color:#ffeb3b;margin-bottom:4px}
+    #ict-queue .ict-queue-tag{color:#888;margin-right:4px;font-size:11px}
+    #ict-job .ict-job-row{margin:1px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     #ict-input-row{display:flex;align-items:center;border-top:1px solid #0f3460;padding:4px 10px;background:#16213e}
     #ict-prompt{color:#00bcd4;margin-right:6px;white-space:nowrap}
     #ict-input{flex:1;background:transparent;border:none;outline:none;color:#e0e0e0;font:inherit;caret-color:#00bcd4}
@@ -1300,6 +1637,8 @@ function initBrowserUI() {
     <div id="ict-header"><span>⚡ Infinite Craft Trainer</span><button id="ict-toggle" style="background:none;border:none;color:#e0e0e0;cursor:pointer;font-size:16px">▼</button></div>
     <div id="ict-body">
       <div id="ict-output"></div>
+      <div id="ict-rate"></div>
+      <div id="ict-job"></div>
       <div id="ict-queue"></div>
       <div id="ict-input-row">
         <span id="ict-prompt">craft&gt;</span>
@@ -1312,8 +1651,11 @@ function initBrowserUI() {
   document.dispatchEvent(new CustomEvent("ict-trainer-ready"));
 
   output = document.getElementById("ict-output");
+  rateEl = document.getElementById("ict-rate");
+  jobEl = document.getElementById("ict-job");
   queueEl = document.getElementById("ict-queue");
   input = document.getElementById("ict-input");
+  promptEl = document.getElementById("ict-prompt");
   body = document.getElementById("ict-body");
   toggle = document.getElementById("ict-toggle");
   stopBtn = document.getElementById("ict-stop");
@@ -1335,7 +1677,13 @@ function initBrowserUI() {
       waitingForConfirm = false;
       const resolve = confirmResolve;
       confirmResolve = null;
+      if (promptEl) promptEl.textContent = "craft>";
+      if (input) {
+        input.placeholder = "Type /help for commands";
+        try { input.readOnly = false; } catch {}
+      }
       resolve("__cancelled__");
+      updateChrome();
     }
   });
 
@@ -1351,10 +1699,14 @@ function initBrowserUI() {
 
   // ── Input handling ───────────────────────────────────────────────────
   input.addEventListener("keydown", (e) => {
+    // During confirm the capture handler owns y/n/Esc/API enqueue; allow
+    // local commands (e.g. /search, /list) through here on Enter.
+    if (waitingForConfirm) {
+      if (e.key !== "Enter" || !isLocalCommand(input.value.trim())) return;
+    }
     if (e.key === "Enter") {
       const line = input.value.trim();
       if (!line) return;
-      if (waitingForConfirm && !isLocalCommand(line)) return;
       input.value = "";
       cmdHistory.push(line);
       cmdHistoryIdx = cmdHistory.length;
@@ -1364,7 +1716,7 @@ function initBrowserUI() {
         waitingForConfirm = false;
         confirmResolve = null;
         currentCommand = null;
-        updateQueueDisplay();
+        clearJobChrome();
         print("  " + red("Error: " + esc(err && err.message || String(err))));
       });
     } else if (e.key === "ArrowUp") {
@@ -1376,6 +1728,11 @@ function initBrowserUI() {
       else { cmdHistoryIdx = cmdHistory.length; input.value = ""; }
     }
   });
+
+  // Rate bar ticker (refill while idle / drain visibility while busy).
+  if (rateTickerId) clearInterval(rateTickerId);
+  rateTickerId = setInterval(() => updateChrome(), RATE_TICK_MS);
+  updateChrome();
 
   // ── Async init: load from IndexedDB then show welcome ────────────────
   print(dim("Loading game data..."));

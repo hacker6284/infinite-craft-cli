@@ -144,3 +144,86 @@ class TestAcquire:
         assert elapsed >= 0.05
         assert calls and calls[0] is True
         assert calls[-1] is False
+
+
+class TestRemaining:
+    def test_remaining_full_when_idle(self):
+        limiter = RateLimiter(max_requests=60)
+        left, maximum = limiter.remaining()
+        assert maximum == 60
+        assert left == 60
+
+    def test_remaining_decreases_after_acquire(self):
+        limiter = RateLimiter(max_requests=5)
+        run_async(limiter.acquire())
+        run_async(limiter.acquire())
+        left, maximum = limiter.remaining()
+        assert maximum == 5
+        assert left == 3
+
+    def test_remaining_zero_limit(self):
+        limiter = RateLimiter(max_requests=0)
+        assert limiter.remaining() == (0, 0)
+
+    def test_remaining_recovers_after_window(self):
+        limiter = RateLimiter(max_requests=1, window_seconds=0.1)
+        run_async(limiter.acquire())
+        assert limiter.remaining() == (0, 1)
+        time.sleep(0.15)
+        assert limiter.remaining() == (1, 1)
+
+
+class TestChromeSnapshot:
+    def test_idle_oldest_frac_is_full(self):
+        limiter = RateLimiter(max_requests=60, window_seconds=60.0)
+        left, maximum, frac = limiter.chrome_snapshot()
+        assert left == 60
+        assert maximum == 60
+        assert frac == 1.0
+
+    def test_fresh_acquire_oldest_frac_near_zero(self):
+        limiter = RateLimiter(max_requests=5, window_seconds=60.0)
+        run_async(limiter.acquire())
+        left, maximum, frac = limiter.chrome_snapshot()
+        assert left == 4
+        assert maximum == 5
+        # First segment: start = birth of oldest → frac near 0.
+        assert 0.0 <= frac < 0.05
+
+    def test_oldest_frac_grows_with_age(self):
+        limiter = RateLimiter(max_requests=1, window_seconds=1.0)
+        run_async(limiter.acquire())
+        time.sleep(0.4)
+        _left, _maximum, frac = limiter.chrome_snapshot()
+        assert 0.25 <= frac <= 0.7
+
+    def test_frac_resets_on_slot_free_and_scales_to_next_drop(self):
+        """After a free, bar resets; next fill uses inter-drop interval, not full window."""
+        limiter = RateLimiter(max_requests=2, window_seconds=0.4)
+        run_async(limiter.acquire())
+        time.sleep(0.15)
+        run_async(limiter.acquire())  # full; oldest ages ~0.15s of 0.4s
+        # Wait until first slot frees (oldest expires).
+        time.sleep(0.30)
+        left, _maximum, frac_just_after = limiter.chrome_snapshot()
+        assert left == 1  # one free
+        # Just after free: segment start = free time → frac near 0 (not ~1 from full window).
+        assert frac_just_after < 0.35
+        time.sleep(0.12)
+        _left2, _m2, frac_mid = limiter.chrome_snapshot()
+        # Midway through remaining life of second request (~0.25s left after free).
+        assert frac_mid > frac_just_after
+
+    def test_release_resets_last_freed(self):
+        limiter = RateLimiter(max_requests=2, window_seconds=60.0)
+        t1 = run_async(limiter.acquire())
+        run_async(limiter.acquire())
+        run_async(limiter.release(t1))
+        left, _maximum, frac = limiter.chrome_snapshot()
+        assert left == 1
+        # Release counts as a free → segment restarts near 0.
+        assert frac < 0.05
+
+    def test_chrome_snapshot_zero_limit(self):
+        limiter = RateLimiter(max_requests=0)
+        assert limiter.chrome_snapshot() == (0, 0, 1.0)

@@ -135,7 +135,7 @@ class TestConfirmAndRunPairs:
                 run_async(_confirm_and_run_pairs(client, storage, pairs))
         captured = capsys.readouterr()
         assert "pairs" in captured.out
-        assert "type y" in captured.out
+        assert "press y" in captured.out
         assert "Cancelled" in captured.out
 
     def test_user_confirms(self, capsys):
@@ -195,7 +195,7 @@ class TestConfirmAndRunPairs:
         captured = capsys.readouterr()
         mock_confirm.assert_not_called()
         assert "pairs" in captured.out
-        assert "type y" in captured.out
+        assert "press y" in captured.out
         assert "Done" in captured.out
         assert "Cancelled" not in captured.out
 

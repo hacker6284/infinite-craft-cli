@@ -69,10 +69,13 @@ _QUERY_HELP = "Search query (wildcards, /regex/, ! exclude, ^ first discoveries)
 _history: list[tuple[str, str, str]] = []
 _session_input_history: list[str] = []
 
-# Interactive command queue (API/long-running commands)
-_command_queue: list[str] = []
-_current_command: str | None = None
-_api_worker_task: asyncio.Task | None = None
+# Interactive command queues — pair (neal.fun) and IB (Infinibrowser) are independent.
+_command_queue: list[str] = []  # pair-API lane (alias kept for tests/chrome)
+_ib_command_queue: list[str] = []
+_current_command: str | None = None  # pair lane currently running
+_current_ib_command: str | None = None
+_api_worker_task: asyncio.Task | None = None  # pair worker
+_ib_worker_task: asyncio.Task | None = None
 _MAX_QUEUE_DEPTH = 50
 _MAX_PERMUTATE_ROUNDS = 50
 _stdin_lock = asyncio.Lock()
@@ -109,7 +112,12 @@ _builtin_print = builtins.print
 
 # Prompt strings (extracted consts; used by _craft_prompt and chrome)
 CRAFT_PROMPT = "craft> "
-CONFIRM_PROMPT = "confirm [y/N]> "
+CONFIRM_PROMPT = "confirm [y/n]> "
+# Segmented rate bar: left 1/2 = next-slot wait refill, right 1/2 = remaining.
+_RATE_BAR_LEFT = 9
+_RATE_BAR_RIGHT = 9
+_RATE_BAR_WIDTH = _RATE_BAR_LEFT + _RATE_BAR_RIGHT  # 18; kept for any legacy width refs
+_RATE_TICK_SECONDS = 0.3
 
 # Test-only seams (set by harness in tests; never used in production).
 # Allows deterministic input without real TTY/termios/select, and avoids races.
@@ -128,6 +136,7 @@ def _reset_test_state() -> None:
     Call this from test fixtures and finally blocks. Not for production use.
     """
     global _pair_cache, _history, _session_input_history, _command_queue
+    global _ib_command_queue, _current_ib_command, _ib_worker_task
     global _current_command, _api_worker_task, _confirm_future, _confirm_answer_buffer
     global _last_queue_snapshot, _queue_panel_height, _interactive_mode_active
     global _confirm_expected, _bulk_confirm_pending, _bulk_confirm_resolved
@@ -144,7 +153,9 @@ def _reset_test_state() -> None:
     _history.clear()
     _session_input_history.clear()
     _command_queue.clear()
+    _ib_command_queue.clear()
     _current_command = None
+    _current_ib_command = None
     _confirm_future = None
     _confirm_answer_buffer = None
     _last_queue_snapshot = ""
@@ -172,6 +183,15 @@ def _reset_test_state() -> None:
     _cancel_scope_depth = 0
     _rate_limit_waiting = False
     _discard_queue_after_cancel = False
+    global _job_done, _job_total, _ib_job_done, _ib_job_total
+    global _last_pair, _active_client, _rate_ticker_task
+    _job_done = 0
+    _job_total = 0
+    _ib_job_done = 0
+    _ib_job_total = 0
+    _last_pair = None
+    _active_client = None
+    _rate_ticker_task = None
     _skip_summary_shown = False
     _sigint_previous = None
     _winch_previous = None
@@ -190,19 +210,21 @@ def _reset_test_state() -> None:
     except RuntimeError:
         # no running loop: still attempt cancel on the task ref (best-effort, marks cancelled)
         # before nulling; prevents orphan ref even if loop is dead.
-        t = _api_worker_task
-        if t and not t.done():
-            with contextlib.suppress(Exception):
-                t.cancel()
-        _api_worker_task = None
+        for name in ("_api_worker_task", "_ib_worker_task"):
+            t = globals().get(name)
+            if t and not t.done():
+                with contextlib.suppress(Exception):
+                    t.cancel()
+            globals()[name] = None
         # sweep not possible w/o running loop; harness paths cover asyncio.all_tasks cases
     except Exception:
         # best-effort: detach ref, do not let cleanup raise
-        t = _api_worker_task
-        if t and not getattr(t, "done", lambda: True)():
-            with contextlib.suppress(Exception):
-                t.cancel()
-        _api_worker_task = None
+        for name in ("_api_worker_task", "_ib_worker_task"):
+            t = globals().get(name)
+            if t and not getattr(t, "done", lambda: True)():
+                with contextlib.suppress(Exception):
+                    t.cancel()
+            globals()[name] = None
     # helper or above always ensures cleared to prevent re-use/orphans
     with contextlib.suppress(Exception):
         _remove_winch_handler()
@@ -394,8 +416,11 @@ async def _cached_pair(client, storage, a, b):
 async def do_combine(client, storage, first_name: str, second_name: str) -> str:
     first = _resolve_element(storage, first_name)
     second = _resolve_element(storage, second_name)
+    _set_job_progress(0, 1)
+    _set_last_pair(first.name, second.name)
     try:
         result = await _cached_pair(client, storage, first, second)
+        _set_job_progress(1, 1)
     except CommandCancelled:
         raise
     except Exception as e:
@@ -718,6 +743,14 @@ _cancelled = False
 _discard_queue_after_cancel = False
 _skip_summary_shown = False
 _rate_limit_waiting = False
+# Sticky chrome: pair job progress + last pair; IB job progress separate
+_job_done: int = 0
+_job_total: int = 0
+_ib_job_done: int = 0
+_ib_job_total: int = 0
+_last_pair: tuple[str, str] | None = None
+_active_client = None  # InfiniteCraftClient | None
+_rate_ticker_task: asyncio.Task | None = None
 
 
 def _reset_cancelled():
@@ -751,7 +784,11 @@ def _rate_limit_wait_callback(waiting: bool) -> None:
 def _request_skip_current() -> bool:
     """Skip the running queued command and continue to the next (Escape)."""
     global _cancelled, _discard_queue_after_cancel
-    if _current_command is None and not _waiting_for_confirm():
+    if (
+        _current_command is None
+        and _current_ib_command is None
+        and not _waiting_for_confirm()
+    ):
         return False
     _cancelled = True
     _discard_queue_after_cancel = False
@@ -1053,9 +1090,14 @@ def _chrome_state_key() -> tuple:
         _waiting_for_confirm(),
         _bulk_confirm_pending,
         _current_command,
+        _current_ib_command,
         tuple(_command_queue),
+        tuple(_ib_command_queue),
         _api_worker_task is not None and not _api_worker_task.done()
         if _api_worker_task
+        else False,
+        _ib_worker_task is not None and not _ib_worker_task.done()
+        if _ib_worker_task
         else False,
         _tty_height(),
         _tty_width(),
@@ -1563,6 +1605,21 @@ def _tty_read_line() -> str:
                 _tty_try_read_orphan_csi(ch)
                 # fallthrough -> isprintable inserts the literal ch
             if ch.isprintable() or ch == "\t":
+                # Instant single-key y/n when a bulk confirm is waiting
+                # (no Enter). Other keys still build a normal line so
+                # commands can be typed+Enter-queued during confirm.
+                if (
+                    not buf
+                    and (_waiting_for_confirm() or _bulk_confirm_pending)
+                    and ch.lower() in ("y", "n")
+                ):
+                    if _chrome_enabled:
+                        _chrome_update_scroll_region(reposition=True)
+                        _chrome_draw(partial="")
+                    else:
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                    return ch.lower()
                 buf.insert(pos, ch)
                 pos += 1
                 history_index = None
@@ -1651,7 +1708,8 @@ async def _prompt_input(prompt: str) -> str:
 
 
 def _is_confirm_answer(line: str) -> bool:
-    return line.strip().lower() in ("y", "yes", "n", "no", "")
+    """Single-key y/n only (no Enter-required 'yes'/'no' words)."""
+    return line.strip().lower() in ("y", "n")
 
 
 def _deliver_confirm_answer(line: str) -> bool:
@@ -1660,7 +1718,7 @@ def _deliver_confirm_answer(line: str) -> bool:
         return False
     if _confirm_future is None or _confirm_future.done():
         return False
-    _confirm_future.set_result(line.strip())
+    _confirm_future.set_result(line.strip().lower()[:1])
     return True
 
 
@@ -1676,9 +1734,170 @@ def _route_confirm_input(line: str) -> bool:
         return True
     if _bulk_confirm_pending:
         global _confirm_answer_buffer
-        _confirm_answer_buffer = line.strip()
+        _confirm_answer_buffer = line.strip().lower()[:1]
         return True
     return False
+
+
+def _paint_job_chrome() -> None:
+    """Repaint sticky chrome for job progress/pair (interactive chrome only).
+
+    Non-interactive callers of _combine_pairs must not flood stdout with the
+    permanent rate line on every pair.
+    """
+    if _chrome_enabled or _interactive_mode_active:
+        _paint_queue_panel(force=True)
+
+
+def _set_job_progress(done: int, total: int) -> None:
+    """Pair-lane job progress (combine/crawl/etc.)."""
+    global _job_done, _job_total
+    _job_done = done
+    _job_total = total
+    _paint_job_chrome()
+
+
+def _set_ib_job_progress(done: int, total: int) -> None:
+    """IB-lane job progress (import/fill/prune) — does not clobber pair chrome."""
+    global _ib_job_done, _ib_job_total
+    _ib_job_done = done
+    _ib_job_total = total
+    _paint_job_chrome()
+
+
+def _set_last_pair(a: str, b: str) -> None:
+    global _last_pair
+    _last_pair = (a, b)
+    _paint_job_chrome()
+
+
+def _clear_job_chrome() -> None:
+    """Clear pair-lane chrome only (IB worker clears its own progress)."""
+    global _job_done, _job_total, _last_pair
+    _job_done = 0
+    _job_total = 0
+    _last_pair = None
+    _paint_job_chrome()
+
+
+def _clear_ib_job_chrome() -> None:
+    global _ib_job_done, _ib_job_total
+    _ib_job_done = 0
+    _ib_job_total = 0
+    _paint_job_chrome()
+
+
+def _rate_snapshot() -> tuple[int, int, float]:
+    """Best-effort ``(slots_left, max, next_slot_frac)`` for chrome.
+
+    Never raises or returns a coroutine. ``next_slot_frac`` is 1.0 when idle.
+    """
+    left, maximum, frac = (60, 60, 1.0)
+    client = _active_client
+    if client is None:
+        return left, maximum, frac
+    try:
+        limiter = getattr(client, "_rate_limiter", None)
+        if limiter is None:
+            return left, maximum, frac
+        # Prefer chrome_snapshot (3-tuple); fall back to remaining() (2-tuple).
+        snap_fn = getattr(limiter, "chrome_snapshot", None)
+        if callable(snap_fn) and not asyncio.iscoroutinefunction(snap_fn):
+            snap = snap_fn()
+            if asyncio.isfuture(snap) or asyncio.iscoroutine(snap):
+                with contextlib.suppress(Exception):
+                    if asyncio.iscoroutine(snap):
+                        snap.close()
+                return left, maximum, frac
+            if (
+                isinstance(snap, tuple)
+                and len(snap) == 3
+                and all(isinstance(x, (int, float)) for x in snap)
+            ):
+                return int(snap[0]), int(snap[1]), float(snap[2])
+        remaining_fn = getattr(limiter, "remaining", None)
+        if not callable(remaining_fn) or asyncio.iscoroutinefunction(remaining_fn):
+            return left, maximum, frac
+        snap = remaining_fn()
+        if asyncio.isfuture(snap) or asyncio.iscoroutine(snap):
+            with contextlib.suppress(Exception):
+                if asyncio.iscoroutine(snap):
+                    snap.close()
+            return left, maximum, frac
+        if isinstance(snap, tuple) and len(snap) == 2:
+            a, b = snap
+            if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+                return int(a), int(b), 1.0
+    except Exception:
+        pass
+    return left, maximum, frac
+
+
+def _rate_bar_segment(filled: int, width: int) -> str:
+    filled = max(0, min(width, filled))
+    return "█" * filled + "░" * (width - filled)
+
+
+def _rate_bar_text(
+    remaining: int,
+    maximum: int,
+    oldest_frac: float = 1.0,
+    *,
+    left_width: int = _RATE_BAR_LEFT,
+    right_width: int = _RATE_BAR_RIGHT,
+) -> str:
+    """Plain (uncolored) segmented bar: left age + right remaining capacity."""
+    if left_width < 0:
+        left_width = 0
+    if right_width < 0:
+        right_width = 0
+    left_filled = int(round(max(0.0, min(1.0, oldest_frac)) * left_width))
+    if maximum <= 0:
+        right_filled = 0
+    else:
+        right_filled = int(round((remaining / maximum) * right_width))
+    return _rate_bar_segment(left_filled, left_width) + _rate_bar_segment(
+        right_filled, right_width
+    )
+
+
+def _rate_bar_colored(
+    remaining: int,
+    maximum: int,
+    oldest_frac: float = 1.0,
+    *,
+    left_width: int = _RATE_BAR_LEFT,
+    right_width: int = _RATE_BAR_RIGHT,
+) -> str:
+    """Segmented bar with purple/magenta next-slot wait + cyan capacity (no separator)."""
+    left_filled = int(round(max(0.0, min(1.0, oldest_frac)) * left_width))
+    if maximum <= 0:
+        right_filled = 0
+    else:
+        right_filled = int(round((remaining / maximum) * right_width))
+    left_part = _rate_bar_segment(left_filled, left_width)
+    right_part = _rate_bar_segment(right_filled, right_width)
+    # MAGENTA reads as purple in most terminals; cyan matches the trainer.
+    return _color(left_part, MAGENTA) + _color(right_part, CYAN)
+
+
+def _ellipsize_end(s: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    if _ansi_visible_len(s) <= max_chars:
+        return s
+    if max_chars == 1:
+        return "…"
+    return _fit_visible(s, max_chars - 1) + "…"
+
+
+def _format_pair_for_width(a: str, b: str, avail: int) -> str:
+    sep = " + "
+    if avail <= len(sep) + 2:
+        return _ellipsize_end(f"{a}{sep}{b}", avail)
+    each = max(1, (avail - len(sep)) // 2)
+    left_extra = (avail - len(sep)) - each * 2
+    return _ellipsize_end(a, each + left_extra) + sep + _ellipsize_end(b, each)
 
 
 def _command_may_bulk_confirm(line: str) -> bool:
@@ -1789,21 +2008,30 @@ async def _combine_pairs(client, storage, pairs: list[tuple]):
     nothing_count = 0
     done_count = 0
     known_names = {e.name for e in storage.get_all()}
+    _set_job_progress(0, total)
 
     async def process(a, b):
         nonlocal new_count, nothing_count, done_count
+        _set_last_pair(a.name, b.name)
+        # In-flight ordinal so a fresh generation never sits at 0/N with a live
+        # last-pair while the first fetch/rate-wait is outstanding.
+        in_flight = min(total, done_count + 1)
+        if in_flight > 0:
+            _set_job_progress(in_flight, total)
         try:
             result = await _cached_pair(client, storage, a, b)
         except CommandCancelled:
             return
         except Exception as e:
             done_count += 1
+            _set_job_progress(done_count, total)
             _repl_print_lines(
                 f"  [{done_count}/{total}] {format_element(a)} + {format_element(b)} = "
                 f"{_color(f'Error: {_tty(str(e))}', RED)}"
             )
             return
         done_count += 1
+        _set_job_progress(done_count, total)
         if result.name is not None:
             for elem in (a, b):
                 storage.add(
@@ -1832,22 +2060,30 @@ async def _combine_pairs(client, storage, pairs: list[tuple]):
             )
 
     # Process in batches of API_CONCURRENCY to avoid overwhelming the rate limiter
-    for i in range(0, len(pairs), API_CONCURRENCY):
-        if _cancelled:
-            break
-        batch = pairs[i : i + API_CONCURRENCY]
-        await asyncio.gather(*(process(a, b) for a, b in batch))
+    try:
+        for i in range(0, len(pairs), API_CONCURRENCY):
+            if _cancelled:
+                break
+            batch = pairs[i : i + API_CONCURRENCY]
+            # Show the first pair of each batch immediately (before the fetch).
+            if batch:
+                _set_last_pair(batch[0][0].name, batch[0][1].name)
+            await asyncio.gather(*(process(a, b) for a, b in batch))
 
-    if _cancelled:
-        _repl_print_lines(
-            f"  Cancelled. {_color(str(new_count), GREEN)} new, "
-            f"{nothing_count} nothing, {done_count}/{total} tried."
-        )
-        _mark_cancel_notified()
-    else:
-        _repl_print_lines(
-            f"  Done. {_color(str(new_count), GREEN)} new, {nothing_count} nothing, {total} tried."
-        )
+        if _cancelled:
+            _repl_print_lines(
+                f"  Cancelled. {_color(str(new_count), GREEN)} new, "
+                f"{nothing_count} nothing, {done_count}/{total} tried."
+            )
+            _mark_cancel_notified()
+        else:
+            _repl_print_lines(
+                f"  Done. {_color(str(new_count), GREEN)} new, {nothing_count} nothing, {total} tried."
+            )
+    finally:
+        # Leave last pair/progress visible until the worker clears chrome on
+        # command end; only reset when this call had no outer command context.
+        pass
 
 
 async def _confirm_and_run_pairs(client, storage, pairs: list[tuple]):
@@ -1860,8 +2096,8 @@ async def _confirm_and_run_pairs(client, storage, pairs: list[tuple]):
             _bulk_confirm_pending = True
             _chrome_sync()
         _repl_print_lines(
-            f"  {_color(f'{len(pairs)} pairs', YELLOW)} — "
-            f"type {_color('y', BOLD)} or {_color('yes', BOLD)} to continue"
+            f"  {_color(f'{len(pairs)} pairs', YELLOW)} — press "
+            f"{_color('y', BOLD)} to continue, {_color('n', BOLD)} / Esc to cancel."
         )
         if sys.stdin.isatty():
             try:
@@ -1871,7 +2107,7 @@ async def _confirm_and_run_pairs(client, storage, pairs: list[tuple]):
                     _repl_print_lines("  Cancelled.")
                     _mark_cancel_notified()
                     return
-                if answer not in ("y", "yes"):
+                if answer != "y":
                     _repl_print_lines("  Cancelled.")
                     _mark_cancel_notified()
                     return
@@ -1961,8 +2197,8 @@ async def do_permutate(client, storage, query: str):
                     _bulk_confirm_pending = True
                     _chrome_sync()
                 _repl_print_lines(
-                    f"  {_color(f'{len(pairs)} pairs per round', YELLOW)} — "
-                    f"type {_color('y', BOLD)} or {_color('yes', BOLD)} to continue"
+                    f"  {_color(f'{len(pairs)} pairs per round', YELLOW)} — press "
+                    f"{_color('y', BOLD)} to continue, {_color('n', BOLD)} / Esc to cancel."
                 )
                 if sys.stdin.isatty():
                     try:
@@ -1972,7 +2208,7 @@ async def do_permutate(client, storage, query: str):
                             _repl_print_lines("  Cancelled.")
                             _mark_cancel_notified()
                             return
-                        if answer not in ("y", "yes"):
+                        if answer != "y":
                             _repl_print_lines("  Cancelled.")
                             _mark_cancel_notified()
                             return
@@ -2242,6 +2478,7 @@ async def _fill_missing_recipes_async(storage):
     failed = set()
     processed = 0
     queue = sorted(missing)
+    _set_ib_job_progress(0, total)
     try:
         for name in queue:
             if _cancelled:
@@ -2256,6 +2493,7 @@ async def _fill_missing_recipes_async(storage):
                 skipped += 1
                 continue
             processed += 1
+            _set_ib_job_progress(processed, total)
             remaining = total - fetched - skipped - len(failed)
             e = storage.get_by_name(name) or Element(name=name)
             _repl_print_lines(
@@ -2542,10 +2780,21 @@ _API_SLASH_COMMANDS = (
     "/cross",
 )
 
+# Infinibrowser / non-pair long work — independent queue from neal.fun pair API.
+_IB_QUEUE_COMMANDS = frozenset({"/import", "/fill", "/prune"})
+
 
 def _is_local_command(line: str) -> bool:
     """Commands that run immediately without queuing behind API work."""
     return craft.is_local_command(line)
+
+
+def _is_ib_command(line: str) -> bool:
+    """True when the line is an Infinibrowser-backed long command (own queue)."""
+    if not line:
+        return False
+    head = line.split()[0]
+    return head in _IB_QUEUE_COMMANDS
 
 
 def _is_slash_command_attempt(line: str) -> bool:
@@ -2584,54 +2833,110 @@ def _is_recognized_command(line: str) -> bool:
 
 
 def do_queue_status() -> str:
-    """Describe the current command queue."""
-    if not _current_command and not _command_queue:
-        status_hint = "its status appears in the panel above the prompt."
+    """Describe the current command queue (pair + IB lanes)."""
+    left, maximum, oldest_frac = _rate_snapshot()
+    rate_line = (
+        f"  rate {_rate_bar_text(left, maximum, oldest_frac)} {left}/{maximum}"
+    )
+    pair_q = list(_command_queue)
+    ib_q = list(_ib_command_queue)
+    if (
+        not _current_command
+        and not _current_ib_command
+        and not pair_q
+        and not ib_q
+    ):
         return (
+            f"{rate_line}\n"
             "  Queue is idle.\n"
             "  When you start a long command (combine, fill, permutate, ...), "
-            f"{status_hint}"
+            "its status appears in the panel above the prompt."
         )
-    lines: list[str] = []
+    lines: list[str] = [rate_line]
     if _current_command:
         line = f"  Running: {_sanitize_queue_line(_current_command)}"
-        if _rate_limit_waiting:
-            line += " ⏳ rate limit"
+        if _job_total > 0:
+            line += f"  {_job_done}/{_job_total}"
+        if _last_pair:
+            line += f"  ·  {_last_pair[0]} + {_last_pair[1]}"
         lines.append(line)
-    for i, cmd in enumerate(
-        list(_command_queue), 1
-    ):  # snapshot copy (thread/race safe)
-        lines.append(f"  {i}. pending: {_sanitize_queue_line(cmd)}")
+    if _current_ib_command:
+        line = f"  Running: {_sanitize_queue_line(_current_ib_command)}"
+        if _ib_job_total > 0:
+            line += f"  {_ib_job_done}/{_ib_job_total}"
+        lines.append(line)
+    n = 1
+    for cmd in pair_q:
+        lines.append(f"  {n}. pending: {_sanitize_queue_line(cmd)}")
+        n += 1
+    for cmd in ib_q:
+        lines.append(f"  {n}. pending: {_sanitize_queue_line(cmd)}")
+        n += 1
     return "\n".join(lines)
 
 
 def _format_queue_display() -> str:
-    """Render the queue status panel (empty string when idle).
+    """Render sticky chrome: always-on rate line, job line, pending queue.
 
-    For exactly one content line (single running / only pending / only awaiting/bulk-confirm),
-    emit *only* that status line (no header rule "── queue ──", no footer rule). This reduces
-    reserved vertical space by ~2 lines in common case. >1 items keep header+items+footer.
-    All truncation/color/sanitize/width preserved exactly.
+    Rate line: remaining pair-API budget bar + last pair (while a job runs).
+    Job line: running command + done/total (or confirm state).
+    Queue: pending commands only (height/cap concerns apply here).
     """
-    running = _current_command
-    pending = list(_command_queue)
-    awaiting_confirm = _waiting_for_confirm() or _bulk_confirm_pending
-    if not running and not pending and not awaiting_confirm:
-        return ""
     width = _tty_width()
     content: list[str] = []
-    if running:
-        cmd = _sanitize_queue_line(running)
-        prefix = f"  {_color('▶', YELLOW)} {_color('running', DIM)}  "
-        suffix = ""
-        if _rate_limit_waiting:
-            suffix = f" {_color('⏳ rate limit', DIM)}"
-        pvis = _ansi_visible_len(prefix)
-        suffix_vis = _ansi_visible_len(suffix)
-        avail = max(1, width - pvis - suffix_vis - 1)
+
+    # --- Permanent rate line (always) ---
+    left, maximum, oldest_frac = _rate_snapshot()
+    bar = _rate_bar_colored(left, maximum, oldest_frac)
+    rate_prefix = f"  {_color('rate', DIM)} {bar} {left}/{maximum}"
+    pair_part = ""
+    if _current_command and _last_pair is not None:
+        a, b = _last_pair
+        pvis = _ansi_visible_len(rate_prefix) + 3  # " · "
+        avail = max(8, width - pvis - 1)
+        pair_part = (
+            f" {_color('·', DIM)} {_sanitize_queue_line(_format_pair_for_width(a, b, avail))}"
+        )
+    content.append(rate_prefix + pair_part)
+
+    # --- Job lines (pair and/or IB may run concurrently) ---
+    running = _current_command
+    running_ib = _current_ib_command
+    pending = list(_command_queue) + list(_ib_command_queue)
+    if _waiting_for_confirm() or _bulk_confirm_pending:
+        prefix = f"  {_color('◆', YELLOW)} {_color('confirm', BOLD + YELLOW)}  "
+        cmd = _sanitize_queue_line(running or "")
+        hint = _color("y / n", DIM)
+        pvis = _ansi_visible_len(prefix) + _ansi_visible_len(hint) + 1
+        avail = max(1, width - pvis - 1)
         if _ansi_visible_len(cmd) > avail:
             cmd = _fit_visible(cmd, max(0, avail - 1)) + "…"
-        content.append(f"{prefix}{_color(cmd, YELLOW)}{suffix}")
+        content.append(f"{prefix}{_color(cmd, YELLOW)} {hint}")
+    elif running:
+        prefix = f"  {_color('▶', YELLOW)} {_color('running', DIM)}  "
+        cmd = _sanitize_queue_line(running)
+        prog = f" {_color(f'{_job_done}/{_job_total}', CYAN)}" if _job_total > 0 else ""
+        pvis = _ansi_visible_len(prefix) + _ansi_visible_len(prog)
+        avail = max(1, width - pvis - 1)
+        if _ansi_visible_len(cmd) > avail:
+            cmd = _fit_visible(cmd, max(0, avail - 1)) + "…"
+        content.append(f"{prefix}{_color(cmd, YELLOW)}{prog}")
+    if running_ib:
+        # Same "running" chrome as pair; both lanes can show at once.
+        prefix = f"  {_color('▶', YELLOW)} {_color('running', DIM)}  "
+        cmd = _sanitize_queue_line(running_ib)
+        prog = (
+            f" {_color(f'{_ib_job_done}/{_ib_job_total}', CYAN)}"
+            if _ib_job_total > 0
+            else ""
+        )
+        pvis = _ansi_visible_len(prefix) + _ansi_visible_len(prog)
+        avail = max(1, width - pvis - 1)
+        if _ansi_visible_len(cmd) > avail:
+            cmd = _fit_visible(cmd, max(0, avail - 1)) + "…"
+        content.append(f"{prefix}{_color(cmd, YELLOW)}{prog}")
+
+    # --- Pending queue (pair + ib interlaced for display) ---
     for i, cmd in enumerate(pending, 1):
         safe = _sanitize_queue_line(cmd)
         prefix = f"  {_color(f'{i}.', DIM)} {_color('pending', DIM)}  "
@@ -2640,42 +2945,21 @@ def _format_queue_display() -> str:
         if _ansi_visible_len(safe) > avail:
             safe = _fit_visible(safe, max(0, avail - 1)) + "…"
         content.append(f"{prefix}{safe}")
-    if _waiting_for_confirm():
-        prefix = (
-            f"  {_color('◆', YELLOW)} {_color('awaiting confirm', BOLD + YELLOW)}  "
-        )
-        plain = "answer y/n at prompt below"
-        pvis = _ansi_visible_len(prefix)
-        avail = max(1, width - pvis - 1)
-        if _ansi_visible_len(plain) > avail:
-            plain = _fit_visible(plain, max(0, avail - 1)) + "…"
-        desc = _color(plain, DIM)
-        content.append(f"{prefix}{desc}")
-    elif _bulk_confirm_pending:
-        prefix = f"  {_color('◆', YELLOW)} {_color('confirm', BOLD + YELLOW)}  "
-        plain = "preparing bulk prompt..."
-        pvis = _ansi_visible_len(prefix)
-        avail = max(1, width - pvis - 1)
-        if _ansi_visible_len(plain) > avail:
-            plain = _fit_visible(plain, max(0, avail - 1)) + "…"
-        desc = _color(plain, DIM)
-        content.append(f"{prefix}{desc}")
-    if not content:
-        return ""
-    if len(content) == 1:
-        return content[0]
+
+    # Compact (no decorative rules) when the pending queue is empty: rate-only
+    # idle, or rate + job/confirm. Rules only wrap a multi-item pending list.
+    if not pending:
+        return "\n".join(content)
     overhead = 2 + 1 + 5 + 1
     sep_len = max(3, (width - overhead) // 2)
     sep_len = min(sep_len, 40)
     rule = _color("─" * sep_len, DIM)
-    lines: list[str] = [f"  {rule} {_color('queue', BOLD + CYAN)} {rule}"]
+    lines: list[str] = [f"  {rule} {_color('status', BOLD + CYAN)} {rule}"]
     if _ansi_visible_len(lines[0]) > width:
         sep_len = max(1, sep_len - 2)
         rule = _color("─" * sep_len, DIM)
-        lines[0] = f"  {rule} {_color('queue', BOLD + CYAN)} {rule}"
+        lines[0] = f"  {rule} {_color('status', BOLD + CYAN)} {rule}"
     lines.extend(content)
-    # Make the footer the same visible width as the header for visual consistency.
-    # Header already computed a balanced (capped) rule length around the label.
     header_vis = _ansi_visible_len(lines[0])
     foot_bar = "─" * max(3, header_vis - 2)
     foot = f"  {_color(foot_bar, DIM)}"
@@ -2724,21 +3008,34 @@ def _craft_prompt() -> str:
     if _waiting_for_confirm() or _bulk_confirm_pending or _confirm_expected:
         return _color(CONFIRM_PROMPT, YELLOW)
     base = _color(CRAFT_PROMPT, CYAN)
-    if not (_current_command or _command_queue):
+    pair_q = list(_command_queue)
+    ib_q = list(_ib_command_queue)
+    if not (
+        _current_command
+        or _current_ib_command
+        or pair_q
+        or ib_q
+    ):
         return base
-    cq = list(_command_queue)  # snapshot for race safety (reads from chrome/repl paths)
-    pending = len(cq) + (1 if _current_command else 0)
+    pending = (
+        len(pair_q)
+        + len(ib_q)
+        + (1 if _current_command else 0)
+        + (1 if _current_ib_command else 0)
+    )
     hint = _color(f"[{pending} active] ", DIM)
-    if _current_command and _tty_input_available():
+    if (_current_command or _current_ib_command) and _tty_input_available():
         hint += _color("[Esc skip] ", DIM)
     return base + hint
 
 
-def _queue_enqueue_deferred() -> bool:
-    """True when a new command will wait behind in-flight or queued work."""
+def _queue_enqueue_deferred(line: str | None = None) -> bool:
+    """True when a new command will wait behind in-flight or queued work on its lane."""
+    if line is not None and _is_ib_command(line):
+        return _current_ib_command is not None or bool(list(_ib_command_queue))
     return (
         _current_command is not None
-        or bool(list(_command_queue))  # snapshot copy for cross-thread safety w/ worker
+        or bool(list(_command_queue))
         or _waiting_for_confirm()
         or _bulk_confirm_pending
     )
@@ -2821,7 +3118,11 @@ async def _dispatch_line(client, storage, line: str) -> None:
     elif line == "/queue":
         _paint_queue_panel(force=True)
         if (
-            not _chrome_enabled and not _current_command and not list(_command_queue)
+            not _chrome_enabled
+            and not _current_command
+            and not _current_ib_command
+            and not list(_command_queue)
+            and not list(_ib_command_queue)
         ):  # snapshot
             _repl_print_lines(do_queue_status())
     elif line == "/clear":
@@ -2853,16 +3154,19 @@ async def _dispatch_line(client, storage, line: str) -> None:
 
 
 async def _api_worker(client, storage):
-    """Process queued API/long-running commands (FIFO)."""
+    """Process pair-API queue (neal.fun combine/crawl/etc.) FIFO."""
     global _current_command
     global _bulk_confirm_resolved
     global _skip_summary_shown
     while _command_queue:
-        _reset_cancelled()
+        # Don't clear cancel if IB lane is mid-flight (shared _cancelled flag).
+        if _current_ib_command is None:
+            _reset_cancelled()
         line = _command_queue.pop(0)
         _current_command = line
         _skip_summary_shown = False
         _bulk_confirm_resolved = not _command_may_bulk_confirm(line)
+        _set_job_progress(0, 0)
         _paint_queue_panel()
         _enter_cancel_scope()
         try:
@@ -2875,12 +3179,13 @@ async def _api_worker(client, storage):
                 _repl_print_lines(err)
         finally:
             _current_command = None
-            _paint_queue_panel()
+            _clear_job_chrome()
             _exit_cancel_scope()
             if _cancelled:
                 if _discard_queue_after_cancel:
-                    discarded = len(_command_queue)
+                    discarded = len(_command_queue) + len(_ib_command_queue)
                     _command_queue.clear()
+                    _ib_command_queue.clear()
                     if discarded:
                         msg = f"  {_color(f'Cancelled. Discarded {discarded} queued command(s).', DIM)}"
                         _repl_print_lines(msg)
@@ -2892,32 +3197,94 @@ async def _api_worker(client, storage):
                 _reset_cancelled()
 
 
+async def _ib_worker(client, storage):
+    """Process Infinibrowser queue (import/fill/prune) independently of pair work."""
+    global _current_ib_command
+    global _skip_summary_shown
+    while _ib_command_queue:
+        # Do not reset global cancel if pair lane is mid-flight; only clear when
+        # starting IB work if nothing pair-side is active.
+        if _current_command is None and not _waiting_for_confirm():
+            _reset_cancelled()
+        line = _ib_command_queue.pop(0)
+        _current_ib_command = line
+        _skip_summary_shown = False
+        _set_ib_job_progress(0, 0)
+        _paint_queue_panel()
+        _enter_cancel_scope()
+        try:
+            await _dispatch_line(client, storage, line)
+        except CommandCancelled:
+            pass
+        except Exception as e:
+            if not _cancelled:
+                err = f"  {_color(f'Error: {e}', RED)}"
+                _repl_print_lines(err)
+        finally:
+            _current_ib_command = None
+            _clear_ib_job_chrome()
+            _exit_cancel_scope()
+            if _cancelled:
+                if _discard_queue_after_cancel:
+                    discarded = len(_command_queue) + len(_ib_command_queue)
+                    _command_queue.clear()
+                    _ib_command_queue.clear()
+                    if discarded:
+                        msg = f"  {_color(f'Cancelled. Discarded {discarded} queued command(s).', DIM)}"
+                        _repl_print_lines(msg)
+                    _mark_cancel_notified()
+                    break
+                if not _skip_summary_shown:
+                    msg = f"  {_color('Skipped.', YELLOW)}"
+                    _repl_print_lines(msg)
+                # Only fully reset cancel if pair lane is idle
+                if _current_command is None:
+                    _reset_cancelled()
+
+
 def _ensure_api_worker(client, storage):
     global _api_worker_task
     if _api_worker_task is None or _api_worker_task.done():
         _api_worker_task = asyncio.create_task(_api_worker(client, storage))
 
 
+def _ensure_ib_worker(client, storage):
+    global _ib_worker_task
+    if _ib_worker_task is None or _ib_worker_task.done():
+        _ib_worker_task = asyncio.create_task(_ib_worker(client, storage))
+
+
 def _enqueue_command_line(line: str, client, storage) -> bool:
-    """Append a line to the API queue if allowed. Returns True if enqueued."""
+    """Append a line to the pair or IB queue. Returns True if enqueued."""
     error = _validate_command_line(line)
     if error:
         _repl_print_lines(error)
         return False
-    q = list(_command_queue)  # snapshot to avoid concurrent mod race from worker thread
-    if line in q or line == _current_command:
+    ib = _is_ib_command(line)
+    if ib:
+        q = list(_ib_command_queue)
+        current = _current_ib_command
+    else:
+        q = list(_command_queue)
+        current = _current_command
+    if line in q or line == current:
         msg = f"  {_color('Already queued.', DIM)}"
         _repl_print_lines(msg)
         return False
-    if len(q) >= _MAX_QUEUE_DEPTH:
+    total_pending = len(_command_queue) + len(_ib_command_queue)
+    if total_pending >= _MAX_QUEUE_DEPTH:
         msg = f"  {_color(f'Queue full (max {_MAX_QUEUE_DEPTH}).', YELLOW)}"
         _repl_print_lines(msg)
         return False
-    deferred = _queue_enqueue_deferred()
-    if _current_command is None:
+    deferred = _queue_enqueue_deferred(line)
+    if not ib and _current_command is None:
         _reset_cancelled()
-    _command_queue.append(line)
-    _ensure_api_worker(client, storage)
+    if ib:
+        _ib_command_queue.append(line)
+        _ensure_ib_worker(client, storage)
+    else:
+        _command_queue.append(line)
+        _ensure_api_worker(client, storage)
     if deferred and not _chrome_enabled:
         msg = f"  {_color(f'Queued: {_sanitize_queue_line(line)}', DIM)}"
         _repl_print_lines(msg)
@@ -2926,11 +3293,12 @@ def _enqueue_command_line(line: str, client, storage) -> bool:
 
 
 async def _shutdown_interactive() -> int:
-    """Cancel worker, discard queue, and print goodbye (shared by /quit and interrupts)."""
-    global _cancelled, _command_queue, _api_worker_task
+    """Cancel workers, discard queues, and print goodbye."""
+    global _cancelled, _command_queue, _ib_command_queue, _api_worker_task
     _cancelled = True
-    discarded = len(_command_queue)
+    discarded = len(_command_queue) + len(_ib_command_queue)
     _command_queue.clear()
+    _ib_command_queue.clear()
     await _cancel_and_await_worker(timeout=5.0)
     if discarded:
         msg = f"  Cancelled. Discarded {discarded} queued command(s)."
@@ -2940,36 +3308,58 @@ async def _shutdown_interactive() -> int:
 
 
 async def _cancel_and_await_worker(timeout: float = 2.0) -> None:
-    """Cancel the api worker (if running) and await its completion. Idempotent.
-    Sets the global to None. Used by finally/exit paths and harness to ensure full reap.
-    """
-    global _api_worker_task
-    t = _api_worker_task
-    if t and not t.done():
-        t.cancel()
+    """Cancel pair + IB workers (if running) and await completion. Idempotent."""
+    global _api_worker_task, _ib_worker_task
+    tasks = []
+    for t in (_api_worker_task, _ib_worker_task):
+        if t and not t.done():
+            t.cancel()
+            tasks.append(t)
+    if tasks:
         try:
-            await asyncio.wait_for(t, timeout=timeout)
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True), timeout=timeout
+            )
         except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
             pass
     _api_worker_task = None
+    _ib_worker_task = None
+
+
+async def _rate_ticker_loop() -> None:
+    """Repaint sticky chrome on a short interval so the rate bar refills live."""
+    try:
+        while True:
+            await asyncio.sleep(_RATE_TICK_SECONDS)
+            if _interactive_mode_active:
+                _paint_queue_panel()
+    except asyncio.CancelledError:
+        raise
 
 
 async def interactive_mode():
-    global _command_queue, _current_command, _api_worker_task, _cancelled
+    global _command_queue, _ib_command_queue, _current_command, _current_ib_command
+    global _api_worker_task, _ib_worker_task, _cancelled
     global _confirm_future, _last_queue_snapshot, _queue_panel_height
     global _interactive_mode_active, _confirm_expected, _bulk_confirm_pending
     global _bulk_confirm_resolved, _confirm_answer_buffer
+    global _active_client, _rate_ticker_task
     _interactive_mode_active = True
     _tty_reset_stdin_reader()
     _confirm_expected = False
     _bulk_confirm_pending = False
     _bulk_confirm_resolved = True
     _command_queue = []
+    _ib_command_queue = []
     _current_command = None
+    _current_ib_command = None
     _api_worker_task = None
+    _ib_worker_task = None
     _confirm_future = None
     _last_queue_snapshot = ""
     _queue_panel_height = 0
+    _active_client = None
+    _rate_ticker_task = None
 
     print(_color("=== Infinite Craft CLI ===", BOLD + CYAN))
     print()
@@ -2985,6 +3375,8 @@ async def interactive_mode():
             rate_limit_sleep_step=_RATE_LIMIT_SLEEP_STEP,
             _rate_limit_wait_callback=_rate_limit_wait_callback,
         ) as client:
+            _active_client = client
+            _rate_ticker_task = asyncio.create_task(_rate_ticker_loop())
             starters = "  ".join(format_element(e) for e in storage.get_all()[:4])
             _repl_print_lines(f"  Starting elements: {starters}")
             total = len(storage.get_all())
@@ -2995,8 +3387,9 @@ async def interactive_mode():
                 _paint_queue_panel()
 
                 if (
-                    list(_command_queue) and _current_command is None
-                ):  # snapshot for race safety
+                    (list(_command_queue) and _current_command is None)
+                    or (list(_ib_command_queue) and _current_ib_command is None)
+                ):  # snapshot for race safety — workers about to claim
                     await asyncio.sleep(0)
                     continue
 
@@ -3058,6 +3451,12 @@ async def interactive_mode():
     finally:
         # Best-effort cleanup of worker on any exit (including uncaught exceptions or KI
         # during input) to avoid lingering high-memory processes/threads.
+        if _rate_ticker_task is not None:
+            _rate_ticker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await _rate_ticker_task
+            _rate_ticker_task = None
+        _active_client = None
         await _cancel_and_await_worker()
         _teardown_tty_and_chrome()
         _confirm_future = None
