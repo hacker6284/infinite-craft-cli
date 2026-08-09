@@ -837,6 +837,52 @@ export func is_local_command(line: text) -> bool
         return true
     return false
 
+// Infinibrowser-backed long commands — independent host queue from pair API.
+export func is_ib_command(line: text) -> bool
+    if line == "/import" or strings.starts_with(line, "/import ")
+        return true
+    if line == "/fill" or strings.starts_with(line, "/fill ")
+        return true
+    if line == "/prune" or strings.starts_with(line, "/prune ")
+        return true
+    return false
+
+// Host queue routing: "local" | "ib" | "pair".
+// Local runs immediately; ib and pair are independent FIFO workers.
+export func command_queue_lane(line: text) -> text
+    if is_local_command(line)
+        return "local"
+    if is_ib_command(line)
+        return "ib"
+    return "pair"
+
+// Bulk-confirm gate (hosts prompt when pair count exceeds threshold).
+export func may_bulk_confirm(line: text) -> bool
+    s = strip_spaces(line)
+    end = 0
+    while end < s.length and not is_ascii_space(s[end])
+        end = end + 1
+    head = text_slice(s, 0, end)
+    return head == "/permutate" or head == "/permute" or head == "/exhaust" or head == "/cross" or head == "/with" or head == "/crawl"
+
+// /target pure rules — hosts own session state and confirm UI.
+// parse_target_arg returns (action, name) with action in {"show","clear","set"}.
+// name is non-empty only for "set" (already sanitize_element_name'd).
+export func parse_target_arg(arg: text) -> (text, text)
+    rest = strip_spaces(arg)
+    if rest.length == 0
+        return ("show", "")
+    low = ascii_lower_text(rest)
+    if low == "clear" or low == "off" or low == "none" or low == "-"
+        return ("clear", "")
+    return ("set", sanitize_element_name(rest))
+
+// Exact name match; empty target or empty result is never a hit.
+export func is_target_hit(target: text, result_name: text) -> bool
+    if target.length == 0 or result_name.length == 0
+        return false
+    return target == result_name
+
 export func is_slash_command_attempt(line: text) -> bool
     // Port of re.match(r"/[^/]+/", line) then re.match(r"/\w", line).
     if line.length == 0 or line[0] != '/'
@@ -1483,6 +1529,41 @@ test "is_local_command parity"
     assert not is_local_command("/prune")
     assert not is_local_command("/permutate w*")
     assert not is_local_command("Water + Fire")
+
+test "queue lane and target pure rules"
+    assert is_ib_command("/import")
+    assert is_ib_command("/import Steam")
+    assert is_ib_command("/fill")
+    assert is_ib_command("/prune")
+    assert not is_ib_command("/combine Water Fire")
+    assert not is_ib_command("/permutate w*")
+    assert not is_ib_command("/help")
+    assert command_queue_lane("/help") == "local"
+    assert command_queue_lane("/target Steam") == "local"
+    assert command_queue_lane("/fill") == "ib"
+    assert command_queue_lane("/import X") == "ib"
+    assert command_queue_lane("/permutate w*") == "pair"
+    assert command_queue_lane("Water + Fire") == "pair"
+    assert may_bulk_confirm("/permutate w*")
+    assert may_bulk_confirm("/exhaust fire*")
+    assert may_bulk_confirm("/with Water fire*")
+    assert not may_bulk_confirm("/combine Water Fire")
+    assert not may_bulk_confirm("/fill")
+    act, name = parse_target_arg("")
+    assert act == "show"
+    assert name == ""
+    act, name = parse_target_arg("  clear  ")
+    assert act == "clear"
+    assert name == ""
+    act, name = parse_target_arg("off")
+    assert act == "clear"
+    act, name = parse_target_arg("Steam")
+    assert act == "set"
+    assert name == "Steam"
+    assert is_target_hit("Steam", "Steam")
+    assert not is_target_hit("Steam", "steam")
+    assert not is_target_hit("", "Steam")
+    assert not is_target_hit("Steam", "")
 
 test "parse_query_filter parity"
     p, ex, on = parse_query_filter("!fire*")

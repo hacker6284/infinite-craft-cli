@@ -90,10 +90,6 @@ _interactive_mode_active: bool = False
 _confirm_expected: bool = False
 _bulk_confirm_pending: bool = False
 _bulk_confirm_resolved: bool = True
-_BULK_CONFIRM_COMMANDS = frozenset(
-    {"/permutate", "/permute", "/exhaust", "/cross", "/with", "/crawl"}
-)
-
 # TTY chrome: streaming output scrolls above a pinned queue + prompt (trainer.js layout).
 _chrome_enabled: bool = False
 _chrome_prompt: str = ""
@@ -1911,7 +1907,7 @@ def _format_pair_for_width(a: str, b: str, avail: int) -> str:
 
 
 def _command_may_bulk_confirm(line: str) -> bool:
-    return line.split()[0] in _BULK_CONFIRM_COMMANDS
+    return craft.may_bulk_confirm(line)
 
 
 def _awaiting_bulk_confirm_setup() -> bool:
@@ -2802,10 +2798,6 @@ _API_SLASH_COMMANDS = (
     "/cross",
 )
 
-# Infinibrowser / non-pair long work — independent queue from neal.fun pair API.
-_IB_QUEUE_COMMANDS = frozenset({"/import", "/fill", "/prune"})
-
-
 def _is_local_command(line: str) -> bool:
     """Commands that run immediately without queuing behind API work."""
     return craft.is_local_command(line)
@@ -2813,36 +2805,36 @@ def _is_local_command(line: str) -> bool:
 
 def _is_ib_command(line: str) -> bool:
     """True when the line is an Infinibrowser-backed long command (own queue)."""
-    if not line:
-        return False
-    head = line.split()[0]
-    return head in _IB_QUEUE_COMMANDS
+    return bool(line) and craft.is_ib_command(line)
+
+
+def _command_queue_lane(line: str) -> str:
+    """Kernel lane: ``local`` | ``ib`` | ``pair``."""
+    return craft.command_queue_lane(line)
 
 
 def _is_target_hit(result_name: str | None) -> bool:
     """True when a combination result matches the active /target name (exact)."""
     if not result_name or _target_element is None:
         return False
-    return result_name == _target_element
+    return craft.is_target_hit(_target_element, result_name)
 
 
 def do_target(arg: str) -> str:
-    """Set, clear, or show the combination target element."""
+    """Set, clear, or show the combination target element (rules in kernel)."""
     global _target_element
-    rest = arg.strip()
-    if not rest:
+    action, name = craft.parse_target_arg(arg)
+    if action == "show":
         if _target_element is None:
             return f"  No target set. Usage: {_color('/target <element>', YELLOW)}"
         return f"  Target: {_color(_target_element, BOLD + YELLOW)}"
-    if rest.lower() in ("clear", "off", "none", "-"):
+    if action == "clear":
         prev = _target_element
         _target_element = None
         if prev is None:
             return "  No target was set."
         return f"  Target cleared (was {_color(prev, YELLOW)})."
-    # Normalize like other element args (title-case / resolve is deferred to compare
-    # against API result names as returned).
-    name = _sanitize_element_name(rest)
+    # action == "set"
     _target_element = name
     return f"  Target set: {_color(name, BOLD + YELLOW)} — batch work pauses when this is crafted."
 
@@ -3351,7 +3343,8 @@ def _enqueue_command_line(line: str, client, storage) -> bool:
     if error:
         _repl_print_lines(error)
         return False
-    ib = _is_ib_command(line)
+    lane = _command_queue_lane(line)
+    ib = lane == "ib"
     if ib:
         q = list(_ib_command_queue)
         current = _current_ib_command

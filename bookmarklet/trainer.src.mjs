@@ -28,6 +28,10 @@ import {
   sanitize_element_name as sanitizeElementName,
   unfilled_names_boundary as unfilledNamesBoundary,
   is_local_command as isLocalCommand,
+  is_ib_command as isIbCommandKernel,
+  command_queue_lane as commandQueueLane,
+  parse_target_arg as parseTargetArg,
+  is_target_hit as isTargetHitKernel,
   is_slash_command_attempt as isSlashCommandAttempt,
   classify_command_line as classifyCommandLine,
   validate_command_line_segments as validateCommandLineSegments,
@@ -530,20 +534,14 @@ function endRun() {
   }
 }
 
-/** Infinibrowser-backed long commands — independent of the pair-API queue. */
+/** Infinibrowser-backed long commands — independent of the pair-API queue (kernel). */
 function isIbCommand(line) {
-  const cmd = (line || "").trim().split(/\s+/)[0];
-  return cmd === "/import" || cmd === "/fill" || cmd === "/prune";
-}
-
-function isLocalCommandHost(line) {
-  if (line === "/target" || line.startsWith("/target ")) return true;
-  return isLocalCommand(line);
+  return !!(line && isIbCommandKernel(line));
 }
 
 function doTarget(arg) {
-  const rest = (arg || "").trim();
-  if (!rest) {
+  const [action, name] = parseTargetArg(arg || "");
+  if (action === "show") {
     if (!targetElement) {
       print(`  No target set. Usage: ${yellow("/target <element>")}`);
       return;
@@ -551,7 +549,7 @@ function doTarget(arg) {
     print(`  Target: ${bold(yellow(esc(targetElement)))}`);
     return;
   }
-  if (["clear", "off", "none", "-"].includes(rest.toLowerCase())) {
+  if (action === "clear") {
     const prev = targetElement;
     targetElement = null;
     if (!prev) print("  No target was set.");
@@ -559,13 +557,15 @@ function doTarget(arg) {
     updateChrome();
     return;
   }
-  targetElement = rest;
+  // set
+  targetElement = name;
   print(`  Target set: ${bold(yellow(esc(targetElement)))} — batch work pauses when this is crafted.`);
   updateChrome();
 }
 
 function isTargetHit(resultName) {
-  return !!(resultName && targetElement && resultName === targetElement);
+  if (!resultName || !targetElement) return false;
+  return isTargetHitKernel(targetElement, resultName);
 }
 
 /** Pause for y/n after target hit. Returns true if batch should stop. */
@@ -730,7 +730,7 @@ function waitForConfirmKey() {
           e.stopImmediatePropagation();
           return; // blank Enter ignored
         }
-        if (isLocalCommandHost(val)) return; // main handler runs locals
+        if (isLocalCommand(val)) return; // main handler runs locals
         e.preventDefault();
         e.stopImmediatePropagation();
         if (input) input.value = "";
@@ -1449,7 +1449,8 @@ function totalPending() {
 }
 
 function enqueueCommand(line) {
-  const ib = isIbCommand(line);
+  const lane = commandQueueLane(line);
+  const ib = lane === "ib";
   const laneBusy = ib
     ? (ibWorkerRunning || currentIbCommand !== null)
     : (pairWorkerRunning || currentPairCommand !== null || waitingForConfirm);
@@ -1467,7 +1468,8 @@ function tryEnqueue(line) {
     print(renderErrorSegments(errorSegments));
     return false;
   }
-  const ib = isIbCommand(line);
+  const lane = commandQueueLane(line);
+  const ib = lane === "ib";
   if (ib) {
     if (line === currentIbCommand || ibQueue.includes(line)) {
       print("  " + dim("Already queued."));
@@ -1652,7 +1654,7 @@ async function executeCommand(line) {
 }
 
 async function dispatch(line) {
-  if (isLocalCommandHost(line)) {
+  if (isLocalCommand(line)) {
     await executeCommand(line);
     return;
   }
@@ -1787,7 +1789,7 @@ function initBrowserUI() {
     // During confirm the capture handler owns y/n/Esc/API enqueue; allow
     // local commands (e.g. /search, /list) through here on Enter.
     if (waitingForConfirm) {
-      if (e.key !== "Enter" || !isLocalCommandHost(input.value.trim())) return;
+      if (e.key !== "Enter" || !isLocalCommand(input.value.trim())) return;
     }
     if (e.key === "Enter") {
       const line = input.value.trim();
