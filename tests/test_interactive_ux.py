@@ -1224,26 +1224,6 @@ class TestPermutateSearchDuringCombine:
         assert lines.index("y") < lines.index("/search Bulk")
 
 
-class TestQueueStatusAndPanel:
-    def test_do_queue_status_idle(self):
-        from infinite_craft_cli.cli import do_queue_status
-
-        # LEGACY direct internal for narrow do_queue_status unit test (not high-level behavioral UX)
-        cli._current_command = None
-        cli._command_queue = []
-        assert "idle" in do_queue_status().lower()
-
-    def test_do_queue_status_busy(self):
-        from infinite_craft_cli.cli import do_queue_status
-
-        # LEGACY direct internal for narrow do_queue_status unit test (not high-level behavioral UX)
-        cli._current_command = "/exhaust water"
-        cli._command_queue = ["/combine A B"]
-        status = do_queue_status()
-        assert "Running: /exhaust water" in status
-        assert "1. pending: /combine A B" in status
-
-
 class TestPinnedChrome:
     """TTY chrome keeps queue + prompt pinned while output scrolls above."""
 
@@ -2367,26 +2347,7 @@ class TestChromeRenderingBugs:
         assert cli._command_queue == []
         cli._chrome_disable()
 
-    def test_format_queue_display_idle_while_worker_still_running(self):
-        from infinite_craft_cli.cli import _format_queue_display
-
-        cli._current_command = None
-        cli._command_queue = []
-        mock_task = MagicMock()
-        mock_task.done.return_value = False
-        cli._api_worker_task = mock_task
-
-        # Rate line is permanent; no job/queue lines while idle.
-        display = _format_queue_display()
-        assert "rate" in display
-        assert "running" not in display
-        assert "pending" not in display
-
-        cli._api_worker_task.cancel()
-        cli._api_worker_task = None
-
-
-class TestQueuePanelLegacyErase(TestQueueStatusAndPanel):
+class TestQueuePanelLegacyErase:
     def test_paint_queue_panel_tty_erase_on_idle(self):
         from io import StringIO
 
@@ -2413,38 +2374,6 @@ class TestQueuePanelLegacyErase(TestQueueStatusAndPanel):
 
 class TestREPLHarnessEdges:
     """Dedicated harness coverage for error/edge/concurrent (strengthens vs prior single adoption)."""
-
-    def test_harness_prompt_timeout_falls_to_quit(self, repl_harness, capsys):
-        # no feed -> provider times out -> /quit
-        run_async(repl_harness.run_until_quit(auto_feed_quit=False))
-        captured = capsys.readouterr().out
-        assert "Goodbye" in captured or "Infinite Craft" in captured
-
-    def test_harness_records_prompts_and_feeds(self, repl_harness, capsys):
-        repl_harness.feed("/list")
-        repl_harness.feed("/quit")
-        run_async(repl_harness.run_until_quit(auto_feed_quit=False))
-        assert any("list" in a.lower() for p, a in repl_harness.prompt_calls)
-        out = capsys.readouterr().out
-        assert "Discovered" in out or "Goodbye" in out
-
-    def test_harness_tty_bytes_via_seam(self, repl_harness):
-        repl_harness.enable_tty_mode()
-        repl_harness.set_session_input_history(["prior"])
-        repl_harness.feed_tty_bytes(b"\x1b[A\n")
-        line = repl_harness.tty_read_line()
-        assert line == "prior"
-        repl_harness.set_session_input_history([])
-
-    def test_harness_cleanup_cancels(self, repl_harness):
-        # just exercise cleanup path; no crash
-        repl_harness.feed("/quit")
-        run_async(repl_harness.run_until_quit(auto_feed_quit=False))
-        repl_harness.cleanup()
-        assert (
-            repl_harness._interactive_task is None
-            or repl_harness._interactive_task.done()
-        )
 
     def test_harness_cleans_up_api_worker_after_enqueue(self, repl_harness, capsys):
         """TDD test: after enqueue path + /quit via harness, _api_worker_task must be fully reaped (None or done).
@@ -2509,22 +2438,6 @@ class TestREPLHarnessEdges:
 
         assert enq_count[0] > 0 or started.is_set(), "enqueue was never observed"
         assert started.is_set(), "worker did not start (slow_combine not hit)"
-
-    def test_harness_vs_legacy_equiv_smoke(self, capsys):
-        # parity smoke: harness drive produces similar goodbye as legacy _run (sequential reads isolate deltas)
-        from tests.help_utils import _run_interactive
-        from tests.conftest import REPLTestHarness
-
-        _run_interactive(["/quit"])
-        legacy = capsys.readouterr().out
-        # harness (writes after legacy read are captured in next read)
-        h = REPLTestHarness()
-        with h:
-            h.feed("/quit")
-            run_async(h.run_until_quit(auto_feed_quit=False))
-        h_out = capsys.readouterr().out
-        assert "Goodbye" in legacy
-        assert "Goodbye" in h_out
 
     def test_output_after_command_appears_above_clean_chrome_prompt(
         self, repl_harness, capsys

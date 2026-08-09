@@ -60,12 +60,6 @@ def make_mock_client():
     return client
 
 
-# Keep for backwards compat
-def make_mock_game(discoveries=None):
-    """Deprecated: use make_mock_storage() and make_mock_client() instead."""
-    return make_mock_storage(discoveries)
-
-
 @pytest.fixture(autouse=True)
 def reset_cli_globals(request):
     """Reset module-level CLI state that can leak between tests.

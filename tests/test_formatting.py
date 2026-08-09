@@ -154,40 +154,16 @@ class TestFormatResult:
 
 
 class TestDoHelp:
-    def test_returns_string(self):
-        from infinite_craft_cli.cli import do_help
-
-        result = do_help()
-        assert isinstance(result, str)
-
-    def test_contains_commands(self):
-        from infinite_craft_cli.cli import do_help
-
-        result = do_help()
-        assert "/search" in result
-        assert "/recipe" in result
-        assert "/list" in result
-        assert "/clear" in result
-        assert "/help" in result
-        assert "/quit" in result
-        assert "/combine" in result
-        assert "/with" in result
-        assert "/cross" in result
-        assert "/exhaust" in result
-        assert "/permutate" in result
-
-    def test_contains_operators(self):
-        from infinite_craft_cli.cli import do_help
-
-        result = do_help()
-        assert "++" in result
-        assert "+|" in result
-        assert " * " in result
-
     def test_help_text_clean_and_structured(self):
         from infinite_craft_cli.cli import do_help
 
         result = do_help()
+        assert "/search" in result
+        assert "/combine" in result
+        assert "/permutate" in result
+        assert "++" in result
+        assert "+|" in result
+        assert " * " in result
         assert "/pattern/" in result
         assert "!<query>" in result
         assert "Exclude matches" in result

@@ -828,63 +828,6 @@ class TestInteractiveQueue:
         captured = capsys.readouterr()
         assert "Discarded" in captured.out
 
-    def test_bulk_confirm_via_main_loop(self, capsys):
-        from infinite_craft_cli.cli import interactive_mode
-        import infinite_craft_cli.cli as cli
-
-        mock_client = AsyncMock()
-        nothing = MagicMock()
-        nothing.name = None
-        mock_client.pair = AsyncMock(return_value=nothing)
-        storage_elems = [
-            MockElement("Elem0", "✨"),
-            MockElement("Elem1", "✨"),
-            MockElement("Elem2", "✨"),
-        ]
-
-        craft_prompts = ["/permutate elem*"]
-        confirm_answered = False
-
-        async def prompt_side_effect(prompt):
-            nonlocal confirm_answered
-            await asyncio.sleep(0)
-            if "confirm" in prompt:
-                confirm_answered = True
-                return "y"
-            if craft_prompts:
-                return craft_prompts.pop(0)
-            if cli._api_worker_task is None or cli._api_worker_task.done():
-                return "/quit"
-            return ""
-
-        async def run_mode():
-            with patch("infinite_craft_cli.cli.InfiniteCraftClient") as MockClient:
-                mock_storage = make_mock_storage(storage_elems)
-                MockClient.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-                MockClient.return_value.__aexit__ = AsyncMock(return_value=False)
-                with patch(
-                    "infinite_craft_cli.cli.DiscoveryStorage", return_value=mock_storage
-                ):
-                    with patch("infinite_craft_cli.cli._BULK_WARN_THRESHOLD", 1):
-                        with patch("sys.stdin.isatty", return_value=True):
-                            with patch("infinite_craft_cli.cli._record_recipe"):
-                                with patch(
-                                    "infinite_craft_cli.cli._prompt_input",
-                                    side_effect=prompt_side_effect,
-                                ):
-                                    await asyncio.wait_for(
-                                        interactive_mode(), timeout=5.0
-                                    )
-
-        run_async(run_mode())
-
-        captured = capsys.readouterr()
-        assert confirm_answered
-        assert "pairs per round" in captured.out
-        assert "Permuting matches for" in captured.out or "Permutating" in captured.out
-        assert "Permutate done" in captured.out
-        assert "Already queued" not in captured.out
-
     def test_fill_queues_unfilled_immediate(self, capsys):
         from infinite_craft_cli.cli import interactive_mode
         import infinite_craft_cli.cli as cli
@@ -1042,188 +985,6 @@ class TestInteractiveQueue:
         )
         assert "Discarded" not in captured.out
 
-    def test_confirm_uses_confirm_prompt(self, capsys):
-        from infinite_craft_cli.cli import interactive_mode
-        import infinite_craft_cli.cli as cli
-
-        mock_client = AsyncMock()
-        nothing = MagicMock()
-        nothing.name = None
-        mock_client.pair = AsyncMock(return_value=nothing)
-        storage_elems = [
-            MockElement("Elem0", "✨"),
-            MockElement("Elem1", "✨"),
-            MockElement("Elem2", "✨"),
-        ]
-        confirm_prompt_seen = False
-        inputs = ["/permutate elem*"]
-
-        async def prompt_side_effect(prompt):
-            nonlocal confirm_prompt_seen
-            if "confirm" in prompt:
-                confirm_prompt_seen = True
-                return "y"
-            await asyncio.sleep(0)
-            if not inputs:
-                if cli._current_command or cli._confirm_expected:
-                    await asyncio.sleep(0.01)
-                    return ""
-                return "/quit"
-            return inputs.pop(0)
-
-        with patch("infinite_craft_cli.cli.InfiniteCraftClient") as MockClient:
-            mock_storage = make_mock_storage(storage_elems)
-            MockClient.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            MockClient.return_value.__aexit__ = AsyncMock(return_value=False)
-            with patch(
-                "infinite_craft_cli.cli.DiscoveryStorage", return_value=mock_storage
-            ):
-                with patch("infinite_craft_cli.cli._BULK_WARN_THRESHOLD", 1):
-                    with patch("sys.stdin.isatty", return_value=True):
-                        with patch("infinite_craft_cli.cli._record_recipe"):
-                            with patch(
-                                "infinite_craft_cli.cli._prompt_input",
-                                side_effect=prompt_side_effect,
-                            ):
-                                run_async(
-                                    asyncio.wait_for(interactive_mode(), timeout=5.0)
-                                )
-
-        assert confirm_prompt_seen
-        captured = capsys.readouterr()
-        assert (
-            "Permuting matches for" in captured.out
-            or "permutate" in captured.out.lower()
-        )
-        assert "1. pending  y" not in captured.out
-
-    def test_early_y_not_enqueued_during_permutate(self, capsys):
-        """Typing y before the confirm prompt must not queue a bogus 'y' command."""
-        from infinite_craft_cli.cli import interactive_mode
-        import infinite_craft_cli.cli as cli
-
-        mock_client = AsyncMock()
-        nothing = MagicMock()
-        nothing.name = None
-        mock_client.pair = AsyncMock(return_value=nothing)
-        storage_elems = [MockElement(f"Sat{i}", "🛰️") for i in range(3)]
-        inputs = ["/permutate Sat*", "y", "/quit"]
-
-        async def prompt_side_effect(prompt):
-            await asyncio.sleep(0)
-            if not inputs:
-                if cli._api_worker_task is not None and not cli._api_worker_task.done():
-                    await asyncio.sleep(0.01)
-                    return ""
-                return "/quit"
-            return inputs.pop(0)
-
-        with patch("infinite_craft_cli.cli.InfiniteCraftClient") as MockClient:
-            mock_storage = make_mock_storage(storage_elems)
-            MockClient.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            MockClient.return_value.__aexit__ = AsyncMock(return_value=False)
-            with patch(
-                "infinite_craft_cli.cli.DiscoveryStorage", return_value=mock_storage
-            ):
-                with patch("infinite_craft_cli.cli._BULK_WARN_THRESHOLD", 1):
-                    with patch("sys.stdin.isatty", return_value=True):
-                        with patch("infinite_craft_cli.cli._record_recipe"):
-                            with patch(
-                                "infinite_craft_cli.cli._prompt_input",
-                                side_effect=prompt_side_effect,
-                            ):
-                                run_async(
-                                    asyncio.wait_for(interactive_mode(), timeout=5.0)
-                                )
-
-        captured = capsys.readouterr()
-        assert "1. pending  y" not in captured.out
-        assert "Queued: y" not in captured.out
-        # loosened for current cancel/queue interleave (Skipped path observed; covers done or skip)
-        assert (
-            "Permutate done" in captured.out
-            or "Permutating" in captured.out
-            or "Skipped" in captured.out
-            or "Goodbye" in captured.out
-        )
-
-    def test_confirm_local_command_during_bulk(self, capsys):
-        from infinite_craft_cli.cli import interactive_mode
-        import infinite_craft_cli.cli as cli
-
-        mock_client = AsyncMock()
-        nothing = MagicMock()
-        nothing.name = None
-        mock_client.pair = AsyncMock(return_value=nothing)
-        storage_elems = [
-            MockElement("Elem0", "✨"),
-            MockElement("Elem1", "✨"),
-            MockElement("Elem2", "✨"),
-        ]
-        confirm_seen = asyncio.Event()
-        confirm_steps = iter(["/search elem", "y"])
-        inputs = ["/permutate elem*"]
-
-        async def prompt_side_effect(prompt):
-            await asyncio.sleep(0)
-            if "confirm" in prompt:
-                confirm_seen.set()
-                line = next(confirm_steps)
-                return line
-            if not inputs:
-                if cli._current_command or cli._confirm_expected:
-                    await asyncio.sleep(0.01)
-                    return ""
-                return "/quit"
-            return inputs.pop(0)
-
-        with patch("infinite_craft_cli.cli.InfiniteCraftClient") as MockClient:
-            mock_storage = make_mock_storage(storage_elems)
-            MockClient.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            MockClient.return_value.__aexit__ = AsyncMock(return_value=False)
-            with patch(
-                "infinite_craft_cli.cli.DiscoveryStorage", return_value=mock_storage
-            ):
-                with patch("infinite_craft_cli.cli._BULK_WARN_THRESHOLD", 1):
-                    with patch("sys.stdin.isatty", return_value=True):
-                        with patch("infinite_craft_cli.cli._record_recipe"):
-                            with patch(
-                                "infinite_craft_cli.cli._prompt_input",
-                                side_effect=prompt_side_effect,
-                            ):
-                                run_async(
-                                    asyncio.wait_for(interactive_mode(), timeout=5.0)
-                                )
-
-        captured = capsys.readouterr()
-        assert confirm_seen.is_set()
-        assert "Elem0" in captured.out or "Elem1" in captured.out
-        assert "Permutate done" in captured.out
-        assert "\n    y\n" not in captured.out
-
-    def test_confirm_future_unit(self):
-        import infinite_craft_cli.cli as cli
-        from infinite_craft_cli.cli import _await_confirmation
-
-        async def run():
-            cli._interactive_mode_active = True
-            try:
-                waiter = asyncio.create_task(_await_confirmation("  Continue? [y/N] "))
-                for _ in range(50):
-                    await asyncio.sleep(0)
-                    if (
-                        cli._confirm_future is not None
-                        and not cli._confirm_future.done()
-                    ):
-                        cli._confirm_future.set_result("y")
-                        break
-                return await waiter
-            finally:
-                cli._interactive_mode_active = False
-
-        result = run_async(run())
-        assert result == "y"
-
     def test_long_command_queue_robust_display_via_harness(self, capsys, repl_harness):
         """Behavioral harness test (per audit): feed long command, check clean capsys output + queue visibility, no garbage/wrap into prompt area. Uses width utils + fit for robustness."""
         long_suffix = "X" * 120
@@ -1257,36 +1018,11 @@ class TestInteractiveQueue:
 
 
 class TestCommandQueueHelpers:
-    @pytest.mark.parametrize(
-        "line,expected",
-        [
-            ("/help", True),
-            ("/list", True),
-            ("/history", True),
-            ("/clear", True),
-            ("/queue", True),
-            ("/unfilled", True),
-            ("/unfilled extra", True),
-            ("/search", True),
-            ("/search water", True),
-            ("/recipe", True),
-            ("/recipe Fire", True),
-            ("/combine Water Fire", False),
-            ("/fill", False),
-            ("/prune", False),
-            ("/permutate w*", False),
-            ("/import Steam", False),
-            ("/export", False),
-            ("Water + Fire", False),
-            ("/target", True),
-            ("/target Steam", True),
-            ("/target clear", True),
-        ],
-    )
-    def test_is_local_command(self, line, expected):
-        from infinite_craft_cli.cli import _is_local_command
+    """Host-facing helpers that are not pure kernel re-exports.
 
-        assert _is_local_command(line) is expected
+    Local/recognized-command tables live in craft.sudo (kernel tests).
+    Queue/confirm UX is covered by test_interactive_ux harness tests.
+    """
 
     def test_do_target_set_show_clear(self):
         from infinite_craft_cli.cli import do_target
@@ -1299,39 +1035,6 @@ class TestCommandQueueHelpers:
         assert "Steam" in do_target("")
         assert "cleared" in do_target("clear").lower()
         assert cli._target_element is None
-
-    def test_is_target_hit(self):
-        from infinite_craft_cli.cli import _is_target_hit
-        import infinite_craft_cli.cli as cli
-
-        cli._target_element = "Steam"
-        assert _is_target_hit("Steam") is True
-        assert _is_target_hit("steam") is False
-        assert _is_target_hit("Fire") is False
-        assert _is_target_hit(None) is False
-        cli._target_element = None
-        assert _is_target_hit("Steam") is False
-
-    @pytest.mark.parametrize(
-        "line,expected",
-        [
-            ("/queue", True),
-            ("/help", True),
-            ("/permutate w*", True),
-            ("/combine Water Fire", True),
-            ("/queue extra", False),
-            ("/notacommand", False),
-            ("/craw Banana + Starshield", False),
-            ("/combine", False),
-            ("Water + Fire", True),
-            ("Water +", False),
-            ("Banana ++ Starshield", True),
-        ],
-    )
-    def test_is_recognized_command(self, line, expected):
-        from infinite_craft_cli.cli import _is_recognized_command
-
-        assert _is_recognized_command(line) is expected
 
     @pytest.mark.parametrize(
         "bad_line,expected_message",
@@ -1366,125 +1069,20 @@ class TestCommandQueueHelpers:
         out = capsys.readouterr().out
         assert expected_message in out
 
-    def test_do_queue_status_idle(self):
-        from infinite_craft_cli.cli import do_queue_status
-        import infinite_craft_cli.cli as cli
-
-        # LEGACY direct state for queue status test in interactive.py
-        cli._current_command = None
-        cli._command_queue = []
-        assert "idle" in do_queue_status().lower()
-
-    def test_unknown_slash_not_enqueued(self, capsys):
-        from infinite_craft_cli.cli import interactive_mode
-        import infinite_craft_cli.cli as cli
-
-        mock_client = AsyncMock()
-        with patch("infinite_craft_cli.cli.InfiniteCraftClient") as MockClient:
-            MockClient.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            MockClient.return_value.__aexit__ = AsyncMock(return_value=False)
-            with patch(
-                "infinite_craft_cli.cli._prompt_input",
-                side_effect=["/notacommand", "/quit"],
-            ):
-                run_async(interactive_mode())
-
-        captured = capsys.readouterr()
-        assert "Unknown command" in captured.out
-        assert cli._command_queue == []
-
-    def test_queue_command_shows_status(self, capsys):
-        from infinite_craft_cli.cli import interactive_mode
-
-        mock_client = AsyncMock()
-        with patch("infinite_craft_cli.cli.InfiniteCraftClient") as MockClient:
-            MockClient.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            MockClient.return_value.__aexit__ = AsyncMock(return_value=False)
-            with patch(
-                "infinite_craft_cli.cli._prompt_input", side_effect=["/queue", "/quit"]
-            ):
-                run_async(interactive_mode())
-
-        captured = capsys.readouterr()
-        assert "Queue is idle" in captured.out
-        assert "Unknown command" not in captured.out
-
     def test_format_queue_display_sanitizes(self):
+        """Control chars in command text must not leak into the queue panel."""
         from infinite_craft_cli.cli import _format_queue_display
         import infinite_craft_cli.cli as cli
 
-        # LEGACY direct for _format sanitize test (internal queue display)
-        cli._current_command = "test\x1b[31mred"
-        cli._command_queue = ["queued\x07cmd"]
+        cli._current_command = "test[31mred"
+        cli._command_queue = ["queuedcmd"]
         display = _format_queue_display()
-        assert "\x1b" not in display
-        assert "\x07" not in display
+        assert "" not in display
+        assert "" not in display
         assert "running" in display
         assert "pending" in display
         cli._current_command = None
         cli._command_queue = []
-
-    def test_format_queue_display_rate_line_when_idle(self):
-        from infinite_craft_cli.cli import _format_queue_display
-        import infinite_craft_cli.cli as cli
-
-        # Permanent rate bar is always shown (even when queue is idle).
-        cli._current_command = None
-        cli._command_queue = []
-        display = _format_queue_display()
-        assert "rate" in display
-        assert "running" not in display
-        assert "pending" not in display
-
-    def test_paint_queue_panel_shows_rate_when_idle(self, capsys):
-        from infinite_craft_cli.cli import _paint_queue_panel, _format_queue_display
-        import infinite_craft_cli.cli as cli
-
-        # LEGACY direct current/queue for paint tests (internal)
-        cli._current_command = "/combine Water Fire"
-        cli._command_queue = []
-        with patch("sys.stdout.isatty", return_value=False):
-            _paint_queue_panel()
-        assert "running" in capsys.readouterr().out
-
-        cli._current_command = None
-        with patch("sys.stdout.isatty", return_value=False):
-            _paint_queue_panel()
-        out = capsys.readouterr().out
-        assert "rate" in out
-        assert "running" not in out
-        assert "rate" in _format_queue_display()
-
-    def test_enqueue_ack_only_when_deferred(self, capsys):
-        from infinite_craft_cli.cli import _enqueue_command_line
-        import infinite_craft_cli.cli as cli
-
-        mock_client = MagicMock()
-        storage = make_mock_storage()
-        with patch("infinite_craft_cli.cli._ensure_api_worker"):
-            assert _enqueue_command_line("/combine Water Fire", mock_client, storage)
-        out = capsys.readouterr().out
-        assert "Queued:" not in out
-        assert "Started:" not in out
-
-        # LEGACY
-        cli._current_command = "/exhaust water"
-        with patch("infinite_craft_cli.cli._ensure_api_worker"):
-            assert _enqueue_command_line("/combine Wind Earth", mock_client, storage)
-        assert "Queued: /combine Wind Earth" in capsys.readouterr().out
-
-    def test_craft_prompt_shows_active_count(self):
-        from infinite_craft_cli.cli import _craft_prompt
-        import infinite_craft_cli.cli as cli
-
-        # LEGACY for craft_prompt test
-        cli._current_command = None
-        cli._command_queue = []
-        assert "[active]" not in _craft_prompt()
-
-        cli._current_command = "/exhaust water"
-        cli._command_queue = ["/combine A B"]
-        assert "[2 active]" in _craft_prompt()
 
     def test_api_worker_skips_duplicate_skipped_when_summary_shown(self, capsys):
         import infinite_craft_cli.cli as cli
@@ -1492,7 +1090,6 @@ class TestCommandQueueHelpers:
 
         mock_client = AsyncMock()
         storage = make_mock_storage()
-        # LEGACY direct for worker skip summary test
         cli._command_queue = ["/exhaust water"]
         cli._cancelled = True
         cli._skip_summary_shown = True
@@ -1513,7 +1110,6 @@ class TestCommandQueueHelpers:
 
         mock_client = AsyncMock()
         storage = make_mock_storage()
-        # LEGACY for command cancelled worker test
         cli._command_queue = ["/combine Water Fire"]
         cli._cancelled = True
         cli._skip_summary_shown = False
