@@ -12,9 +12,6 @@ import {
   resolveElement,
   recordRecipe,
   traceRecipeCore,
-  exportIncludedCore,
-  _resetStateForParity,
-  _getRecipeIndexForParity,
 } from "../../bookmarklet/trainer.src.mjs";
 // Pure command helpers: the trainer imports these from the kernel unchanged,
 // so driving the kernel adapter directly exercises the same code path.
@@ -33,7 +30,23 @@ import {
   ic_save_to_batches,
   lineage_steps_to_batches,
   build_export_items_boundary,
+  export_elements_boundary,
 } from "../../bookmarklet/_sudo/craft.mjs";
+
+// Parity-only helpers: trainer installs seeders on globalThis when loaded
+// under Node (not exported on the production API surface).
+const _parity = globalThis.__IC_TRAINER_PARITY__;
+if (!_parity || typeof _parity.resetState !== "function" || typeof _parity.getRecipeIndex !== "function") {
+  throw new Error(
+    "trainer parity hooks missing; expected Node install of globalThis.__IC_TRAINER_PARITY__"
+  );
+}
+function _resetStateForParity(elements, recipes) {
+  _parity.resetState(elements, recipes);
+}
+function _getRecipeIndexForParity() {
+  return _parity.getRecipeIndex();
+}
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIXTURES_PATH = join(__dirname, "fixtures.json");
@@ -123,7 +136,7 @@ function runScenario(scenario, fixtures) {
   }
 
   if (op === "export") {
-    const included = exportIncludedCore();
+    const included = export_elements_boundary(elements, recipes);
     return included
       .map(([n, em, f]) => [n, em || "", !!f])
       .sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));

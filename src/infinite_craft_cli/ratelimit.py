@@ -46,13 +46,13 @@ class RateLimiter:
         if freed:
             self._last_freed_at = now
 
-    def _next_slot_frac(self, now: float) -> float:
-        """Progress [0,1] toward the next slot free (kernel pure math)."""
+    def _next_slot_frac_milli(self, now: float) -> int:
+        """Progress toward next slot free in thousandths [0, 1000] (kernel)."""
         if not self._timestamps:
-            return 1.0
+            return 1000
         oldest = self._timestamps[0]
         last_freed = self._last_freed_at if self._last_freed_at is not None else 0.0
-        milli = craft.rate_next_slot_frac_milli(
+        return craft.rate_next_slot_frac_milli(
             _ms(now),
             _ms(oldest),
             _ms(last_freed),
@@ -60,7 +60,6 @@ class RateLimiter:
             True,
             self._last_freed_at is not None,
         )
-        return milli / 1000.0
 
     async def acquire(
         self,
@@ -131,30 +130,19 @@ class RateLimiter:
             except ValueError:
                 pass
 
-    def remaining(self) -> tuple[int, int]:
-        """Return ``(slots_left, max_requests)`` in the current sliding window.
+    def chrome_snapshot(self) -> tuple[int, int, int]:
+        """Return ``(slots_left, max_requests, frac_milli)`` for the rate bar.
 
-        Pure snapshot for chrome/UI; does not acquire a slot. Evicts expired
-        timestamps on the calling thread without the async lock (best-effort
-        display only — concurrent acquire may race slightly).
-        """
-        left, maximum, _frac = self.chrome_snapshot()
-        return (left, maximum)
-
-    def chrome_snapshot(self) -> tuple[int, int, float]:
-        """Return ``(slots_left, max_requests, next_slot_frac)`` for the rate bar.
-
-        ``next_slot_frac`` is in ``[0, 1]``: progress from the last slot free
+        ``frac_milli`` is in ``[0, 1000]``: progress from the last slot free
         (or the current oldest's birth) until the next free. Resets to 0 when
         something drops off the window log, then fills over that inter-drop
         interval — so a 2s gap to the next free fills the left half in 2s,
-        not 60s. ``1.0`` when idle (no in-window requests). Best-effort display
+        not 60s. ``1000`` when idle (no in-window requests). Best-effort display
         only (no async lock).
         """
         if self._max <= 0:
-            return (0, 0, 1.0)
+            return (0, 0, 1000)
         now = time.monotonic()
         self._evict_expired(now)
         left = craft.rate_slots_left(len(self._timestamps), self._max)
-        frac = self._next_slot_frac(now)
-        return (left, self._max, frac)
+        return (left, self._max, self._next_slot_frac_milli(now))

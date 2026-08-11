@@ -856,6 +856,43 @@ export func command_queue_lane(line: text) -> text
         return "ib"
     return "pair"
 
+// Pure enqueue accept decision. Hosts keep validation, membership snapshots,
+// append, worker wake, paint, message chrome. Returns "dup" | "full" | "ok".
+// Idle current is "" — hosts store "" (not None/null) for idle worker current.
+export func queue_accept(line: text, current: text, lane_queue: List<text>, total_pending: int, max_depth: int) -> text
+    // Idle current is "" — do not false-dup empty line unless empty is queued.
+    if current.length > 0 and line == current
+        return "dup"
+    for item in lane_queue
+        if item == line
+            return "dup"
+    if total_pending >= max_depth
+        return "full"
+    return "ok"
+
+// Pure lane-busy / deferred-ack predicate. Hosts map session flags only:
+// current non-empty (running cmd string), pending_len (lane queue depth),
+// confirm_active (pair confirm / bulk / folded workerRunning). True → show
+// "Queued:" ack; validation, append, wake, paint stay host-side.
+export func queue_lane_busy(current: text, pending_len: int, confirm_active: bool) -> bool
+    return current.length > 0 or pending_len > 0 or confirm_active
+
+// Dual-queue cancel-reset policy for shared cancelled flag across pair/IB.
+// lane in {"pair","ib"}. Hosts map peer_busy (other lane current non-empty)
+// and confirm_active (pair confirm wait); hosts own the actual reset side-effect.
+// Start-of-job: pair resets only when not peer_busy; ib when not peer_busy and
+// not confirm_active. Soft-skip: pair always; ib only when not peer_busy.
+export func lane_should_reset_cancel(lane: text, peer_busy: bool, confirm_active: bool) -> bool
+    if lane == "ib"
+        return not peer_busy and not confirm_active
+    // "pair"
+    return not peer_busy
+
+export func lane_should_soft_reset_cancel(lane: text, peer_busy: bool) -> bool
+    if lane == "ib"
+        return not peer_busy
+    return true
+
 // Bulk-confirm gate (hosts prompt when pair count exceeds threshold).
 export func may_bulk_confirm(line: text) -> bool
     s = strip_spaces(line)
@@ -863,7 +900,11 @@ export func may_bulk_confirm(line: text) -> bool
     while end < s.length and not is_ascii_space(s[end])
         end = end + 1
     head = text_slice(s, 0, end)
-    return head == "/permutate" or head == "/permute" or head == "/exhaust" or head == "/cross" or head == "/with" or head == "/crawl"
+    return head == "/permutate" or head == "/permute" or head == "/exhaust" or head == "/cross" or head == "/with"
+
+// Pair-count bulk-warn predicate (strict greater-than). Hosts keep threshold constants.
+export func should_bulk_warn(n: int, threshold: int) -> bool
+    return n > threshold
 
 // /target pure rules — hosts own session state and confirm UI.
 // parse_target_arg returns (action, name) with action in {"show","clear","set"}.
@@ -883,18 +924,53 @@ export func is_target_hit(target: text, result_name: text) -> bool
         return false
     return target == result_name
 
+// Outcome of a /target command after parse_target_arg.
+// Returns (kind, new_state, detail) with kind in
+// {show_empty, show, clear_empty, clear, set}.
+// show+empty→show_empty; show+set→show (new_state=prev);
+// clear+empty prev→clear_empty; clear+had prev→clear (detail=prev);
+// else set (new_state=sanitize name). Hosts format wording; no display strings.
+export func target_outcome(prev: text, action: text, name: text) -> (text, text, text)
+    if action == "show"
+        if prev.length == 0
+            return ("show_empty", "", "")
+        return ("show", prev, "")
+    if action == "clear"
+        if prev.length == 0
+            return ("clear_empty", "", "")
+        return ("clear", "", prev)
+    // "set"
+    return ("set", sanitize_element_name(name), "")
+
 // Apply parse_target_arg action to session target (empty text = no target).
 export func apply_target_state(current: text, action: text, name: text) -> text
-    if action == "show"
-        return current
-    if action == "clear"
-        return ""
-    // "set"
-    return name
+    kind, new_state, detail = target_outcome(current, action, name)
+    return new_state
+
+// Confirm key normalize: strip + ascii-lower full key.
+export func confirm_answer_key(answer: text) -> text
+    return strip_spaces(ascii_lower_text(answer))
 
 // Confirm policy: single-key y continues; anything else stops.
 export func confirm_should_continue(answer: text) -> bool
-    return strip_spaces(ascii_lower_text(answer)) == "y"
+    return confirm_answer_key(answer) == "y"
+
+// Confirm key gate: single-key y/n only (reject "", "yes", "no", multi-char).
+export func is_confirm_answer(answer: text) -> bool
+    key = confirm_answer_key(answer)
+    return key == "y" or key == "n"
+
+// Confirm input route: classify y/n against waiting Future vs bulk buffer.
+// ignore = not a confirm key (or no waiter/buffer sink); deliver = set Future;
+// buffer = stash until bulk awaiter is ready. Hosts own Future/buffer I/O.
+export func confirm_input_route(answer: text, waiting: bool, bulk_pending: bool) -> text
+    if not is_confirm_answer(answer)
+        return "ignore"
+    if waiting
+        return "deliver"
+    if bulk_pending
+        return "buffer"
+    return "ignore"
 
 // ---------------------------------------------------------------------------
 // Rate-window chrome math (pure). Hosts own clocks, deques, HTTP, paint.
@@ -971,6 +1047,38 @@ export func rate_bar_fills(
         if right_filled > right_width
             right_filled = right_width
     return (left_filled, right_filled)
+
+// Glyph segment for rate bars: clamp filled to [0, width], then █ filled + ░ empty.
+// Hosts keep ANSI/HTML wrappers; kernel owns clamp + glyph construction.
+// █ = U+2588 (9608), ░ = U+2591 (9617).
+export func rate_bar_segment(filled: int, width: int) -> text
+    n = filled
+    if n < 0
+        n = 0
+    if n > width
+        n = width
+    return repeat_char(9608, n) + repeat_char(9617, width - n)
+
+// End-ellipsis for rate-line pair chrome. Plain text length (not ANSI).
+// Matches trainer ellipsizeEnd: max_chars<=0 → ""; overflow → prefix + "…".
+export func rate_ellipsize_end(s: text, max_chars: int) -> text
+    if max_chars <= 0
+        return ""
+    if s.length <= max_chars
+        return s
+    if max_chars == 1
+        return "…"
+    return text_slice(s, 0, max_chars - 1) + "…"
+
+// Format "a + b" into avail cells: split remaining after sep, end-ellipsis each.
+// Hosts supply avail (TTY width / DOM clientWidth); kernel owns the math.
+export func rate_format_pair_for_width(a: text, b: text, avail: int) -> text
+    sep: text = " + "
+    if avail <= sep.length + 2
+        return rate_ellipsize_end(a + sep + b, avail)
+    each = (avail - sep.length) / 2
+    left_extra = (avail - sep.length) - each * 2
+    return rate_ellipsize_end(a, each + left_extra) + sep + rate_ellipsize_end(b, each)
 
 export func is_slash_command_attempt(line: text) -> bool
     // Port of re.match(r"/[^/]+/", line) then re.match(r"/\w", line).
@@ -1633,11 +1741,52 @@ test "queue lane and target pure rules"
     assert command_queue_lane("/import X") == "ib"
     assert command_queue_lane("/permutate w*") == "pair"
     assert command_queue_lane("Water + Fire") == "pair"
+    // queue_accept: dup / full / ok
+    empty_q: List<text> = []
+    assert queue_accept("Water + Fire", "Water + Fire", empty_q, 0, 50) == "dup"
+    q1: List<text> = ["Water + Fire", "/fill"]
+    assert queue_accept("Water + Fire", "", q1, 2, 50) == "dup"
+    assert queue_accept("/fill", "other", q1, 2, 50) == "dup"
+    assert queue_accept("new", "", q1, 50, 50) == "full"
+    assert queue_accept("new", "", q1, 49, 50) == "ok"
+    assert queue_accept("new", "", empty_q, 0, 50) == "ok"
+    // Idle current "" does not false-dup empty line unless empty is queued
+    assert queue_accept("", "", empty_q, 0, 50) == "ok"
+    empty_only: List<text> = [""]
+    assert queue_accept("", "", empty_only, 1, 50) == "dup"
+    // Non-empty current still dups; full only when not dup
+    assert queue_accept("x", "x", empty_q, 50, 50) == "dup"
+    // queue_lane_busy: current non-empty OR pending_len>0 OR confirm_active
+    assert not queue_lane_busy("", 0, false)
+    assert queue_lane_busy("Water + Fire", 0, false)
+    assert queue_lane_busy("", 1, false)
+    assert queue_lane_busy("", 0, true)
+    assert queue_lane_busy("x", 2, true)
+    assert not queue_lane_busy("", 0, false)
+    // lane_should_reset_cancel: pair ignores confirm; ib needs peer idle + no confirm
+    assert lane_should_reset_cancel("pair", false, false)
+    assert lane_should_reset_cancel("pair", false, true)
+    assert not lane_should_reset_cancel("pair", true, false)
+    assert not lane_should_reset_cancel("pair", true, true)
+    assert lane_should_reset_cancel("ib", false, false)
+    assert not lane_should_reset_cancel("ib", false, true)
+    assert not lane_should_reset_cancel("ib", true, false)
+    assert not lane_should_reset_cancel("ib", true, true)
+    // soft: pair always; ib only when not peer_busy
+    assert lane_should_soft_reset_cancel("pair", false)
+    assert lane_should_soft_reset_cancel("pair", true)
+    assert lane_should_soft_reset_cancel("ib", false)
+    assert not lane_should_soft_reset_cancel("ib", true)
     assert may_bulk_confirm("/permutate w*")
     assert may_bulk_confirm("/exhaust fire*")
     assert may_bulk_confirm("/with Water fire*")
     assert not may_bulk_confirm("/combine Water Fire")
     assert not may_bulk_confirm("/fill")
+    assert not may_bulk_confirm("/crawl Water Fire")
+    assert should_bulk_warn(201, 200)
+    assert not should_bulk_warn(200, 200)
+    assert not should_bulk_warn(0, 200)
+    assert should_bulk_warn(2, 1)
     act, name = parse_target_arg("")
     assert act == "show"
     assert name == ""
@@ -1656,11 +1805,51 @@ test "queue lane and target pure rules"
     assert apply_target_state("Steam", "show", "") == "Steam"
     assert apply_target_state("Steam", "clear", "") == ""
     assert apply_target_state("", "set", "Lava") == "Lava"
+    kind, st, det = target_outcome("", "show", "")
+    assert kind == "show_empty"
+    assert st == ""
+    assert det == ""
+    kind, st, det = target_outcome("Steam", "show", "")
+    assert kind == "show"
+    assert st == "Steam"
+    assert det == ""
+    kind, st, det = target_outcome("", "clear", "")
+    assert kind == "clear_empty"
+    assert st == ""
+    assert det == ""
+    kind, st, det = target_outcome("Steam", "clear", "")
+    assert kind == "clear"
+    assert st == ""
+    assert det == "Steam"
+    kind, st, det = target_outcome("", "set", "Lava")
+    assert kind == "set"
+    assert st == "Lava"
+    assert det == ""
+    kind, st, det = target_outcome("Steam", "set", "  Water  ")
+    assert kind == "set"
+    assert st == "Water"
     assert confirm_should_continue("y")
     assert confirm_should_continue(" Y ")
     assert not confirm_should_continue("n")
     assert not confirm_should_continue("")
     assert not confirm_should_continue("yes")
+    assert is_confirm_answer("y")
+    assert is_confirm_answer("Y")
+    assert is_confirm_answer(" n ")
+    assert not is_confirm_answer("")
+    assert not is_confirm_answer("yes")
+    assert not is_confirm_answer("no")
+    assert not is_confirm_answer("ya")
+    assert confirm_answer_key(" Y ") == "y"
+    assert confirm_answer_key(" n ") == "n"
+    assert confirm_input_route("y", true, false) == "deliver"
+    assert confirm_input_route("n", true, true) == "deliver"
+    assert confirm_input_route("y", false, true) == "buffer"
+    assert confirm_input_route("n", false, true) == "buffer"
+    assert confirm_input_route("y", false, false) == "ignore"
+    assert confirm_input_route("", true, true) == "ignore"
+    assert confirm_input_route("yes", true, false) == "ignore"
+    assert confirm_input_route("no", false, true) == "ignore"
     assert rate_slots_left(0, 60) == 60
     assert rate_slots_left(15, 60) == 45
     assert rate_slots_left(60, 60) == 0
@@ -1683,6 +1872,26 @@ test "queue lane and target pure rules"
     lf, rf = rate_bar_fills(30, 60, 500, 9, 9)
     assert lf == 5
     assert rf == 5
+    // rate_bar_segment: clamp edges + mid fill (█ / ░)
+    assert rate_bar_segment(0, 4) == "░░░░"
+    assert rate_bar_segment(4, 4) == "████"
+    assert rate_bar_segment(2, 4) == "██░░"
+    assert rate_bar_segment(-3, 4) == "░░░░"
+    assert rate_bar_segment(99, 4) == "████"
+    assert rate_bar_segment(0, 0) == ""
+    assert rate_bar_segment(3, 0) == ""
+    // rate_ellipsize_end: short fits, overflow end-ellipsis
+    assert rate_ellipsize_end("hello", 10) == "hello"
+    assert rate_ellipsize_end("hello", 5) == "hello"
+    assert rate_ellipsize_end("hello", 0) == ""
+    assert rate_ellipsize_end("hello", 1) == "…"
+    assert rate_ellipsize_end("hello", 3) == "he…"
+    // rate_format_pair_for_width: short fits, tight avail, overflow split
+    assert rate_format_pair_for_width("Hi", "Yo", 20) == "Hi + Yo"
+    assert rate_format_pair_for_width("A", "B", 7) == "A + B"
+    assert rate_format_pair_for_width("Water", "Fire", 5) == "Wate…"
+    assert rate_format_pair_for_width("Water", "Fire", 6) == "W… + …"
+    assert rate_format_pair_for_width("Water", "Fire", 11) == "Wat… + Fire"
 
 test "parse_query_filter parity"
     p, ex, on = parse_query_filter("!fire*")

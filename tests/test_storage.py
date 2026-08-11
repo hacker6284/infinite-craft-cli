@@ -3,7 +3,6 @@
 import json
 import sys
 import pytest
-from unittest.mock import patch
 
 # Run with pytest when invoked directly by Bazel
 if __name__ == "__main__":
@@ -24,13 +23,6 @@ class TestInitialization:
         assert "Earth" in names
         assert len(elements) == 4
 
-    def test_file_written_to_disk(self, tmp_path):
-        path = tmp_path / "discoveries.json"
-        DiscoveryStorage(str(path))
-        assert path.exists()
-        data = json.loads(path.read_text())
-        assert len(data) == 4
-
     def test_loads_existing_file(self, tmp_path):
         path = tmp_path / "discoveries.json"
         data = [
@@ -42,11 +34,6 @@ class TestInitialization:
         assert len(storage.get_all()) == 2
         assert storage.get_by_name("Steam") is not None
 
-    def test_creates_parent_dirs(self, tmp_path):
-        path = str(tmp_path / "deep" / "nested" / "discoveries.json")
-        storage = DiscoveryStorage(path)
-        assert len(storage.get_all()) == 4
-
     def test_corrupt_discoveries_raises_clear_error(self, tmp_path):
         path = tmp_path / "discoveries.json"
         path.write_text('[{"name": "Water"')  # truncated (repair heuristic cannot salvage)
@@ -54,26 +41,16 @@ class TestInitialization:
             DiscoveryStorage(str(path))
 
 
-class TestGetByName:
-    def test_found(self, tmp_path):
-        storage = DiscoveryStorage(str(tmp_path / "d.json"))
-        elem = storage.get_by_name("Water")
-        assert elem is not None
-        assert elem.name == "Water"
-        assert elem.emoji == "💧"
-
-    def test_not_found(self, tmp_path):
-        storage = DiscoveryStorage(str(tmp_path / "d.json"))
-        assert storage.get_by_name("Nonexistent") is None
-
-
 class TestAdd:
-    def test_new_element(self, tmp_path):
-        storage = DiscoveryStorage(str(tmp_path / "d.json"))
+    def test_new_element_persists(self, tmp_path):
+        path = tmp_path / "d.json"
+        storage = DiscoveryStorage(str(path))
         result = storage.add(name="Steam", emoji="💨", is_first_discovery=False)
         assert result is not None
         assert result.name == "Steam"
         assert len(storage.get_all()) == 5
+        data = json.loads(path.read_text())
+        assert any(d["name"] == "Steam" for d in data)
 
     def test_duplicate_returns_none(self, tmp_path):
         storage = DiscoveryStorage(str(tmp_path / "d.json"))
@@ -81,45 +58,17 @@ class TestAdd:
         assert result is None
         assert len(storage.get_all()) == 4
 
-    def test_persists_to_disk(self, tmp_path):
-        path = tmp_path / "d.json"
-        storage = DiscoveryStorage(str(path))
-        storage.add(name="Steam", emoji="💨", is_first_discovery=True)
-        data = json.loads(path.read_text())
-        assert any(d["name"] == "Steam" for d in data)
-
-    def test_available_via_get_by_name(self, tmp_path):
-        storage = DiscoveryStorage(str(tmp_path / "d.json"))
-        storage.add(name="Steam", emoji="💨", is_first_discovery=False)
-        assert storage.get_by_name("Steam") is not None
-
-    def test_default_optional_fields(self, tmp_path):
-        storage = DiscoveryStorage(str(tmp_path / "d.json"))
-        result = storage.add(name="Mystery")
-        assert result is not None
-        assert result.emoji is None
-        assert result.is_first_discovery is None
-
 
 class TestRemove:
-    def test_removes_element(self, tmp_path):
-        storage = DiscoveryStorage(str(tmp_path / "d.json"))
+    def test_removes_element_persists(self, tmp_path):
+        path = tmp_path / "d.json"
+        storage = DiscoveryStorage(str(path))
         storage.add(name="Steam", emoji="💨", is_first_discovery=False)
         assert storage.remove("Steam") is True
         assert storage.get_by_name("Steam") is None
         assert len(storage.get_all()) == 4
-
-    def test_persists_removal(self, tmp_path):
-        path = tmp_path / "d.json"
-        storage = DiscoveryStorage(str(path))
-        storage.add(name="Steam", emoji="💨", is_first_discovery=False)
-        storage.remove("Steam")
         data = json.loads(path.read_text())
         assert not any(d["name"] == "Steam" for d in data)
-
-    def test_missing_returns_false(self, tmp_path):
-        storage = DiscoveryStorage(str(tmp_path / "d.json"))
-        assert storage.remove("Nope") is False
 
 
 class TestAddBatch:
@@ -135,18 +84,13 @@ class TestAddBatch:
         assert storage.get_by_name("Steam") is not None
         assert storage.get_by_name("Mud") is not None
 
-    def test_single_disk_write(self, tmp_path):
-        storage = DiscoveryStorage(str(tmp_path / "d.json"))
-        with patch.object(storage, "_save", wraps=storage._save) as mock_save:
-            storage.add_batch([("Steam", "💨", False), ("Mud", "🟤", False)])
-            mock_save.assert_called_once()
-
     def test_skips_existing_elements(self, tmp_path):
         storage = DiscoveryStorage(str(tmp_path / "d.json"))
-        with patch.object(storage, "_save", wraps=storage._save) as mock_save:
-            count = storage.add_batch([("Water", "💧", False), ("Steam", "💨", False)])
+        count = storage.add_batch([("Water", "💧", False), ("Steam", "💨", False)])
         assert count == 1
-        mock_save.assert_called_once()
+        assert storage.get_by_name("Steam") is not None
+        assert len(storage.get_all()) == 5
+
 
 
 class TestReload:

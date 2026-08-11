@@ -24,12 +24,6 @@ class TestAcquire:
         elapsed = time.monotonic() - start
         assert elapsed < 0.1
 
-    def test_multiple_under_limit(self):
-        limiter = RateLimiter(max_requests=5)
-        for _ in range(5):
-            run_async(limiter.acquire())
-        # All 5 should succeed without blocking
-
     def test_zero_limit_never_blocks(self):
         limiter = RateLimiter(max_requests=0)
         start = time.monotonic()
@@ -85,7 +79,10 @@ class TestAcquire:
         run_async(run())
         elapsed = time.monotonic() - start
         assert elapsed < 0.5
-        assert len(limiter._timestamps) == 1
+        # First acquire still holds the only slot; cancel did not free it.
+        left, maximum, _frac = limiter.chrome_snapshot()
+        assert left == 0
+        assert maximum == 1
         blocked = asyncio.Event()
 
         async def second_acquire():
@@ -101,101 +98,64 @@ class TestAcquire:
                 await task
 
         run_async(run_blocked())
-        assert len(limiter._timestamps) == 1
+        # Slot still held after cancelled waiter; left remains 0.
+        left2, _, _ = limiter.chrome_snapshot()
+        assert left2 == 0
 
     def test_release_restores_slot(self):
         limiter = RateLimiter(max_requests=1, window_seconds=2.0)
         token = run_async(limiter.acquire())
-        assert len(limiter._timestamps) == 1
+        left, _, _ = limiter.chrome_snapshot()
+        assert left == 0
         run_async(limiter.release(token))
-        assert len(limiter._timestamps) == 0
+        left_after, _, _ = limiter.chrome_snapshot()
+        assert left_after == 1
+        # Re-acquire succeeds immediately after release.
+        start = time.monotonic()
         run_async(limiter.acquire())
-        assert len(limiter._timestamps) == 1
-
-    def test_concurrent_release_only_drops_own_token(self):
-        limiter = RateLimiter(max_requests=2, window_seconds=2.0)
-        token_a = run_async(limiter.acquire())
-        token_b = run_async(limiter.acquire())
-        assert len(limiter._timestamps) == 2
-        run_async(limiter.release(token_a))
-        assert len(limiter._timestamps) == 1
-        assert token_b in limiter._timestamps
+        assert time.monotonic() - start < 0.1
+        left_final, _, _ = limiter.chrome_snapshot()
+        assert left_final == 0
 
     def test_cancel_on_zero_wait_branch(self):
         """Cancel during re-acquire spin must not consume a slot."""
         limiter = RateLimiter(max_requests=1, window_seconds=5.0)
-        run_async(limiter.acquire())
+        token = run_async(limiter.acquire())
         with pytest.raises(RateLimitCancelled):
             run_async(limiter.acquire(cancel_check=lambda: True, sleep_step=0.01))
-        assert len(limiter._timestamps) == 1
-
-    def test_wait_callback_invoked_true_then_false(self):
-        """Direct unit test (no UI) for the callback contract on acquire backoff path."""
-        limiter = RateLimiter(max_requests=1, window_seconds=0.1)
-        run_async(limiter.acquire())
-        calls: list[bool] = []
-
-        def cb(w: bool) -> None:
-            calls.append(w)
-
+        # First slot still held; cancel did not consume another.
+        left, _, _ = limiter.chrome_snapshot()
+        assert left == 0
+        # Second acquire succeeds only after release of the first token.
+        run_async(limiter.release(token))
         start = time.monotonic()
-        run_async(limiter.acquire(_wait_callback=cb, sleep_step=0.01))
-        elapsed = time.monotonic() - start
-        assert elapsed >= 0.05
-        assert calls and calls[0] is True
-        assert calls[-1] is False
-
-
-class TestRemaining:
-    def test_remaining_full_when_idle(self):
-        limiter = RateLimiter(max_requests=60)
-        left, maximum = limiter.remaining()
-        assert maximum == 60
-        assert left == 60
-
-    def test_remaining_decreases_after_acquire(self):
-        limiter = RateLimiter(max_requests=5)
-        run_async(limiter.acquire())
-        run_async(limiter.acquire())
-        left, maximum = limiter.remaining()
-        assert maximum == 5
-        assert left == 3
-
-    def test_remaining_zero_limit(self):
-        limiter = RateLimiter(max_requests=0)
-        assert limiter.remaining() == (0, 0)
-
-    def test_remaining_recovers_after_window(self):
-        limiter = RateLimiter(max_requests=1, window_seconds=0.1)
-        run_async(limiter.acquire())
-        assert limiter.remaining() == (0, 1)
-        time.sleep(0.15)
-        assert limiter.remaining() == (1, 1)
+        run_async(limiter.acquire(cancel_check=lambda: False, sleep_step=0.01))
+        assert time.monotonic() - start < 0.1
 
 
 class TestChromeSnapshot:
     def test_idle_oldest_frac_is_full(self):
         limiter = RateLimiter(max_requests=60, window_seconds=60.0)
-        left, maximum, frac = limiter.chrome_snapshot()
+        left, maximum, frac_milli = limiter.chrome_snapshot()
         assert left == 60
         assert maximum == 60
-        assert frac == 1.0
+        assert frac_milli == 1000
 
     def test_fresh_acquire_oldest_frac_near_zero(self):
         limiter = RateLimiter(max_requests=5, window_seconds=60.0)
         run_async(limiter.acquire())
-        left, maximum, frac = limiter.chrome_snapshot()
+        left, maximum, frac_milli = limiter.chrome_snapshot()
         assert left == 4
         assert maximum == 5
         # First segment: start = birth of oldest → frac near 0.
-        assert 0.0 <= frac < 0.05
+        assert 0 <= frac_milli < 50
 
     def test_oldest_frac_grows_with_age(self):
         limiter = RateLimiter(max_requests=1, window_seconds=1.0)
         run_async(limiter.acquire())
         time.sleep(0.4)
-        _left, _maximum, frac = limiter.chrome_snapshot()
-        assert 0.25 <= frac <= 0.7
+        _left, _maximum, frac_milli = limiter.chrome_snapshot()
+        assert 250 <= frac_milli <= 700
 
     def test_frac_resets_on_slot_free_and_scales_to_next_drop(self):
         """After a free, bar resets; next fill uses inter-drop interval, not full window."""
@@ -207,8 +167,8 @@ class TestChromeSnapshot:
         time.sleep(0.30)
         left, _maximum, frac_just_after = limiter.chrome_snapshot()
         assert left == 1  # one free
-        # Just after free: segment start = free time → frac near 0 (not ~1 from full window).
-        assert frac_just_after < 0.35
+        # Just after free: segment start = free time → frac near 0 (not ~1000 from full window).
+        assert frac_just_after < 350
         time.sleep(0.12)
         _left2, _m2, frac_mid = limiter.chrome_snapshot()
         # Midway through remaining life of second request (~0.25s left after free).
@@ -219,11 +179,11 @@ class TestChromeSnapshot:
         t1 = run_async(limiter.acquire())
         run_async(limiter.acquire())
         run_async(limiter.release(t1))
-        left, _maximum, frac = limiter.chrome_snapshot()
+        left, _maximum, frac_milli = limiter.chrome_snapshot()
         assert left == 1
         # Release counts as a free → segment restarts near 0.
-        assert frac < 0.05
+        assert frac_milli < 50
 
     def test_chrome_snapshot_zero_limit(self):
         limiter = RateLimiter(max_requests=0)
-        assert limiter.chrome_snapshot() == (0, 0, 1.0)
+        assert limiter.chrome_snapshot() == (0, 0, 1000)

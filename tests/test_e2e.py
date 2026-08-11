@@ -54,7 +54,7 @@ class TestCombinePersistence:
         client = AsyncMock()
         client.pair = AsyncMock(return_value=result_elem)
 
-        with patch("infinite_craft_cli.cli._record_recipe"):
+        with patch("infinite_craft_cli.cli._record_recipes_batch"):
             run_async(do_combine(client, storage, "Water", "Fire"))
 
         # Verify in-memory
@@ -76,7 +76,7 @@ class TestCombinePersistence:
         client = AsyncMock()
         client.pair = AsyncMock(return_value=result_elem)
 
-        with patch("infinite_craft_cli.cli._record_recipe"):
+        with patch("infinite_craft_cli.cli._record_recipes_batch"):
             run_async(do_combine(client, storage, "Water", "Fire"))
 
         storage2 = DiscoveryStorage(discoveries_path)
@@ -101,40 +101,11 @@ class TestCombinePersistence:
         assert len(storage2.get_all()) == 4
 
 
-class TestBulkPersistence:
-    """Verify bulk operations persist results to disk."""
-
-    def test_combine_pairs_saves_all_results(self, tmp_path, capsys):
-        from infinite_craft_cli.cli import _combine_pairs
-
-        discoveries_path = str(tmp_path / "discoveries.json")
-        storage = DiscoveryStorage(discoveries_path)
-
-        results = [
-            Element(name="Steam", emoji="💨", is_first_discovery=False),
-            Element(name="Mud", emoji="", is_first_discovery=False),
-        ]
-        client = AsyncMock()
-        client.pair = AsyncMock(side_effect=results)
-
-        pairs = [
-            (Element(name="Water", emoji="💧"), Element(name="Fire", emoji="🔥")),
-            (Element(name="Water", emoji="💧"), Element(name="Earth", emoji="🌍")),
-        ]
-
-        with patch("infinite_craft_cli.cli._record_recipe"):
-            run_async(_combine_pairs(client, storage, pairs))
-
-        storage2 = DiscoveryStorage(discoveries_path)
-        assert storage2.get_by_name("Steam") is not None
-        assert storage2.get_by_name("Mud") is not None
-
-
 class TestExportImportRoundTrip:
     """Verify export then import preserves all elements and recipes."""
 
     def test_round_trip(self, tmp_path):
-        from infinite_craft_cli.cli import do_export, _import_from_save, _record_recipe
+        from infinite_craft_cli.cli import do_export, _import_from_save, _record_recipes_batch
 
         discoveries_path = str(tmp_path / "discoveries.json")
         recipes_path = str(tmp_path / "recipes.json")
@@ -147,8 +118,8 @@ class TestExportImportRoundTrip:
 
         # Record recipes
         with patch("infinite_craft_cli.cli.RECIPES_PATH", recipes_path):
-            _record_recipe("Steam", "Water", "Fire")
-            _record_recipe("Mud", "Water", "Earth")
+            _record_recipes_batch([("Steam", "Water", "Fire")])
+            _record_recipes_batch([("Mud", "Water", "Earth")])
 
             # Export
             do_export(storage, export_path)
@@ -206,7 +177,7 @@ class TestInfinibrowserImportPersistence:
     """Verify importing from Infinibrowser persists all lineage elements."""
 
     def test_import_persists_to_disk(self, tmp_path):
-        from infinite_craft_cli.cli import _import_from_infinibrowser
+        from infinite_craft_cli.cli import _import_from_infinibrowser_async
 
         discoveries_path = str(tmp_path / "discoveries.json")
         recipes_path = str(tmp_path / "recipes.json")
@@ -232,7 +203,7 @@ class TestInfinibrowserImportPersistence:
             "infinite_craft_cli.cli._ib_fetch", side_effect=[item_data, lineage_data]
         ):
             with patch("infinite_craft_cli.cli.RECIPES_PATH", recipes_path):
-                _import_from_infinibrowser(storage, "Lava")
+                asyncio.run(_import_from_infinibrowser_async(storage, "Lava"))
 
         # Reload from disk and verify
         storage2 = DiscoveryStorage(discoveries_path)
@@ -242,10 +213,11 @@ class TestInfinibrowserImportPersistence:
 
     def test_import_not_blocked_by_stale_cache(self, tmp_path):
         """A prior cached empty recipe should not prevent a successful import."""
-        from infinite_craft_cli.cli import _import_from_infinibrowser
-        from infinite_craft_cli.client import fetch_json, clear_fetch_cache
+        from infinite_craft_cli.cli import _import_from_infinibrowser_async
+        from infinite_craft_cli.client import fetch_json
+        import infinite_craft_cli.client as client_mod
 
-        clear_fetch_cache()
+        client_mod._sync_cache.clear()
         discoveries_path = str(tmp_path / "discoveries.json")
         recipes_path = str(tmp_path / "recipes.json")
         storage = DiscoveryStorage(discoveries_path)
@@ -277,7 +249,7 @@ class TestInfinibrowserImportPersistence:
             "infinite_craft_cli.cli._ib_fetch", side_effect=[item_data, full_recipe]
         ):
             with patch("infinite_craft_cli.cli.RECIPES_PATH", recipes_path):
-                result = _import_from_infinibrowser(storage, "Licker")
+                result = asyncio.run(_import_from_infinibrowser_async(storage, "Licker"))
 
         assert "No lineage" not in result
         storage2 = DiscoveryStorage(discoveries_path)

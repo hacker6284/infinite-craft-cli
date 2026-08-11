@@ -70,10 +70,10 @@ _history: list[tuple[str, str, str]] = []
 _session_input_history: list[str] = []
 
 # Interactive command queues — pair (neal.fun) and IB (Infinibrowser) are independent.
-_command_queue: list[str] = []  # pair-API lane (alias kept for tests/chrome)
+_command_queue: list[str] = []  # pair-API lane queue
 _ib_command_queue: list[str] = []
-_current_command: str | None = None  # pair lane currently running
-_current_ib_command: str | None = None
+_current_command: str = ""  # pair lane currently running; "" = idle
+_current_ib_command: str = ""  # IB lane; "" = idle
 _api_worker_task: asyncio.Task | None = None  # pair worker
 _ib_worker_task: asyncio.Task | None = None
 _MAX_QUEUE_DEPTH = 50
@@ -112,7 +112,6 @@ CONFIRM_PROMPT = "confirm [y/n]> "
 # Segmented rate bar: left 1/2 = next-slot wait refill, right 1/2 = remaining.
 _RATE_BAR_LEFT = 9
 _RATE_BAR_RIGHT = 9
-_RATE_BAR_WIDTH = _RATE_BAR_LEFT + _RATE_BAR_RIGHT  # 18; kept for any legacy width refs
 _RATE_TICK_SECONDS = 0.3
 
 # Test-only seams (set by harness in tests; never used in production).
@@ -150,8 +149,8 @@ def _reset_test_state() -> None:
     _session_input_history.clear()
     _command_queue.clear()
     _ib_command_queue.clear()
-    _current_command = None
-    _current_ib_command = None
+    _current_command = ""
+    _current_ib_command = ""
     _confirm_future = None
     _confirm_answer_buffer = None
     _last_queue_snapshot = ""
@@ -188,7 +187,7 @@ def _reset_test_state() -> None:
     _last_pair = None
     _active_client = None
     _rate_ticker_task = None
-    _target_element = None
+    _target_element = ""
     _skip_summary_shown = False
     _sigint_previous = None
     _winch_previous = None
@@ -276,11 +275,6 @@ def _save_recipes(recipes: dict[str, list[list[str]]]):
         raise
 
 
-def _record_recipe(result_name: str, a_name: str, b_name: str):
-    """Record that a_name + b_name = result_name."""
-    _record_recipes_batch([(result_name, a_name, b_name)])
-
-
 def _record_recipes_batch(entries: list[tuple[str, str, str]]):
     """Record multiple recipes with a single disk write."""
     if not entries:
@@ -309,43 +303,19 @@ def _color(text: str, code: str) -> str:
     return text
 
 
-def _sanitize_tty_text(text: str) -> str:
-    """Strip control characters from untrusted text before TTY output."""
-    return _sanitize_queue_line(text)
-
-
 def _tty(text: str) -> str:
     """Sanitize untrusted text when writing to an interactive terminal."""
     if sys.stdout.isatty():
-        return _sanitize_tty_text(text)
+        return _sanitize_queue_line(text)
     return text
-
-
-def _sanitize_element_name(name: str) -> str:
-    """Normalize API/import element names before storage.
-
-    The rule lives in the kernel so both hosts persist identical names for
-    identical payloads; TTY-display sanitization stays host-side."""
-    return craft.sanitize_element_name(name)
 
 
 def format_element(elem) -> str:
     raw = str(elem)  # uses Element.__str__ which handles emoji
-    s = _sanitize_tty_text(raw) if sys.stdout.isatty() else raw
+    s = _sanitize_queue_line(raw) if sys.stdout.isatty() else raw
     if elem.is_first_discovery:
         s += " " + _color("[FIRST DISCOVERY!]", BOLD + MAGENTA)
     return s
-
-
-def format_result(first_name: str, second_name: str, result) -> str:
-    if sys.stdout.isatty():
-        first_name = _sanitize_tty_text(first_name)
-        second_name = _sanitize_tty_text(second_name)
-    if result.name is None:
-        res = _color("Nothing", DIM)
-    else:
-        res = format_element(result)
-    return f"  {first_name} + {second_name} = {res}"
 
 
 # ---------------------------------------------------------------------------
@@ -406,18 +376,18 @@ async def _cached_pair(client, storage, a, b):
                 raise CommandCancelled()
     _pair_cache[key] = result
     if result.name is not None:
-        _record_recipe(result.name, a.name, b.name)
+        _record_recipes_batch([(result.name, a.name, b.name)])
     return result
 
 
 async def do_combine(client, storage, first_name: str, second_name: str) -> str:
     first = _resolve_element(storage, first_name)
     second = _resolve_element(storage, second_name)
-    _set_job_progress(0, 1)
+    _set_lane_progress("pair", 0, 1)
     _set_last_pair(first.name, second.name)
     try:
         result = await _cached_pair(client, storage, first, second)
-        _set_job_progress(1, 1)
+        _set_lane_progress("pair", 1, 1)
     except CommandCancelled:
         raise
     except Exception as e:
@@ -426,53 +396,30 @@ async def do_combine(client, storage, first_name: str, second_name: str) -> str:
     if result.name is not None:
         for elem in (first, second):
             storage.add(
-                name=_sanitize_element_name(elem.name),
+                name=craft.sanitize_element_name(elem.name),
                 emoji=elem.emoji,
                 is_first_discovery=False,
             )
         storage.add(
-            name=_sanitize_element_name(result.name),
+            name=craft.sanitize_element_name(result.name),
             emoji=result.emoji,
             is_first_discovery=result.is_first_discovery,
         )
     result_display = result.name if result.name else "Nothing"
     _history.append((first_name.strip(), second_name.strip(), result_display))
-    # Use format_element(...) directly for operands (and result) so FIRST tag color/text
-    # survives; avoid format_result's re-sanitize on pre-rendered names (which strips ANSI).
+    # format_element on operands and result preserves FIRST tag color/text.
     if result.name is None:
         res = _color("Nothing", DIM)
     else:
         res = format_element(result)
     line = f"  {format_element(first)} + {format_element(second)} = {res}"
-    if result.name is not None and _is_target_hit(result.name):
+    hit = craft.is_target_hit(_target_element, result.name or "")
+    if hit:
         line += " " + _color("★ TARGET ★", BOLD + YELLOW + MAGENTA)
-        stop = await _acknowledge_target_hit(first.name, second.name, result.name)
+        stop = await _acknowledge_target_hit(first.name, second.name, result.name or "")
         if stop:
             raise CommandCancelled()
     return line
-
-
-def _slash_args(line: str, command: str) -> str | None:
-    """Return arguments after a slash command, or None if the line is not that command."""
-    return craft.slash_args(line, command)
-
-
-def _parse_query_filter(query: str) -> tuple[str, bool, bool]:
-    """Parse a query, returning (pattern, exclude, only_new).
-
-    Prefix ``!`` excludes matching elements (negation).
-    Prefix ``^`` limits results to first discoveries among pattern matches.
-    """
-    return craft.parse_query_filter(query)
-
-
-def _is_delimited_regex(pattern: str) -> bool:
-    return craft.is_delimited_regex(pattern)
-
-
-def _element_matches_pattern(name: str, pattern: str) -> tuple[bool, str | None]:
-    """Match an element name against a query pattern."""
-    return craft.element_matches_pattern(name, pattern)
 
 
 def _match_elements(storage, query: str) -> tuple[list[Element], str | None]:
@@ -569,6 +516,12 @@ def do_history(storage=None) -> str:
 
 async def do_crawl(client, storage, first_name: str, second_name: str):
     """Combine two elements, then iteratively combine results with all inputs until nothing new."""
+    # Crawl never uses bulk confirm; resolve immediately so the interactive loop
+    # does not stall in _awaiting_bulk_confirm_setup (belt-and-suspenders vs
+    # may_bulk_confirm excluding /crawl).
+    global _bulk_confirm_resolved
+    _bulk_confirm_resolved = True
+
     first = _resolve_element(storage, first_name)
     second = _resolve_element(storage, second_name)
     pool = {first.name: first, second.name: second}
@@ -695,50 +648,6 @@ def _render_error_segments(segments) -> str:
     )
 
 
-def _slash_combine_crawl_pipe_error(rest: str) -> str | None:
-    """Reject slash combine/crawl payloads that use spaced ``+ |`` instead of ``+|``."""
-    segments = craft.slash_combine_crawl_pipe_error_segments(rest)
-    if segments is None:
-        return None
-    return _render_error_segments(segments)
-
-
-def _slash_combine_crawl_operator_error(rest: str, kind: str) -> str | None:
-    """Reject slash combine/crawl payloads that still use `` + `` operator syntax."""
-    segments = craft.slash_combine_crawl_operator_error_segments(rest, kind)
-    if segments is None:
-        return None
-    return _render_error_segments(segments)
-
-
-def _slash_cross_operator_error(rest: str) -> str | None:
-    """Reject slash cross payloads that still use `` * `` operator syntax."""
-    segments = craft.slash_cross_operator_error_segments(rest)
-    if segments is None:
-        return None
-    return _render_error_segments(segments)
-
-
-def _split_two_positional_args(rest: str) -> tuple[str, str] | None:
-    """Split into two positional args, respecting ``/regex/`` tokens."""
-    return craft.split_two_positional_args(rest)
-
-
-def _parse_two_elements(rest: str) -> tuple[str, str] | None:
-    """Parse two element names from positional slash combine/crawl args."""
-    return craft.parse_two_elements(rest)
-
-
-def _parse_with_args(rest: str) -> tuple[str, str] | None:
-    """Parse ``<element> <query>`` for /with."""
-    return craft.parse_with_args(rest)
-
-
-def _parse_cross_queries(rest: str) -> tuple[str, str] | None:
-    """Parse two positional queries for slash /cross (supports ``/regex/`` tokens)."""
-    return craft.parse_cross_queries(rest)
-
-
 _BULK_WARN_THRESHOLD = 200
 
 
@@ -755,7 +664,8 @@ _last_pair: tuple[str, str] | None = None
 _active_client = None  # InfiniteCraftClient | None
 _rate_ticker_task: asyncio.Task | None = None
 # /target: pause batch when this element name is produced by a combination.
-_target_element: str | None = None
+# Empty string = no target (kernel is_target_hit/apply_target_state treat "" as idle).
+_target_element: str = ""
 _target_hit_lock = asyncio.Lock()
 
 
@@ -791,8 +701,8 @@ def _request_skip_current() -> bool:
     """Skip the running queued command and continue to the next (Escape)."""
     global _cancelled, _discard_queue_after_cancel
     if (
-        _current_command is None
-        and _current_ib_command is None
+        not _current_command
+        and not _current_ib_command
         and not _waiting_for_confirm()
     ):
         return False
@@ -1617,7 +1527,7 @@ def _tty_read_line() -> str:
                 if (
                     not buf
                     and (_waiting_for_confirm() or _bulk_confirm_pending)
-                    and ch.lower() in ("y", "n")
+                    and craft.is_confirm_answer(ch)
                 ):
                     if _chrome_enabled:
                         _chrome_update_scroll_region(reposition=True)
@@ -1625,7 +1535,7 @@ def _tty_read_line() -> str:
                     else:
                         sys.stdout.write("\n")
                         sys.stdout.flush()
-                    return ch.lower()
+                    return craft.confirm_answer_key(ch)
                 buf.insert(pos, ch)
                 pos += 1
                 history_index = None
@@ -1713,34 +1623,23 @@ async def _prompt_input(prompt: str) -> str:
         return raw.strip()
 
 
-def _is_confirm_answer(line: str) -> bool:
-    """Single-key y/n only (no Enter-required 'yes'/'no' words)."""
-    return line.strip().lower() in ("y", "n")
-
-
-def _deliver_confirm_answer(line: str) -> bool:
-    """Route a y/n answer to the active confirmation. Returns True if handled."""
-    if not _is_confirm_answer(line):
-        return False
-    if _confirm_future is None or _confirm_future.done():
-        return False
-    _confirm_future.set_result(line.strip().lower()[:1])
-    return True
-
-
 def _waiting_for_confirm() -> bool:
     return _confirm_future is not None and not _confirm_future.done()
 
 
 def _route_confirm_input(line: str) -> bool:
     """Deliver y/n to active confirm or buffer until the worker is ready."""
-    if not _is_confirm_answer(line):
-        return False
-    if _deliver_confirm_answer(line):
+    route = craft.confirm_input_route(
+        line, _waiting_for_confirm(), bool(_bulk_confirm_pending)
+    )
+    if route == "deliver":
+        key = craft.confirm_answer_key(line)
+        if _confirm_future is not None and not _confirm_future.done():
+            _confirm_future.set_result(key)
         return True
-    if _bulk_confirm_pending:
+    if route == "buffer":
         global _confirm_answer_buffer
-        _confirm_answer_buffer = line.strip().lower()[:1]
+        _confirm_answer_buffer = craft.confirm_answer_key(line)
         return True
     return False
 
@@ -1755,19 +1654,15 @@ def _paint_job_chrome() -> None:
         _paint_queue_panel(force=True)
 
 
-def _set_job_progress(done: int, total: int) -> None:
-    """Pair-lane job progress (combine/crawl/etc.)."""
-    global _job_done, _job_total
-    _job_done = done
-    _job_total = total
-    _paint_job_chrome()
-
-
-def _set_ib_job_progress(done: int, total: int) -> None:
-    """IB-lane job progress (import/fill/prune) — does not clobber pair chrome."""
-    global _ib_job_done, _ib_job_total
-    _ib_job_done = done
-    _ib_job_total = total
+def _set_lane_progress(lane: str, done: int, total: int) -> None:
+    """Set job progress for one chrome lane ('pair' or 'ib'); does not clobber the other."""
+    global _job_done, _job_total, _ib_job_done, _ib_job_total
+    if lane == "ib":
+        _ib_job_done = done
+        _ib_job_total = total
+    else:
+        _job_done = done
+        _job_total = total
     _paint_job_chrome()
 
 
@@ -1777,158 +1672,49 @@ def _set_last_pair(a: str, b: str) -> None:
     _paint_job_chrome()
 
 
-def _clear_job_chrome() -> None:
-    """Clear pair-lane chrome only (IB worker clears its own progress)."""
-    global _job_done, _job_total, _last_pair
-    _job_done = 0
-    _job_total = 0
-    _last_pair = None
+def _clear_lane_progress(lane: str) -> None:
+    """Zero one lane's progress; pair also clears _last_pair."""
+    global _job_done, _job_total, _ib_job_done, _ib_job_total, _last_pair
+    if lane == "ib":
+        _ib_job_done = 0
+        _ib_job_total = 0
+    else:
+        _job_done = 0
+        _job_total = 0
+        _last_pair = None
     _paint_job_chrome()
-
-
-def _clear_ib_job_chrome() -> None:
-    global _ib_job_done, _ib_job_total
-    _ib_job_done = 0
-    _ib_job_total = 0
-    _paint_job_chrome()
-
-
-def _rate_snapshot() -> tuple[int, int, float]:
-    """Best-effort ``(slots_left, max, next_slot_frac)`` for chrome.
-
-    Never raises or returns a coroutine. ``next_slot_frac`` is 1.0 when idle.
-    """
-    left, maximum, frac = (60, 60, 1.0)
-    client = _active_client
-    if client is None:
-        return left, maximum, frac
-    try:
-        limiter = getattr(client, "_rate_limiter", None)
-        if limiter is None:
-            return left, maximum, frac
-        # Prefer chrome_snapshot (3-tuple); fall back to remaining() (2-tuple).
-        snap_fn = getattr(limiter, "chrome_snapshot", None)
-        if callable(snap_fn) and not asyncio.iscoroutinefunction(snap_fn):
-            snap = snap_fn()
-            if asyncio.isfuture(snap) or asyncio.iscoroutine(snap):
-                with contextlib.suppress(Exception):
-                    if asyncio.iscoroutine(snap):
-                        snap.close()
-                return left, maximum, frac
-            if (
-                isinstance(snap, tuple)
-                and len(snap) == 3
-                and all(isinstance(x, (int, float)) for x in snap)
-            ):
-                return int(snap[0]), int(snap[1]), float(snap[2])
-        remaining_fn = getattr(limiter, "remaining", None)
-        if not callable(remaining_fn) or asyncio.iscoroutinefunction(remaining_fn):
-            return left, maximum, frac
-        snap = remaining_fn()
-        if asyncio.isfuture(snap) or asyncio.iscoroutine(snap):
-            with contextlib.suppress(Exception):
-                if asyncio.iscoroutine(snap):
-                    snap.close()
-            return left, maximum, frac
-        if isinstance(snap, tuple) and len(snap) == 2:
-            a, b = snap
-            if isinstance(a, (int, float)) and isinstance(b, (int, float)):
-                return int(a), int(b), 1.0
-    except Exception:
-        pass
-    return left, maximum, frac
-
-
-def _rate_bar_segment(filled: int, width: int) -> str:
-    filled = max(0, min(width, filled))
-    return "█" * filled + "░" * (width - filled)
-
-
-def _rate_bar_fills(
-    remaining: int,
-    maximum: int,
-    oldest_frac: float = 1.0,
-    *,
-    left_width: int = _RATE_BAR_LEFT,
-    right_width: int = _RATE_BAR_RIGHT,
-) -> tuple[int, int]:
-    """Kernel pure fill counts for the segmented rate bar."""
-    frac_milli = int(round(max(0.0, min(1.0, oldest_frac)) * 1000))
-    return craft.rate_bar_fills(
-        remaining, maximum, frac_milli, left_width, right_width
-    )
-
-
-def _rate_bar_text(
-    remaining: int,
-    maximum: int,
-    oldest_frac: float = 1.0,
-    *,
-    left_width: int = _RATE_BAR_LEFT,
-    right_width: int = _RATE_BAR_RIGHT,
-) -> str:
-    """Plain (uncolored) segmented bar: left age + right remaining capacity."""
-    left_filled, right_filled = _rate_bar_fills(
-        remaining,
-        maximum,
-        oldest_frac,
-        left_width=left_width,
-        right_width=right_width,
-    )
-    return _rate_bar_segment(left_filled, left_width) + _rate_bar_segment(
-        right_filled, right_width
-    )
 
 
 def _rate_bar_colored(
     remaining: int,
     maximum: int,
-    oldest_frac: float = 1.0,
+    frac_milli: int = 1000,
     *,
+    colored: bool = True,
     left_width: int = _RATE_BAR_LEFT,
     right_width: int = _RATE_BAR_RIGHT,
 ) -> str:
-    """Segmented bar with purple/magenta next-slot wait + cyan capacity (no separator)."""
-    left_filled, right_filled = _rate_bar_fills(
-        remaining,
-        maximum,
-        oldest_frac,
-        left_width=left_width,
-        right_width=right_width,
+    """Segmented bar: left age + right remaining capacity.
+
+    When colored=True (default), magenta next-slot wait + cyan capacity.
+    When colored=False, plain ASCII segments (no ANSI) for /queue status.
+    ``frac_milli`` is thousandths progress [0, 1000] from chrome_snapshot.
+    """
+    left_filled, right_filled = craft.rate_bar_fills(
+        remaining, maximum, frac_milli, left_width, right_width
     )
-    left_part = _rate_bar_segment(left_filled, left_width)
-    right_part = _rate_bar_segment(right_filled, right_width)
+    left_part = craft.rate_bar_segment(left_filled, left_width)
+    right_part = craft.rate_bar_segment(right_filled, right_width)
+    if not colored:
+        return left_part + right_part
     # MAGENTA reads as purple in most terminals; cyan matches the trainer.
     return _color(left_part, MAGENTA) + _color(right_part, CYAN)
-
-
-def _ellipsize_end(s: str, max_chars: int) -> str:
-    if max_chars <= 0:
-        return ""
-    if _ansi_visible_len(s) <= max_chars:
-        return s
-    if max_chars == 1:
-        return "…"
-    return _fit_visible(s, max_chars - 1) + "…"
-
-
-def _format_pair_for_width(a: str, b: str, avail: int) -> str:
-    sep = " + "
-    if avail <= len(sep) + 2:
-        return _ellipsize_end(f"{a}{sep}{b}", avail)
-    each = max(1, (avail - len(sep)) // 2)
-    left_extra = (avail - len(sep)) - each * 2
-    return _ellipsize_end(a, each + left_extra) + sep + _ellipsize_end(b, each)
-
-
-def _command_may_bulk_confirm(line: str) -> bool:
-    return craft.may_bulk_confirm(line)
 
 
 def _awaiting_bulk_confirm_setup() -> bool:
     """True while a bulk command is starting but confirm UI is not ready yet."""
     return (
-        _current_command is not None
+        bool(_current_command)
         and not _bulk_confirm_resolved
         and not _waiting_for_confirm()
     )
@@ -1974,6 +1760,60 @@ async def _await_confirmation(prompt: str) -> str:
             _chrome_sync()
 
 
+async def _prompt_continue(
+    warn_lines: str | list[str],
+    *,
+    bulk_pending: bool = False,
+    cancel_msg: str = "Cancelled.",
+) -> bool:
+    """Print warn lines, await y/n, return True to continue / False to cancel.
+
+    Owns cleanup of _bulk_confirm_pending / _confirm_expected / _confirm_answer_buffer.
+    Policy is craft.confirm_should_continue; I/O is _await_confirmation.
+    EOF/KeyboardInterrupt → cancel.
+    """
+    global _bulk_confirm_pending, _confirm_expected, _confirm_answer_buffer
+
+    # Bulk path mirrors historical isatty-only prompt; target hit also allows
+    # interactive mode without a TTY (harness / non-TTY interactive).
+    can_prompt = sys.stdin.isatty() if bulk_pending else (
+        sys.stdin.isatty() or _interactive_mode_active
+    )
+
+    if bulk_pending and can_prompt:
+        _bulk_confirm_pending = True
+        _chrome_sync()
+
+    if isinstance(warn_lines, str):
+        _repl_print_lines(warn_lines)
+    else:
+        for line in warn_lines:
+            _repl_print_lines(line)
+
+    if not can_prompt:
+        return True
+
+    try:
+        try:
+            answer = await _await_confirmation("")
+        except (EOFError, KeyboardInterrupt):
+            _repl_print_lines(f"  {cancel_msg}")
+            _mark_cancel_notified()
+            return False
+        if not craft.confirm_should_continue(answer):
+            _repl_print_lines(f"  {cancel_msg}")
+            _mark_cancel_notified()
+            return False
+        return True
+    finally:
+        _bulk_confirm_pending = False
+        _confirm_expected = False
+        _confirm_answer_buffer = None
+        if _chrome_enabled:
+            _chrome_prompt = _craft_prompt()
+        _chrome_sync()
+
+
 async def _sleep_cancellable_async(seconds: float, step: float = 0.1) -> bool:
     """Async sleep in small chunks; return True if cancelled during sleep."""
     elapsed = 0.0
@@ -1984,20 +1824,6 @@ async def _sleep_cancellable_async(seconds: float, step: float = 0.1) -> bool:
         await asyncio.sleep(chunk)
         elapsed += chunk
     return _cancelled
-
-
-def _run_sync(coro):
-    """Run a coroutine from synchronous CLI entry points."""
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        try:
-            return loop.run_until_complete(coro)
-        finally:
-            loop.close()
-        return
-    raise RuntimeError("use the async entry point from interactive mode")
 
 
 async def _combine_pairs(client, storage, pairs: list[tuple]):
@@ -2029,7 +1855,7 @@ async def _combine_pairs(client, storage, pairs: list[tuple]):
     nothing_count = 0
     done_count = 0
     known_names = {e.name for e in storage.get_all()}
-    _set_job_progress(0, total)
+    _set_lane_progress("pair", 0, total)
 
     async def process(a, b):
         nonlocal new_count, nothing_count, done_count
@@ -2038,30 +1864,30 @@ async def _combine_pairs(client, storage, pairs: list[tuple]):
         # last-pair while the first fetch/rate-wait is outstanding.
         in_flight = min(total, done_count + 1)
         if in_flight > 0:
-            _set_job_progress(in_flight, total)
+            _set_lane_progress("pair", in_flight, total)
         try:
             result = await _cached_pair(client, storage, a, b)
         except CommandCancelled:
             return
         except Exception as e:
             done_count += 1
-            _set_job_progress(done_count, total)
+            _set_lane_progress("pair", done_count, total)
             _repl_print_lines(
                 f"  [{done_count}/{total}] {format_element(a)} + {format_element(b)} = "
                 f"{_color(f'Error: {_tty(str(e))}', RED)}"
             )
             return
         done_count += 1
-        _set_job_progress(done_count, total)
+        _set_lane_progress("pair", done_count, total)
         if result.name is not None:
             for elem in (a, b):
                 storage.add(
-                    name=_sanitize_element_name(elem.name),
+                    name=craft.sanitize_element_name(elem.name),
                     emoji=elem.emoji,
                     is_first_discovery=False,
                 )
             storage.add(
-                name=_sanitize_element_name(result.name),
+                name=craft.sanitize_element_name(result.name),
                 emoji=result.emoji,
                 is_first_discovery=result.is_first_discovery,
             )
@@ -2075,76 +1901,52 @@ async def _combine_pairs(client, storage, pairs: list[tuple]):
                 tag = " " + _color("[NEW]", BOLD + GREEN)
                 new_count += 1
                 known_names.add(result.name)
-            if _is_target_hit(result.name):
+            hit = craft.is_target_hit(_target_element, result.name or "")
+            if hit:
                 tag += " " + _color("★ TARGET ★", BOLD + YELLOW + MAGENTA)
             _repl_print_lines(
                 f"  [{done_count}/{total}] {format_element(a)} + {format_element(b)} = "
                 f"{format_element(result)}{tag}"
             )
-            if _is_target_hit(result.name):
-                stop = await _acknowledge_target_hit(a.name, b.name, result.name)
+            if hit:
+                stop = await _acknowledge_target_hit(a.name, b.name, result.name or "")
                 if stop:
                     return
 
     # Process in batches of API_CONCURRENCY to avoid overwhelming the rate limiter
-    try:
-        for i in range(0, len(pairs), API_CONCURRENCY):
-            if _cancelled:
-                break
-            batch = pairs[i : i + API_CONCURRENCY]
-            # Show the first pair of each batch immediately (before the fetch).
-            if batch:
-                _set_last_pair(batch[0][0].name, batch[0][1].name)
-            await asyncio.gather(*(process(a, b) for a, b in batch))
-
+    for i in range(0, len(pairs), API_CONCURRENCY):
         if _cancelled:
-            _repl_print_lines(
-                f"  Cancelled. {_color(str(new_count), GREEN)} new, "
-                f"{nothing_count} nothing, {done_count}/{total} tried."
-            )
-            _mark_cancel_notified()
-        else:
-            _repl_print_lines(
-                f"  Done. {_color(str(new_count), GREEN)} new, {nothing_count} nothing, {total} tried."
-            )
-    finally:
-        # Leave last pair/progress visible until the worker clears chrome on
-        # command end; only reset when this call had no outer command context.
-        pass
+            break
+        batch = pairs[i : i + API_CONCURRENCY]
+        # Show the first pair of each batch immediately (before the fetch).
+        if batch:
+            _set_last_pair(batch[0][0].name, batch[0][1].name)
+        await asyncio.gather(*(process(a, b) for a, b in batch))
+
+    if _cancelled:
+        _repl_print_lines(
+            f"  Cancelled. {_color(str(new_count), GREEN)} new, "
+            f"{nothing_count} nothing, {done_count}/{total} tried."
+        )
+        _mark_cancel_notified()
+    else:
+        _repl_print_lines(
+            f"  Done. {_color(str(new_count), GREEN)} new, {nothing_count} nothing, {total} tried."
+        )
 
 
 async def _confirm_and_run_pairs(client, storage, pairs: list[tuple]):
     """Warn if too many pairs, then run them."""
-    global _confirm_expected, _bulk_confirm_pending, _bulk_confirm_resolved
-    if len(pairs) <= _BULK_WARN_THRESHOLD:
-        _bulk_confirm_resolved = True
-    if len(pairs) > _BULK_WARN_THRESHOLD:
-        if sys.stdin.isatty():
-            _bulk_confirm_pending = True
-            _chrome_sync()
-        _repl_print_lines(
+    global _bulk_confirm_resolved
+    if craft.should_bulk_warn(len(pairs), _BULK_WARN_THRESHOLD):
+        if not await _prompt_continue(
             f"  {_color(f'{len(pairs)} pairs', YELLOW)} — press "
-            f"{_color('y', BOLD)} to continue, {_color('n', BOLD)} / Esc to cancel."
-        )
-        if sys.stdin.isatty():
-            try:
-                try:
-                    answer = (await _await_confirmation("")).strip().lower()
-                except (EOFError, KeyboardInterrupt):
-                    _repl_print_lines("  Cancelled.")
-                    _mark_cancel_notified()
-                    return
-                if not craft.confirm_should_continue(answer):
-                    _repl_print_lines("  Cancelled.")
-                    _mark_cancel_notified()
-                    return
-            finally:
-                _bulk_confirm_pending = False
-                _confirm_expected = False
-                _confirm_answer_buffer = None
-                if _chrome_enabled:
-                    _chrome_prompt = _craft_prompt()
-                _chrome_sync()
+            f"{_color('y', BOLD)} to continue, {_color('n', BOLD)} / Esc to cancel.",
+            bulk_pending=True,
+        ):
+            return
+        _bulk_confirm_resolved = True
+    else:
         _bulk_confirm_resolved = True
     await _combine_pairs(client, storage, pairs)
 
@@ -2218,34 +2020,13 @@ async def do_permutate(client, storage, query: str):
                 f"  --- Round {round_num}: {n} elements, {len(pairs)} pairs ---"
             )
 
-            if not confirmed and len(pairs) > _BULK_WARN_THRESHOLD:
-                if sys.stdin.isatty():
-                    global _bulk_confirm_pending
-                    _bulk_confirm_pending = True
-                    _chrome_sync()
-                _repl_print_lines(
+            if not confirmed and craft.should_bulk_warn(len(pairs), _BULK_WARN_THRESHOLD):
+                if not await _prompt_continue(
                     f"  {_color(f'{len(pairs)} pairs per round', YELLOW)} — press "
-                    f"{_color('y', BOLD)} to continue, {_color('n', BOLD)} / Esc to cancel."
-                )
-                if sys.stdin.isatty():
-                    try:
-                        try:
-                            answer = (await _await_confirmation("")).strip().lower()
-                        except (EOFError, KeyboardInterrupt):
-                            _repl_print_lines("  Cancelled.")
-                            _mark_cancel_notified()
-                            return
-                        if not craft.confirm_should_continue(answer):
-                            _repl_print_lines("  Cancelled.")
-                            _mark_cancel_notified()
-                            return
-                    finally:
-                        _bulk_confirm_pending = False
-                        _confirm_expected = False
-                        _confirm_answer_buffer = None
-                        if _chrome_enabled:
-                            _chrome_prompt = _craft_prompt()
-                        _chrome_sync()
+                    f"{_color('y', BOLD)} to continue, {_color('n', BOLD)} / Esc to cancel.",
+                    bulk_pending=True,
+                ):
+                    return
                 confirmed = True
                 _bulk_confirm_resolved = True
             elif not confirmed:
@@ -2322,31 +2103,15 @@ async def do_cross(client, storage, left_query: str, right_query: str):
 _IB_BASE = "https://infinibrowser.wiki/api"
 
 
-def _ib_fetch(path: str, params: dict, use_cache: bool = True) -> dict | None:
-    """Fetch from the Infinibrowser API. Prints errors on failure."""
+def _ib_fetch(
+    path: str, params: dict, use_cache: bool = True, quiet: bool = False
+) -> dict | None:
+    """Fetch from the Infinibrowser API. Prints errors on failure unless quiet."""
     result = fetch_json(f"{_IB_BASE}/{path}", params=params, use_cache=use_cache)
-    if result is None:
+    if result is None and not quiet:
         _repl_print_lines(f"  {_color('Infinibrowser request failed', RED)}")
     return result
 
-
-def _ib_fetch_quiet(path: str, params: dict) -> dict | None:
-    """Fetch from the Infinibrowser API. Silent on errors."""
-    return fetch_json(f"{_IB_BASE}/{path}", params=params)
-
-
-async def _ib_fetch_async(
-    path: str, params: dict, *, use_cache: bool = True
-) -> dict | None:
-    return await asyncio.to_thread(_ib_fetch, path, params, use_cache)
-
-
-async def _ib_fetch_quiet_async(path: str, params: dict) -> dict | None:
-    return await asyncio.to_thread(_ib_fetch_quiet, path, params)
-
-
-async def _ib_can_fill_async(name: str) -> bool | None:
-    return await asyncio.to_thread(_ib_can_fill, name)
 
 
 def _lineage_step_tuples(steps) -> list[tuple[str, str, str, str, str, str]]:
@@ -2373,7 +2138,7 @@ def _lineage_step_tuples(steps) -> list[tuple[str, str, str, str, str, str]]:
 
 async def _import_from_infinibrowser_async(storage, name: str) -> str:
     """Look up an element on Infinibrowser, show its lineage, and import into discoveries."""
-    data = await _ib_fetch_async("item", {"id": name})
+    data = await asyncio.to_thread(_ib_fetch, "item", {"id": name})
     if data is None:
         return ""
     if "code" in data:
@@ -2381,11 +2146,11 @@ async def _import_from_infinibrowser_async(storage, name: str) -> str:
 
     emoji = data.get("emoji", "")
     depth = data.get("depth", "?")
-    item_name = _sanitize_element_name(data["text"])
+    item_name = craft.sanitize_element_name(data["text"])
     found_elem = Element(name=item_name, emoji=emoji or None, is_first_discovery=None)
     _repl_print_lines(f"  Found: {format_element(found_elem)}  (depth {depth})")
 
-    lineage = await _ib_fetch_async("recipe", {"id": name}, use_cache=False)
+    lineage = await asyncio.to_thread(_ib_fetch, "recipe", {"id": name}, False)
     if lineage is None:
         return ""
     steps = lineage.get("steps", [])
@@ -2409,10 +2174,6 @@ async def _import_from_infinibrowser_async(storage, name: str) -> str:
 
     storage.reload()
     return f"  Imported {_color(str(len(import_batch)), GREEN)} elements into discoveries."
-
-
-def _import_from_infinibrowser(storage, name: str) -> str:
-    return _run_sync(_import_from_infinibrowser_async(storage, name))
 
 
 def _import_from_save(storage, path: str) -> str:
@@ -2475,10 +2236,6 @@ async def do_import_async(storage, arg: str) -> str:
     return await _import_from_infinibrowser_async(storage, arg)
 
 
-def do_import(storage, arg: str) -> str:
-    return _run_sync(do_import_async(storage, arg))
-
-
 async def _fill_missing_recipes_async(storage):
     """Fetch lineages from Infinibrowser for elements missing recipes.
 
@@ -2505,7 +2262,7 @@ async def _fill_missing_recipes_async(storage):
     failed = set()
     processed = 0
     queue = sorted(missing)
-    _set_ib_job_progress(0, total)
+    _set_lane_progress("ib", 0, total)
     try:
         for name in queue:
             if _cancelled:
@@ -2520,17 +2277,22 @@ async def _fill_missing_recipes_async(storage):
                 skipped += 1
                 continue
             processed += 1
-            _set_ib_job_progress(processed, total)
+            _set_lane_progress("ib", processed, total)
             remaining = total - fetched - skipped - len(failed)
             e = storage.get_by_name(name) or Element(name=name)
             _repl_print_lines(
                 f"  [{processed}/{total}] {format_element(e)} ({remaining} remaining)..."
             )
-            data = await _ib_fetch_quiet_async("item", {"id": name})
+            data = await asyncio.to_thread(
+                _ib_fetch, "item", {"id": name}, quiet=True
+            )
             if data is None or "code" in data:
                 failed.add(name)
                 continue
-            lineage = await _ib_fetch_quiet_async("recipe", {"id": name})
+            lineage = await asyncio.to_thread(
+                _ib_fetch, "recipe", {"id": name}, quiet=True
+            )
+
             if lineage is None:
                 failed.add(name)
                 continue
@@ -2559,10 +2321,6 @@ async def _fill_missing_recipes_async(storage):
     _repl_print_lines(summary)
 
 
-def _fill_missing_recipes(storage):
-    _run_sync(_fill_missing_recipes_async(storage))
-
-
 def do_unfilled(storage) -> str:
     """List elements that have no recipes (excluding base elements)."""
     recipes = _load_recipes()
@@ -2577,15 +2335,6 @@ def do_unfilled(storage) -> str:
     for e in missing:
         lines.append(f"    {format_element(e)}")
     return "\n".join(lines)
-
-
-def _included_element_names(
-    recipes: dict[str, list[list[str]]] | None = None,
-) -> set[str]:
-    """Names in the export/prune closure: bases, recipe results, and their constituents."""
-    if recipes is None:
-        recipes = _load_recipes()
-    return set(craft.included_element_names_boundary(recipes))
 
 
 def _orphan_candidates(storage) -> list:
@@ -2654,7 +2403,7 @@ async def _prune_orphans_async(storage):
                 _mark_cancel_notified()
                 break
             _repl_print_lines(f"  [{i}/{total}] {format_element(elem)}...")
-            fillable = await _ib_can_fill_async(elem.name)
+            fillable = await asyncio.to_thread(_ib_can_fill, elem.name)
             if fillable is None:
                 skipped += 1
             elif fillable:
@@ -2677,21 +2426,6 @@ async def _prune_orphans_async(storage):
     if skipped:
         summary += f" {_color(str(skipped), YELLOW)} skipped (API errors)."
     _repl_print_lines(summary)
-
-
-def _prune_orphans(storage):
-    _run_sync(_prune_orphans_async(storage))
-
-
-def _export_included(storage) -> list[tuple[str, str, bool]]:
-    """Pure export-selection core: kernel's export/prune closure applied to
-    this storage's current discoveries, as (name, emoji, first) triples in
-    input (discoveries) order. Also used directly by
-    tests/parity/run_py.py's host-parity harness — keep this exact name and
-    signature."""
-    recipes = _load_recipes()
-    elements = _elements_to_boundary(storage.get_all())
-    return craft.export_elements_boundary(elements, recipes)
 
 
 def do_export(storage, path: str = EXPORT_PATH) -> str:
@@ -2813,46 +2547,21 @@ _API_SLASH_COMMANDS = (
     "/cross",
 )
 
-def _is_local_command(line: str) -> bool:
-    """Commands that run immediately without queuing behind API work."""
-    return craft.is_local_command(line)
-
-
-def _is_ib_command(line: str) -> bool:
-    """True when the line is an Infinibrowser-backed long command (own queue)."""
-    return bool(line) and craft.is_ib_command(line)
-
-
-def _command_queue_lane(line: str) -> str:
-    """Kernel lane: ``local`` | ``ib`` | ``pair``."""
-    return craft.command_queue_lane(line)
-
-
-def _is_target_hit(result_name: str | None) -> bool:
-    """True when a combination result matches the active /target name (exact)."""
-    if not result_name or _target_element is None:
-        return False
-    return craft.is_target_hit(_target_element, result_name)
-
-
 def do_target(arg: str) -> str:
     """Set, clear, or show the combination target element (rules in kernel)."""
     global _target_element
     action, name = craft.parse_target_arg(arg)
-    current = _target_element or ""
-    new_state = craft.apply_target_state(current, action, name)
-    if action == "show":
-        if not new_state:
-            return f"  No target set. Usage: {_color('/target <element>', YELLOW)}"
+    kind, new_state, detail = craft.target_outcome(_target_element, action, name)
+    if kind == "show_empty":
+        return f"  No target set. Usage: {_color('/target <element>', YELLOW)}"
+    if kind == "show":
         return f"  Target: {_color(new_state, BOLD + YELLOW)}"
-    if action == "clear":
-        prev = _target_element
-        _target_element = new_state or None
-        if prev is None:
-            return "  No target was set."
-        return f"  Target cleared (was {_color(prev, YELLOW)})."
-    # action == "set"
-    _target_element = new_state or None
+    # Mutating kinds: assign session target, then host-format message.
+    _target_element = new_state
+    if kind == "clear_empty":
+        return "  No target was set."
+    if kind == "clear":
+        return f"  Target cleared (was {_color(detail, YELLOW)})."
     return (
         f"  Target set: {_color(new_state, BOLD + YELLOW)} — "
         "batch work pauses when this is crafted."
@@ -2872,41 +2581,14 @@ async def _acknowledge_target_hit(a_name: str, b_name: str, result_name: str) ->
             f"  {_color('★ TARGET HIT ★', BOLD + YELLOW)} "
             f"{_tty(a_name)} + {_tty(b_name)} = {_color(_tty(result_name), BOLD + YELLOW + MAGENTA)}"
         )
-        _repl_print_lines(
-            f"  Press {_color('y', BOLD)} to continue, {_color('n', BOLD)} / Esc to stop the batch."
-        )
-        if not sys.stdin.isatty() and not _interactive_mode_active:
-            # Non-interactive: report hit and keep going (no prompt available).
-            return False
-        try:
-            answer = (await _await_confirmation("")).strip().lower()
-        except (EOFError, KeyboardInterrupt):
+        if not await _prompt_continue(
+            f"  Press {_color('y', BOLD)} to continue, {_color('n', BOLD)} / Esc to stop the batch.",
+            cancel_msg="Stopped after target hit.",
+        ):
             _cancelled = True
-            _mark_cancel_notified()
-            _repl_print_lines("  Stopped after target hit.")
-            return True
-        if not craft.confirm_should_continue(answer):
-            _cancelled = True
-            _mark_cancel_notified()
-            _repl_print_lines("  Stopped after target hit.")
             return True
         _repl_print_lines(f"  {_color('Continuing…', DIM)}")
         return False
-
-
-def _is_slash_command_attempt(line: str) -> bool:
-    """True when input looks like a mistyped /command, not a regex cross query."""
-    return craft.is_slash_command_attempt(line)
-
-
-def _classify_command_line(line: str) -> tuple[str, str] | None:
-    """Classify a queuable command. Returns (kind, payload) or None if unrecognized."""
-    return craft.classify_command_line(line)
-
-
-def _validate_query_at_enqueue(query: str) -> str | None:
-    """Return an error message if a with/cross query is invalid before enqueue."""
-    return craft.validate_query_at_enqueue(query)
 
 
 def _validate_command_line(line: str) -> str | None:
@@ -2920,20 +2602,14 @@ def _validate_command_line(line: str) -> str | None:
     return _render_error_segments(segments)
 
 
-def _is_recognized_command(line: str) -> bool:
-    """Whether interactive input is a known command or shorthand."""
-    if _is_local_command(line):
-        return True
-    if line in ("/quit", "/exit"):
-        return True
-    return _validate_command_line(line) is None
-
-
 def do_queue_status() -> str:
     """Describe the current command queue (pair + IB lanes)."""
-    left, maximum, oldest_frac = _rate_snapshot()
+    if _active_client is None:
+        left, maximum, frac_milli = (60, 60, 1000)
+    else:
+        left, maximum, frac_milli = _active_client._rate_limiter.chrome_snapshot()
     rate_line = (
-        f"  rate {_rate_bar_text(left, maximum, oldest_frac)} {left}/{maximum}"
+        f"  rate {_rate_bar_colored(left, maximum, frac_milli, colored=False)} {left}/{maximum}"
     )
     pair_q = list(_command_queue)
     ib_q = list(_ib_command_queue)
@@ -2983,8 +2659,11 @@ def _format_queue_display() -> str:
     content: list[str] = []
 
     # --- Permanent rate line (always) ---
-    left, maximum, oldest_frac = _rate_snapshot()
-    bar = _rate_bar_colored(left, maximum, oldest_frac)
+    if _active_client is None:
+        left, maximum, frac_milli = (60, 60, 1000)
+    else:
+        left, maximum, frac_milli = _active_client._rate_limiter.chrome_snapshot()
+    bar = _rate_bar_colored(left, maximum, frac_milli)
     rate_prefix = f"  {_color('rate', DIM)} {bar} {left}/{maximum}"
     pair_part = ""
     if _current_command and _last_pair is not None:
@@ -2992,7 +2671,7 @@ def _format_queue_display() -> str:
         pvis = _ansi_visible_len(rate_prefix) + 3  # " · "
         avail = max(8, width - pvis - 1)
         pair_part = (
-            f" {_color('·', DIM)} {_sanitize_queue_line(_format_pair_for_width(a, b, avail))}"
+            f" {_color('·', DIM)} {_sanitize_queue_line(craft.rate_format_pair_for_width(a, b, avail))}"
         )
     content.append(rate_prefix + pair_part)
 
@@ -3130,29 +2809,17 @@ def _craft_prompt() -> str:
     return base + hint
 
 
-def _queue_enqueue_deferred(line: str | None = None) -> bool:
-    """True when a new command will wait behind in-flight or queued work on its lane."""
-    if line is not None and _is_ib_command(line):
-        return _current_ib_command is not None or bool(list(_ib_command_queue))
-    return (
-        _current_command is not None
-        or bool(list(_command_queue))
-        or _waiting_for_confirm()
-        or _bulk_confirm_pending
-    )
-
-
 async def _dispatch_line(client, storage, line: str) -> None:
     """Execute one input line from the API worker or immediate local commands."""
     if line == "/help":
         _repl_print_lines(do_help())
-    elif (rest := _slash_args(line, "/search")) is not None:
+    elif (rest := craft.slash_args(line, "/search")) is not None:
         if not rest:
             msg = "  Usage: /search <query>"
         else:
             msg = do_search(storage, rest)
         _repl_print_lines(msg)
-    elif (rest := _slash_args(line, "/recipe")) is not None:
+    elif (rest := craft.slash_args(line, "/recipe")) is not None:
         if not rest:
             msg = "  Usage: /recipe <element>"
         else:
@@ -3160,63 +2827,63 @@ async def _dispatch_line(client, storage, line: str) -> None:
         _repl_print_lines(msg)
     elif line == "/list":
         _repl_print_lines(do_list(storage))
-    elif (rest := _slash_args(line, "/permute")) is not None:
+    elif (rest := craft.slash_args(line, "/permute")) is not None:
         if (err := _validate_command_line(line)) is not None:
             _repl_print_lines(err)
         else:
             await do_permute(client, storage, rest)
-    elif (rest := _slash_args(line, "/permutate")) is not None:
+    elif (rest := craft.slash_args(line, "/permutate")) is not None:
         if (err := _validate_command_line(line)) is not None:
             _repl_print_lines(err)
         else:
             await do_permutate(client, storage, rest)
-    elif (rest := _slash_args(line, "/import")) is not None:
+    elif (rest := craft.slash_args(line, "/import")) is not None:
         if (err := _validate_command_line(line)) is not None:
             msg = err
         else:
             msg = await do_import_async(storage, rest)
         _repl_print_lines(msg)
-    elif (rest := _slash_args(line, "/unfilled")) is not None:
+    elif (rest := craft.slash_args(line, "/unfilled")) is not None:
         _repl_print_lines(do_unfilled(storage))
-    elif (rest := _slash_args(line, "/fill")) is not None:
+    elif (rest := craft.slash_args(line, "/fill")) is not None:
         await _fill_missing_recipes_async(storage)
-    elif (rest := _slash_args(line, "/prune")) is not None:
+    elif (rest := craft.slash_args(line, "/prune")) is not None:
         await _prune_orphans_async(storage)
-    elif (rest := _slash_args(line, "/export")) is not None:
+    elif (rest := craft.slash_args(line, "/export")) is not None:
         _repl_print_lines(do_export(storage, rest or EXPORT_PATH))
-    elif (rest := _slash_args(line, "/exhaust")) is not None:
+    elif (rest := craft.slash_args(line, "/exhaust")) is not None:
         if (err := _validate_command_line(line)) is not None:
             _repl_print_lines(err)
         else:
             await do_exhaust(client, storage, rest)
-    elif (rest := _slash_args(line, "/combine")) is not None:
+    elif (rest := craft.slash_args(line, "/combine")) is not None:
         if (err := _validate_command_line(line)) is not None:
             msg = err
         else:
-            first, second = _parse_two_elements(rest)
+            first, second = craft.parse_two_elements(rest)
             msg = await do_combine(client, storage, first, second)
         _repl_print_lines(msg)
-    elif (rest := _slash_args(line, "/crawl")) is not None:
+    elif (rest := craft.slash_args(line, "/crawl")) is not None:
         if (err := _validate_command_line(line)) is not None:
             _repl_print_lines(err)
         else:
-            first, second = _parse_two_elements(rest)
+            first, second = craft.parse_two_elements(rest)
             await do_crawl(client, storage, first, second)
-    elif (rest := _slash_args(line, "/with")) is not None:
+    elif (rest := craft.slash_args(line, "/with")) is not None:
         if (err := _validate_command_line(line)) is not None:
             _repl_print_lines(err)
         else:
-            element, query = _parse_with_args(rest)
+            element, query = craft.parse_with_args(rest)
             await do_with(client, storage, element, query)
-    elif (rest := _slash_args(line, "/cross")) is not None:
+    elif (rest := craft.slash_args(line, "/cross")) is not None:
         if (err := _validate_command_line(line)) is not None:
             _repl_print_lines(err)
         else:
-            left_q, right_q = _parse_cross_queries(rest)
+            left_q, right_q = craft.parse_cross_queries(rest)
             await do_cross(client, storage, left_q, right_q)
     elif line == "/history":
         _repl_print_lines(do_history(storage))
-    elif (rest := _slash_args(line, "/target")) is not None:
+    elif (rest := craft.slash_args(line, "/target")) is not None:
         _repl_print_lines(do_target(rest))
     elif line == "/queue":
         _paint_queue_panel(force=True)
@@ -3233,7 +2900,7 @@ async def _dispatch_line(client, storage, line: str) -> None:
             print(f"  {_color('(terminal has no output buffer to clear)', DIM)}")
         else:
             _chrome_sync()
-    elif (classified := _classify_command_line(line)) is not None and classified[
+    elif (classified := craft.classify_command_line(line)) is not None and classified[
         0
     ] in ("bad+|", "++", "+|", "*", "+"):
         kind, payload = classified
@@ -3256,20 +2923,68 @@ async def _dispatch_line(client, storage, line: str) -> None:
         )
 
 
-async def _api_worker(client, storage):
-    """Process pair-API queue (neal.fun combine/crawl/etc.) FIFO."""
-    global _current_command
-    global _bulk_confirm_resolved
-    global _skip_summary_shown
-    while _command_queue:
-        # Don't clear cancel if IB lane is mid-flight (shared _cancelled flag).
-        if _current_ib_command is None:
+class _LaneCfg:
+    """Per-lane worker config: queue, current command, cancel-reset, bulk confirm."""
+
+    __slots__ = ("lane", "bulk_confirm")
+
+    def __init__(self, lane: str, *, bulk_confirm: bool = False):
+        self.lane = lane
+        self.bulk_confirm = bulk_confirm
+
+    @property
+    def queue(self) -> list:
+        # Live global (interactive_mode may rebind the list).
+        return _ib_command_queue if self.lane == "ib" else _command_queue
+
+    def get_current(self) -> str:
+        return _current_ib_command if self.lane == "ib" else _current_command
+
+    def set_current(self, value: str) -> None:
+        global _current_command, _current_ib_command
+        if self.lane == "ib":
+            _current_ib_command = value
+        else:
+            _current_command = value
+
+    def cancel_reset(self) -> bool:
+        """Start-of-job: clear shared cancel when peer lane is idle."""
+        peer_busy = (
+            bool(_current_command)
+            if self.lane == "ib"
+            else bool(_current_ib_command)
+        )
+        return craft.lane_should_reset_cancel(
+            self.lane, peer_busy, _waiting_for_confirm()
+        )
+
+    def soft_cancel_reset(self) -> bool:
+        """After soft-skip: pair always; IB only if pair idle."""
+        peer_busy = (
+            bool(_current_command)
+            if self.lane == "ib"
+            else bool(_current_ib_command)
+        )
+        return craft.lane_should_soft_reset_cancel(self.lane, peer_busy)
+
+
+_pair_cfg = _LaneCfg("pair", bulk_confirm=True)
+_ib_cfg = _LaneCfg("ib", bulk_confirm=False)
+
+
+async def _lane_worker(cfg: _LaneCfg, client, storage):
+    """Process one command lane (pair or IB) FIFO."""
+    global _bulk_confirm_resolved, _skip_summary_shown
+    while cfg.queue:
+        # Don't clear cancel if the peer lane is mid-flight (shared _cancelled).
+        if cfg.cancel_reset():
             _reset_cancelled()
-        line = _command_queue.pop(0)
-        _current_command = line
+        line = cfg.queue.pop(0)
+        cfg.set_current(line)
         _skip_summary_shown = False
-        _bulk_confirm_resolved = not _command_may_bulk_confirm(line)
-        _set_job_progress(0, 0)
+        if cfg.bulk_confirm:
+            _bulk_confirm_resolved = not craft.may_bulk_confirm(line)
+        _set_lane_progress(cfg.lane, 0, 0)
         _paint_queue_panel()
         _enter_cancel_scope()
         try:
@@ -3281,8 +2996,8 @@ async def _api_worker(client, storage):
                 err = f"  {_color(f'Error: {e}', RED)}"
                 _repl_print_lines(err)
         finally:
-            _current_command = None
-            _clear_job_chrome()
+            cfg.set_current("")
+            _clear_lane_progress(cfg.lane)
             _exit_cancel_scope()
             if _cancelled:
                 if _discard_queue_after_cancel:
@@ -3297,64 +3012,18 @@ async def _api_worker(client, storage):
                 if not _skip_summary_shown:
                     msg = f"  {_color('Skipped.', YELLOW)}"
                     _repl_print_lines(msg)
-                _reset_cancelled()
-
-
-async def _ib_worker(client, storage):
-    """Process Infinibrowser queue (import/fill/prune) independently of pair work."""
-    global _current_ib_command
-    global _skip_summary_shown
-    while _ib_command_queue:
-        # Do not reset global cancel if pair lane is mid-flight; only clear when
-        # starting IB work if nothing pair-side is active.
-        if _current_command is None and not _waiting_for_confirm():
-            _reset_cancelled()
-        line = _ib_command_queue.pop(0)
-        _current_ib_command = line
-        _skip_summary_shown = False
-        _set_ib_job_progress(0, 0)
-        _paint_queue_panel()
-        _enter_cancel_scope()
-        try:
-            await _dispatch_line(client, storage, line)
-        except CommandCancelled:
-            pass
-        except Exception as e:
-            if not _cancelled:
-                err = f"  {_color(f'Error: {e}', RED)}"
-                _repl_print_lines(err)
-        finally:
-            _current_ib_command = None
-            _clear_ib_job_chrome()
-            _exit_cancel_scope()
-            if _cancelled:
-                if _discard_queue_after_cancel:
-                    discarded = len(_command_queue) + len(_ib_command_queue)
-                    _command_queue.clear()
-                    _ib_command_queue.clear()
-                    if discarded:
-                        msg = f"  {_color(f'Cancelled. Discarded {discarded} queued command(s).', DIM)}"
-                        _repl_print_lines(msg)
-                    _mark_cancel_notified()
-                    break
-                if not _skip_summary_shown:
-                    msg = f"  {_color('Skipped.', YELLOW)}"
-                    _repl_print_lines(msg)
-                # Only fully reset cancel if pair lane is idle
-                if _current_command is None:
+                if cfg.soft_cancel_reset():
                     _reset_cancelled()
 
 
-def _ensure_api_worker(client, storage):
-    global _api_worker_task
-    if _api_worker_task is None or _api_worker_task.done():
-        _api_worker_task = asyncio.create_task(_api_worker(client, storage))
-
-
-def _ensure_ib_worker(client, storage):
-    global _ib_worker_task
-    if _ib_worker_task is None or _ib_worker_task.done():
-        _ib_worker_task = asyncio.create_task(_ib_worker(client, storage))
+def _ensure_lane_worker(cfg: _LaneCfg, client, storage):
+    global _api_worker_task, _ib_worker_task
+    if cfg.lane == "ib":
+        if _ib_worker_task is None or _ib_worker_task.done():
+            _ib_worker_task = asyncio.create_task(_lane_worker(cfg, client, storage))
+    else:
+        if _api_worker_task is None or _api_worker_task.done():
+            _api_worker_task = asyncio.create_task(_lane_worker(cfg, client, storage))
 
 
 def _enqueue_command_line(line: str, client, storage) -> bool:
@@ -3363,7 +3032,7 @@ def _enqueue_command_line(line: str, client, storage) -> bool:
     if error:
         _repl_print_lines(error)
         return False
-    lane = _command_queue_lane(line)
+    lane = craft.command_queue_lane(line)
     ib = lane == "ib"
     if ib:
         q = list(_ib_command_queue)
@@ -3371,24 +3040,38 @@ def _enqueue_command_line(line: str, client, storage) -> bool:
     else:
         q = list(_command_queue)
         current = _current_command
-    if line in q or line == current:
+    decision = craft.queue_accept(
+        line,
+        current,
+        list(q),
+        len(_command_queue) + len(_ib_command_queue),
+        _MAX_QUEUE_DEPTH,
+    )
+    if decision == "dup":
         msg = f"  {_color('Already queued.', DIM)}"
         _repl_print_lines(msg)
         return False
-    total_pending = len(_command_queue) + len(_ib_command_queue)
-    if total_pending >= _MAX_QUEUE_DEPTH:
+    if decision == "full":
         msg = f"  {_color(f'Queue full (max {_MAX_QUEUE_DEPTH}).', YELLOW)}"
         _repl_print_lines(msg)
         return False
-    deferred = _queue_enqueue_deferred(line)
-    if not ib and _current_command is None:
+    if craft.command_queue_lane(line) == "ib":
+        current = _current_ib_command
+        pending_len = len(_ib_command_queue)
+        confirm_active = False
+    else:
+        current = _current_command
+        pending_len = len(_command_queue)
+        confirm_active = _waiting_for_confirm() or _bulk_confirm_pending
+    deferred = craft.queue_lane_busy(current, pending_len, confirm_active)
+    if not ib and not _current_command:
         _reset_cancelled()
     if ib:
         _ib_command_queue.append(line)
-        _ensure_ib_worker(client, storage)
+        _ensure_lane_worker(_ib_cfg, client, storage)
     else:
         _command_queue.append(line)
-        _ensure_api_worker(client, storage)
+        _ensure_lane_worker(_pair_cfg, client, storage)
     if deferred and not _chrome_enabled:
         msg = f"  {_color(f'Queued: {_sanitize_queue_line(line)}', DIM)}"
         _repl_print_lines(msg)
@@ -3455,8 +3138,8 @@ async def interactive_mode():
     _bulk_confirm_resolved = True
     _command_queue = []
     _ib_command_queue = []
-    _current_command = None
-    _current_ib_command = None
+    _current_command = ""
+    _current_ib_command = ""
     _api_worker_task = None
     _ib_worker_task = None
     _confirm_future = None
@@ -3494,8 +3177,8 @@ async def interactive_mode():
                 _paint_queue_panel()
 
                 if (
-                    (list(_command_queue) and _current_command is None)
-                    or (list(_ib_command_queue) and _current_ib_command is None)
+                    (list(_command_queue) and not _current_command)
+                    or (list(_ib_command_queue) and not _current_ib_command)
                 ):  # snapshot for race safety — workers about to claim
                     await asyncio.sleep(0)
                     continue
@@ -3514,7 +3197,7 @@ async def interactive_mode():
                         if line in ("/quit", "/exit"):
                             await _shutdown_interactive()
                             break
-                        if _is_local_command(line):
+                        if craft.is_local_command(line):
                             _echo_submitted_command(line)
                             await _dispatch_line(client, storage, line)
                             continue
@@ -3545,7 +3228,7 @@ async def interactive_mode():
                     await _shutdown_interactive()
                     break
 
-                if _is_local_command(line):
+                if craft.is_local_command(line):
                     _echo_submitted_command(line)
                     await _dispatch_line(client, storage, line)
                     continue

@@ -10,10 +10,9 @@ import tempfile
 
 import infinite_craft_cli.cli as cli
 from infinite_craft_cli.cli import (
-    _export_included,
     _load_recipes,
     _match_elements,
-    _record_recipe,
+    _record_recipes_batch,
     _resolve_element,
     _trace_recipe,
 )
@@ -90,7 +89,7 @@ def _run_scenario(scenario: dict, fixtures: dict, scratch_root: str):
 
         if op == "record_recipe":
             for call in scenario["calls"]:
-                _record_recipe(call["result"], call["a"], call["b"])
+                _record_recipes_batch([(call["result"], call["a"], call["b"])])
             loaded = _load_recipes()
             return {
                 k: sorted([list(p) for p in v]) for k, v in loaded.items()
@@ -105,14 +104,16 @@ def _run_scenario(scenario: dict, fixtures: dict, scratch_root: str):
             }
 
         if op == "export":
-            included = _export_included(storage)
+            recipes = _load_recipes()
+            elements = cli._elements_to_boundary(storage.get_all())
+            included = cli.craft.export_elements_boundary(elements, recipes)
             return sorted(
                 ([n, em, bool(f)] for n, em, f in included),
                 key=lambda t: t[0],
             )
 
         if op == "classify":
-            result = cli._classify_command_line(scenario["line"])
+            result = cli.craft.classify_command_line(scenario["line"])
             return list(result) if result is not None else None
 
         if op == "validate":

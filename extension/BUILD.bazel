@@ -21,8 +21,7 @@ pkg_files(
 )
 
 # Named to match the filename the repo has historically built by hand
-# (tests/test_extension_loader.py + tests/artifact_paths.py locate it via
-# runfiles).
+# (tests/artifact_paths.py locates it via runfiles).
 pkg_zip(
     name = "zip",
     srcs = [":extension_files"],

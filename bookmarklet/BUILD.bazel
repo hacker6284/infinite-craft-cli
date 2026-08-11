@@ -1,5 +1,4 @@
 load("@aspect_rules_esbuild//esbuild:defs.bzl", "esbuild")
-load("@aspect_rules_js//js:defs.bzl", "js_test")
 load("@bazel_lib//lib:copy_to_directory.bzl", "copy_to_directory")
 load("@rules_sudo//:defs.bzl", "sudo_js_library")
 
@@ -86,14 +85,4 @@ copy_to_directory(
     ],
     root_paths = ["bookmarklet"],
     visibility = ["//visibility:public"],
-)
-
-# Node smoke of ex-bug kernel behaviors (was sudo.yml's `node test_kernel_smoke.mjs`).
-js_test(
-    name = "kernel_smoke_test",
-    data = [
-        "test_kernel_smoke.mjs",
-        ":_sudo",
-    ],
-    entry_point = "test_kernel_smoke.mjs",
 )

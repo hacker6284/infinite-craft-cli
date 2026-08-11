@@ -4,9 +4,7 @@ Oracle = the owner's stated ruling text from the 2026-07-22 query-semantics
 grilling (see tests/e2e_intent/README.md), not the implementation and not
 tests/parity/ (which is host-vs-host). Each scenario in intent_fixtures.json
 pins one ruling against the real infinite_craft_cli.cli functions dispatched
-by the REPL. Scenarios marked "pending-v0.2.0" describe rulings the current
-kernel does not implement yet (blocked on a future sudoc compiler version)
-and are skipped with a visible, ruling-tagged reason rather than omitted.
+by the REPL.
 """
 
 from __future__ import annotations
@@ -57,9 +55,9 @@ def _storage_for(element_set_name: str) -> _FixtureStorage:
     )
 
 
+# All fixtures are active today; pending-v0.2.0 status can return later if needed.
 ACTIVE = [s for s in FIXTURES["scenarios"] if s["status"] == "active"]
-PENDING = [s for s in FIXTURES["scenarios"] if s["status"] == "pending-v0.2.0"]
-assert len(ACTIVE) + len(PENDING) == len(FIXTURES["scenarios"])
+assert len(ACTIVE) == len(FIXTURES["scenarios"])
 
 
 def _id(scenario: dict) -> str:
@@ -81,8 +79,3 @@ def test_active_scenario(scenario: dict) -> None:
         assert err == scenario["expect"]["error"], scenario.get("note", scenario["id"])
     else:
         pytest.fail(f"unknown surface: {scenario['surface']!r}")
-
-
-@pytest.mark.parametrize("scenario", PENDING, ids=[s["id"] for s in PENDING])
-def test_pending_scenario(scenario: dict) -> None:
-    pytest.skip(f"{scenario['ruling']}: {scenario['skip_reason']}")

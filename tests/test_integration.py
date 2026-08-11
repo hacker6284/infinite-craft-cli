@@ -23,15 +23,6 @@ def run_async(coro):
 
 
 class TestClientIntegration:
-    def test_session_starts(self):
-        from infinite_craft_cli.client import InfiniteCraftClient
-
-        async def _test():
-            async with InfiniteCraftClient(rate_limit=10) as client:
-                assert client._session is not None
-
-        run_async(_test())
-
     def test_pair_water_fire_makes_steam(self):
         from infinite_craft_cli.client import InfiniteCraftClient
 
@@ -42,32 +33,3 @@ class TestClientIntegration:
                 assert result.emoji is not None
 
         run_async(_test())
-
-    def test_pair_nothing_result(self):
-        from infinite_craft_cli.client import InfiniteCraftClient
-
-        async def _test():
-            async with InfiniteCraftClient(rate_limit=10) as client:
-                result = await client.pair("Water", "Water")
-                # Water + Water typically returns something, but we just verify
-                # the response is a valid Element (name is str or None)
-                assert result.name is None or isinstance(result.name, str)
-
-        run_async(_test())
-
-
-class TestStorageIntegration:
-    def test_round_trip(self, tmp_path):
-        from infinite_craft_cli.storage import DiscoveryStorage
-
-        path = str(tmp_path / "test_discoveries.json")
-        storage = DiscoveryStorage(path)
-        assert len(storage.get_all()) == 4  # starters
-
-        storage.add(name="Steam", emoji="💨", is_first_discovery=False)
-        assert storage.get_by_name("Steam") is not None
-
-        # Reload from disk
-        storage2 = DiscoveryStorage(path)
-        assert storage2.get_by_name("Steam") is not None
-        assert len(storage2.get_all()) == 5

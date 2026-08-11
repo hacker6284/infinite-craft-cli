@@ -57,6 +57,11 @@ def make_mock_client():
     """Create a mock InfiniteCraftClient object."""
     client = AsyncMock()
     client.pair = AsyncMock()
+    # Sync chrome_snapshot / rate chrome so paint does not get an AsyncMock
+    # coroutine child (would break chrome paint unpack).
+    limiter = MagicMock()
+    limiter.chrome_snapshot.return_value = (60, 60, 1000)
+    client._rate_limiter = limiter
     return client
 
 
@@ -251,9 +256,16 @@ class REPLTestHarness:
 
     def set_mock_client(self, client: AsyncMock | None = None):
         """Prepare a mock client (pair etc)."""
-        self._mock_client = client or AsyncMock()
+        self._mock_client = client or make_mock_client()
         if not hasattr(self._mock_client, "pair"):
             self._mock_client.pair = AsyncMock(return_value=MagicMock(name=None))
+        # AsyncMock auto-creates _rate_limiter as another AsyncMock; chrome
+        # needs a sync chrome_snapshot() returning a 3-tuple.
+        rl = getattr(self._mock_client, "_rate_limiter", None)
+        if rl is None or isinstance(rl, AsyncMock):
+            limiter = MagicMock()
+            limiter.chrome_snapshot.return_value = (60, 60, 1000)
+            self._mock_client._rate_limiter = limiter
         return self._mock_client
 
     def set_storage_elems(self, elems=None):
@@ -363,7 +375,7 @@ class REPLTestHarness:
         p_client_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
         # Centralize record here (pure harness surface). High-level drop cli._* record patch sites from bodies.
         # isatty via explicit sys patch (allowed, not cli._*) or enable_tty in tty tests.
-        self._patches.enter_context(patch("infinite_craft_cli.cli._record_recipe"))
+        self._patches.enter_context(patch("infinite_craft_cli.cli._record_recipes_batch"))
         if not self._tty_mode:
             if (
                 self.cli
@@ -416,16 +428,6 @@ class REPLTestHarness:
         self.captured_lines.append("OUTPUT:\n" + out)
         return out
 
-    def get_captured(self) -> str:
-        # Use capsys for output (see class doc). Kept for API compat, always ''.
-        return ""
-
-    def assert_prompt_count(self, n: int):
-        assert len([c for c in self.prompt_calls if c[1]]) >= n
-
-    def last_prompts(self) -> list[str]:
-        return [p for p, a in self.prompt_calls]
-
     def answers(self) -> list[str]:
         return [a for p, a in self.prompt_calls]
 
@@ -445,17 +447,6 @@ class REPLTestHarness:
 
         return cli._repl_print_lines
 
-    def set_session_input_history(self, hist: list[str]) -> None:
-        """Test seam (tty history tests): populate history without direct cli._ in caller."""
-        if self.cli:
-            self.cli._session_input_history = list(hist) or []
-
-    def tty_read_line(self) -> str:
-        """Test seam for direct low-level tty line read in edge tests (bypasses full repl run to avoid stdin capsys issues)."""
-        import infinite_craft_cli.cli as cli
-
-        return cli._tty_read_line()
-
     def is_cancelled(self) -> bool:
         """Seam: cancel flag read for mocks in pure harness behavioral tests (no cli._ in test body)."""
         if self.cli:
@@ -473,45 +464,12 @@ class REPLTestHarness:
 
             cli._cancelled = True
 
-    def set_test_prompt_hook(self, hook):
-        """Seam: install custom (raising) prompt hook; run_until respects pre-set."""
-        if self.cli:
-            self.cli._test_prompt_input_hook = hook
-
-    def install_enqueue_wrapper(self, tracker):
-        """Seam: wrap _enqueue for count tracking in edges (no patch _ in test)."""
-        if self.cli:
-            real = self.cli._enqueue_command_line
-
-            def w(line, client, storage):
-                tracker(line, client, storage)
-                return real(line, client, storage)
-
-            p = patch("infinite_craft_cli.cli._enqueue_command_line", side_effect=w)
-            self._patches.enter_context(p)
-
-    def install_combine_side_effect(self, side_effect):
-        """Seam: set slow combine etc without patch.object(cli, ...) in high-level test bodies."""
-        p = patch("infinite_craft_cli.cli.do_combine", side_effect=side_effect)
-        self._patches.enter_context(p)
-
     def install_repl_lines_wrapper(self, instrument_func):
         """Seam: install timing wrapper (from get_repl..) w/o cli._ patch literal in test."""
         p = patch(
             "infinite_craft_cli.cli._repl_print_lines", side_effect=instrument_func
         )
         self._patches.enter_context(p)
-
-    def simulate_resize(self, rows: int, cols: int) -> None:
-        """Seam for SIGWINCH behavioral harness test: patch size + force handler."""
-        if self.cli is None:
-            return
-        p_h = patch("infinite_craft_cli.cli._tty_height", return_value=max(1, rows))
-        p_w = patch("infinite_craft_cli.cli._tty_width", return_value=max(1, cols))
-        self._patches.enter_context(p_h)
-        self._patches.enter_context(p_w)
-        with contextlib.suppress(Exception):
-            self.cli._on_sigwinch()
 
     def install_cli_patch(self, name: str, *args, **kwargs):
         """Seam (minimal) for high-level TestREPLHarnessEdges purity: apply patches to cli.<name>
@@ -535,22 +493,6 @@ class REPLTestHarness:
         self.install_cli_patch("_tty_height", return_value=max(1, height))
         self.install_cli_patch("_tty_width", return_value=max(1, width))
 
-    def force_disable_chrome(self):
-        """Seam to force non-chrome behavior (noop enable + flag=False) under tty sim."""
-        self.install_cli_patch("_chrome_enable")
-        self.install_cli_patch("_chrome_enabled", False)
-
     def reset(self):
         """Seam: reset without cli._reset_test_state literal in high-level body."""
         self._full_cli_reset()
-
-    def request_skip_current(self) -> bool:
-        """Seam: simulate ESC skip (sets cancel, no discard) without cli._ or import private in high-level test body."""
-        try:
-            if self.cli is not None:
-                return bool(self.cli._request_skip_current())
-            import infinite_craft_cli.cli as cli
-
-            return bool(cli._request_skip_current())
-        except Exception:
-            return False

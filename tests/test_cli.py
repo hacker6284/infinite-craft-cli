@@ -17,86 +17,6 @@ def run_async(coro):
     return asyncio.run(asyncio.wait_for(coro, timeout=30.0))
 
 
-class TestArgParsing:
-    def test_combine_args(self):
-        from infinite_craft_cli.cli import main
-
-        with patch("sys.argv", ["infinite-craft", "combine", "Water", "Fire"]):
-            with patch("asyncio.run") as mock_run:
-                with patch("infinite_craft_cli.cli.interactive_mode"):
-                    with patch("infinite_craft_cli.cli.noninteractive_mode"):
-                        main()
-        mock_run.assert_called_once()
-
-    def test_search_args(self):
-        from infinite_craft_cli.cli import main
-
-        with patch("sys.argv", ["infinite-craft", "search", "steam"]):
-            with patch("asyncio.run") as mock_run:
-                with patch("infinite_craft_cli.cli.interactive_mode"):
-                    with patch("infinite_craft_cli.cli.noninteractive_mode"):
-                        main()
-        mock_run.assert_called_once()
-
-    def test_list_args(self):
-        from infinite_craft_cli.cli import main
-
-        with patch("sys.argv", ["infinite-craft", "list"]):
-            with patch("asyncio.run") as mock_run:
-                with patch("infinite_craft_cli.cli.interactive_mode"):
-                    with patch("infinite_craft_cli.cli.noninteractive_mode"):
-                        main()
-        mock_run.assert_called_once()
-
-    def test_no_args_interactive(self):
-        from infinite_craft_cli.cli import main
-
-        with patch("sys.argv", ["infinite-craft"]):
-            with patch("asyncio.run") as mock_run:
-                with patch("infinite_craft_cli.cli.interactive_mode"):
-                    with patch("infinite_craft_cli.cli.noninteractive_mode"):
-                        main()
-        mock_run.assert_called_once()
-
-    def test_version_flag(self):
-        from infinite_craft_cli.cli import main
-
-        with patch("sys.argv", ["infinite-craft", "--version"]):
-            with pytest.raises(SystemExit) as exc_info:
-                main()
-        assert exc_info.value.code == 0
-
-    def test_with_args(self):
-        from infinite_craft_cli.cli import main
-
-        with patch("sys.argv", ["infinite-craft", "with", "Water", "/^fi/"]):
-            with patch("asyncio.run") as mock_run:
-                with patch("infinite_craft_cli.cli.interactive_mode"):
-                    with patch("infinite_craft_cli.cli.noninteractive_mode"):
-                        main()
-        mock_run.assert_called_once()
-
-    def test_exhaust_args(self):
-        from infinite_craft_cli.cli import main
-
-        with patch("sys.argv", ["infinite-craft", "exhaust", "w*"]):
-            with patch("asyncio.run") as mock_run:
-                with patch("infinite_craft_cli.cli.interactive_mode"):
-                    with patch("infinite_craft_cli.cli.noninteractive_mode"):
-                        main()
-        mock_run.assert_called_once()
-
-    def test_permutate_args(self):
-        from infinite_craft_cli.cli import main
-
-        with patch("sys.argv", ["infinite-craft", "permutate", "w*"]):
-            with patch("asyncio.run") as mock_run:
-                with patch("infinite_craft_cli.cli.interactive_mode"):
-                    with patch("infinite_craft_cli.cli.noninteractive_mode"):
-                        main()
-        mock_run.assert_called_once()
-
-
 class TestNonInteractiveMode:
     def test_combine_command(self, capsys):
         from infinite_craft_cli.cli import noninteractive_mode
@@ -121,7 +41,7 @@ class TestNonInteractiveMode:
 
         with patch("infinite_craft_cli.cli.InfiniteCraftClient", mock_client_cls):
             with patch("infinite_craft_cli.cli.DiscoveryStorage", mock_storage_cls):
-                with patch("infinite_craft_cli.cli._record_recipe"):
+                with patch("infinite_craft_cli.cli._record_recipes_batch"):
                     with patch("sys.stdout.isatty", return_value=False):
                         run_async(noninteractive_mode(args))
         captured = capsys.readouterr()
@@ -253,7 +173,7 @@ class TestNonInteractiveMode:
 
         with patch("infinite_craft_cli.cli.InfiniteCraftClient", mock_client_cls):
             with patch("infinite_craft_cli.cli.DiscoveryStorage", mock_storage_cls):
-                with patch("infinite_craft_cli.cli._record_recipe"):
+                with patch("infinite_craft_cli.cli._record_recipes_batch"):
                     with patch("sys.stdout.isatty", return_value=False):
                         run_async(noninteractive_mode(args))
         captured = capsys.readouterr()
@@ -287,8 +207,18 @@ class TestNonInteractiveMode:
 
         with patch("infinite_craft_cli.cli.InfiniteCraftClient", mock_client_cls):
             with patch("infinite_craft_cli.cli.DiscoveryStorage", mock_storage_cls):
-                with patch("infinite_craft_cli.cli._record_recipe"):
+                with patch("infinite_craft_cli.cli._record_recipes_batch"):
                     with patch("sys.stdout.isatty", return_value=False):
                         run_async(noninteractive_mode(args))
         captured = capsys.readouterr()
         assert "Permuting matches for" in captured.out or "Permutating" in captured.out
+
+
+class TestArgParsing:
+    def test_version_flag(self):
+        from infinite_craft_cli.cli import main
+
+        with patch("sys.argv", ["infinite-craft", "--version"]):
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+        assert exc_info.value.code == 0

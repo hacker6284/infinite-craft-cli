@@ -12,7 +12,6 @@ import {
   record_recipe as recordRecipeKernel,
   record_recipes_batch as recordRecipesBatchKernel,
   trace_recipe_boundary as traceRecipeBoundary,
-  export_elements_boundary as exportElementsBoundary,
   orphan_candidates_boundary as orphanCandidatesBoundary,
   exhaust_pairs_boundary as exhaustPairsBoundary,
   permute_pairs_boundary as permutePairsBoundary,
@@ -28,16 +27,22 @@ import {
   sanitize_element_name as sanitizeElementName,
   unfilled_names_boundary as unfilledNamesBoundary,
   is_local_command as isLocalCommand,
-  is_ib_command as isIbCommandKernel,
   command_queue_lane as commandQueueLane,
+  queue_accept as queueAccept,
+  queue_lane_busy as queueLaneBusy,
+  lane_should_reset_cancel as laneShouldResetCancel,
   parse_target_arg as parseTargetArg,
-  apply_target_state as applyTargetState,
+  target_outcome as targetOutcome,
   is_target_hit as isTargetHitKernel,
   confirm_should_continue as confirmShouldContinue,
+  is_confirm_answer as isConfirmAnswer,
+  confirm_answer_key as confirmAnswerKey,
+  should_bulk_warn as shouldBulkWarn,
   rate_slots_left as rateSlotsLeft,
   rate_next_slot_frac_milli as rateNextSlotFracMilli,
   rate_bar_fills as rateBarFills,
-  is_slash_command_attempt as isSlashCommandAttempt,
+  rate_bar_segment as rateBarSegment,
+  rate_format_pair_for_width as rateFormatPairForWidth,
   classify_command_line as classifyCommandLine,
   validate_command_line_segments as validateCommandLineSegments,
   slash_args as slashArgs,
@@ -67,18 +72,16 @@ let confirmResolve = null;
 // Two independent queues: neal.fun pair API vs Infinibrowser (import/fill/prune).
 const pairQueue = [];
 const ibQueue = [];
-let currentPairCommand = null;
-let currentIbCommand = null;
-/** @deprecated use currentPairCommand; kept as alias for chrome/confirm during pair bulk */
-let currentCommand = null;
+let currentPairCommand = "";
+let currentIbCommand = "";
 let activeAbort = null;
 let pairWorkerRunning = false;
 let ibWorkerRunning = false;
 // IB job progress (separate from pair jobDone/jobTotal so chrome can dual-run).
 let ibJobDone = 0;
 let ibJobTotal = 0;
-// /target: pause batches when this element name is crafted
-let targetElement = null; // string | null
+// /target: pause batches when this element name is crafted ("" = no target)
+let targetElement = "";
 let targetHitChain = Promise.resolve(); // serialize target acks
 
 // DOM refs — initialized in initBrowserUI() so module evaluation is Node-safe
@@ -94,7 +97,6 @@ const RATE_TICK_MS = 300;
 // Segmented rate bar: left 1/2 = next-slot wait refill, right 1/2 = remaining.
 const RATE_BAR_LEFT = 9;
 const RATE_BAR_RIGHT = 9;
-const RATE_BAR_WIDTH = RATE_BAR_LEFT + RATE_BAR_RIGHT;
 
 
 // ── Output helpers ───────────────────────────────────────────────────
@@ -346,7 +348,9 @@ function recordRecipesBatch(entries) {
   for (const [result, a, b] of entries) persistRecipe(result, a, b);
 }
 
-// ── Host-parity test seam (Node-only; browser path is untouched) ─────
+// ── Inventory / recipe seeders (module-private) ──────────────────────
+// Used by the Node parity lockstep via a side channel installed below;
+// not part of the production named-export API.
 function _resetStateForParity(elements, recipes) {
   _items = elements.map(([text, emoji, discovered], i) => {
     const item = { id: i, saveId: 0, text, emoji: emoji || "" };
@@ -364,6 +368,16 @@ function _resetStateForParity(elements, recipes) {
 
 function _getRecipeIndexForParity() {
   return recipeIndex;
+}
+
+// Node parity (tests/parity/run_js.mjs) needs to seed the same module-private
+// inventory/recipeIndex the browser host uses. Keep the seeders unexported
+// from the production export list; open them only when not in a browser.
+if (typeof window === "undefined") {
+  globalThis.__IC_TRAINER_PARITY__ = {
+    resetState: _resetStateForParity,
+    getRecipeIndex: _getRecipeIndexForParity,
+  };
 }
 
 // ── Rate limiter ─────────────────────────────────────────────────────
@@ -396,18 +410,13 @@ function pruneRateTimestamps(now = Date.now()) {
   if (freed) lastSlotFreedAt = now;
 }
 
-function rateBudgetRemaining(now = Date.now()) {
-  pruneRateTimestamps(now);
-  return rateSlotsLeft(timestamps.length, RATE_LIMIT);
-}
-
 /**
- * Progress [0,1] toward the next slot free (kernel pure math).
+ * Progress toward next slot free in thousandths [0, 1000] (kernel pure math).
  * Resets when a timestamp drops off; fills over (nextDrop - lastDrop), not the full window.
  */
-function nextSlotFrac(now = Date.now()) {
-  if (!timestamps.length) return 1.0;
-  const milli = rateNextSlotFracMilli(
+function nextSlotFracMilli(now = Date.now()) {
+  if (!timestamps.length) return 1000;
+  return rateNextSlotFracMilli(
     now,
     timestamps[0],
     lastSlotFreedAt == null ? 0 : lastSlotFreedAt,
@@ -415,14 +424,13 @@ function nextSlotFrac(now = Date.now()) {
     true,
     lastSlotFreedAt != null
   );
-  return milli / 1000;
 }
 
-/** @returns {{ remaining: number, max: number, oldestFrac: number }} */
+/** @returns {{ remaining: number, max: number, oldestFracMilli: number }} */
 function rateChromeSnapshot(now = Date.now()) {
   pruneRateTimestamps(now);
   const remaining = rateSlotsLeft(timestamps.length, RATE_LIMIT);
-  return { remaining, max: RATE_LIMIT, oldestFrac: nextSlotFrac(now) };
+  return { remaining, max: RATE_LIMIT, oldestFracMilli: nextSlotFracMilli(now) };
 }
 
 function acquireRate() {
@@ -484,10 +492,10 @@ async function doCombine(aName, bName) {
   const b = resolveElement(bName);
   try {
     beginRun();
-    setJobProgress(0, 1);
+    setLaneProgress("pair", 0, 1);
     setLastPair(a.text, b.text);
     const result = await apiPair(a.text, b.text);
-    setJobProgress(1, 1);
+    setLaneProgress("pair", 1, 1);
     if (cancelled) return;
     if (result) {
       addElement(a.text, a.emoji, false);
@@ -496,10 +504,11 @@ async function doCombine(aName, bName) {
       recordRecipe(result.text, a.text, b.text);
       history.push({ a: a.text, b: b.text, result: result.text });
       let extra = isNew ? " " + green("(new)") : "";
-      if (isTargetHit(result.text)) extra += " " + bold(yellow("★ TARGET ★"));
+      const hit = isTargetHitKernel(targetElement, result.text || "");
+      if (hit) extra += " " + bold(yellow("★ TARGET ★"));
       print(formatResult(a, b, result) + extra);
-      if (isTargetHit(result.text)) {
-        await acknowledgeTargetHit(a.text, b.text, result.text);
+      if (hit) {
+        await acknowledgeTargetHit(a.text, b.text, result.text || "");
       }
     } else {
       history.push({ a: a.text, b: b.text, result: "Nothing" });
@@ -541,40 +550,27 @@ function endRun() {
   }
 }
 
-/** Infinibrowser-backed long commands — independent of the pair-API queue (kernel). */
-function isIbCommand(line) {
-  return !!(line && isIbCommandKernel(line));
-}
-
 function doTarget(arg) {
   const [action, name] = parseTargetArg(arg || "");
-  const current = targetElement || "";
-  const next = applyTargetState(current, action, name);
-  if (action === "show") {
-    if (!next) {
-      print(`  No target set. Usage: ${yellow("/target <element>")}`);
-      return;
-    }
-    print(`  Target: ${bold(yellow(esc(next)))}`);
+  const [kind, newState, detail] = targetOutcome(targetElement, action, name);
+  if (kind === "show_empty") {
+    print(`  No target set. Usage: ${yellow("/target <element>")}`);
     return;
   }
-  if (action === "clear") {
-    const prev = targetElement;
-    targetElement = next || null;
-    if (!prev) print("  No target was set.");
-    else print(`  Target cleared (was ${yellow(esc(prev))}).`);
-    updateChrome();
+  if (kind === "show") {
+    print(`  Target: ${bold(yellow(esc(newState)))}`);
     return;
   }
-  // set
-  targetElement = next || null;
-  print(`  Target set: ${bold(yellow(esc(targetElement)))} — batch work pauses when this is crafted.`);
+  // Mutating kinds: assign session target, then host-format message.
+  targetElement = newState;
+  if (kind === "clear_empty") {
+    print("  No target was set.");
+  } else if (kind === "clear") {
+    print(`  Target cleared (was ${yellow(esc(detail))}).`);
+  } else {
+    print(`  Target set: ${bold(yellow(esc(newState)))} — batch work pauses when this is crafted.`);
+  }
   updateChrome();
-}
-
-function isTargetHit(resultName) {
-  if (!resultName || !targetElement) return false;
-  return isTargetHitKernel(targetElement, resultName);
 }
 
 /** Pause for y/n after target hit. Returns true if batch should stop. */
@@ -586,12 +582,10 @@ async function acknowledgeTargetHit(aName, bName, resultName) {
   await prev;
   try {
     if (cancelled) return true;
-    print(
-      `  ${bold(yellow("★ TARGET HIT ★"))} ${esc(aName)} + ${esc(bName)} = ${bold(yellow(esc(resultName)))}`
-    );
-    print(`  Press ${bold("y")} to continue, ${bold("n")} / Esc / Stop to halt the batch.`);
-    const answer = await waitForConfirmKey();
-    if (cancelled || answer === "__cancelled__" || !confirmShouldContinue(answer)) {
+    if (!(await confirmOrCancel([
+      `  ${bold(yellow("★ TARGET HIT ★"))} ${esc(aName)} + ${esc(bName)} = ${bold(yellow(esc(resultName)))}`,
+      `  Press ${bold("y")} to continue, ${bold("n")} / Esc / Stop to halt the batch.`,
+    ]))) {
       cancelled = true;
       print("  " + yellow("Stopped after target hit."));
       return true;
@@ -618,18 +612,27 @@ function prioritizePairs(pairs) {
 }
 
 // ── Bulk pair processor ──────────────────────────────────────────────
-async function runPairsInner(pairs) {
+// opts (optional):
+//   onResult({ a, b, result, isNew, isTarget, extra, done, total })
+//     — after a successful combine (storage/history already updated)
+//   shouldPrint(ctx) → boolean
+//     — whether to emit the default `[n/total] result` line; default: print
+//       only when the result is new or hits the target
+//   skipSummary — omit the final "Done: N new…" line (crawl gens use their own)
+async function runPairsInner(pairs, opts = {}) {
   pairs = prioritizePairs(pairs);
   let done = 0, newCount = 0, nothingCount = 0, errors = 0;
   const total = pairs.length;
-  setJobProgress(0, total);
+  const onResult = opts.onResult;
+  const shouldPrint = opts.shouldPrint;
+  setLaneProgress("pair", 0, total);
   for (let i = 0; i < pairs.length; i++) {
     const [a, b] = pairs[i];
     if (cancelled) { print("  " + yellow("Cancelled.")); break; }
     // Bump progress when the pair *starts* so chrome never sits at 0/N
     // while a fetch (or rate-limit wait) is in flight.
     setLastPair(a.text, b.text);
-    setJobProgress(i + 1, total);
+    setLaneProgress("pair", i + 1, total);
     try {
       const result = await apiPair(a.text, b.text);
       if (cancelled) { print("  " + yellow("Cancelled.")); break; }
@@ -643,14 +646,18 @@ async function runPairsInner(pairs) {
           newCount++;
           extra += " " + green("(new)");
         }
-        if (isTargetHit(result.text)) {
+        const hit = isTargetHitKernel(targetElement, result.text || "");
+        if (hit) {
           extra += " " + bold(yellow("★ TARGET ★"));
         }
-        if (extra) {
+        const ctx = { a, b, result, isNew, isTarget: hit, extra, done, total };
+        const wantPrint = shouldPrint ? shouldPrint(ctx) : !!extra;
+        if (wantPrint) {
           print(`  ${dim(`[${done}/${total}]`)} ${formatResult(a, b, result)}${extra}`);
         }
-        if (isTargetHit(result.text)) {
-          if (await acknowledgeTargetHit(a.text, b.text, result.text)) break;
+        if (onResult) await onResult(ctx);
+        if (hit) {
+          if (await acknowledgeTargetHit(a.text, b.text, result.text || "")) break;
         }
       } else {
         nothingCount++;
@@ -663,7 +670,7 @@ async function runPairsInner(pairs) {
     }
     await new Promise(r => setTimeout(r, 0));
   }
-  if (!cancelled) {
+  if (!cancelled && !opts.skipSummary) {
     print(`  Done: ${green(String(newCount))} new, ${dim(String(nothingCount))} nothing, ${errors ? red(String(errors)) + " errors" : "0 errors"} (${done}/${total})`);
   }
 }
@@ -671,10 +678,10 @@ async function runPairsInner(pairs) {
 async function confirmAndRunPairs(pairs) {
   try {
     beginRun();
-    if (pairs.length > BULK_WARN) {
-      print(`  ${yellow(`${pairs.length} pairs`)} — press ${bold("y")} to continue, ${bold("n")} / Esc / Stop to cancel.`);
-      const answer = await waitForConfirmKey();
-      if (cancelled || answer === "__cancelled__" || !confirmShouldContinue(answer)) {
+    if (shouldBulkWarn(pairs.length, BULK_WARN)) {
+      if (!(await confirmOrCancel([
+        `  ${yellow(`${pairs.length} pairs`)} — press ${bold("y")} to continue, ${bold("n")} / Esc / Stop to cancel.`,
+      ]))) {
         print("  Cancelled.");
         return;
       }
@@ -685,6 +692,13 @@ async function confirmAndRunPairs(pairs) {
   } finally {
     endRun();
   }
+}
+
+/** Print warn lines, await y/n, return true to continue / false if cancelled. */
+async function confirmOrCancel(warnLines) {
+  for (const line of warnLines) print(line);
+  const answer = await waitForConfirmKey();
+  return !(cancelled || answer === "__cancelled__" || !confirmShouldContinue(answer));
 }
 
 function waitForConfirmKey() {
@@ -726,10 +740,10 @@ function waitForConfirmKey() {
       }
       // Instant y/n only when the field is empty (not mid-command).
       const empty = !input || !input.value;
-      if (empty && (e.key === "y" || e.key === "Y" || e.key === "n" || e.key === "N")) {
+      if (empty && isConfirmAnswer(e.key)) {
         e.preventDefault();
         e.stopImmediatePropagation();
-        finish(e.key.toLowerCase());
+        finish(confirmAnswerKey(e.key));
         return;
       }
       if (e.key === "Enter") {
@@ -743,9 +757,8 @@ function waitForConfirmKey() {
         e.preventDefault();
         e.stopImmediatePropagation();
         if (input) input.value = "";
-        const answer = val.toLowerCase();
-        if (answer === "y" || answer === "n") {
-          finish(answer);
+        if (isConfirmAnswer(val)) {
+          finish(confirmAnswerKey(val));
         } else {
           tryEnqueue(val);
         }
@@ -847,7 +860,8 @@ async function doCrawl(aName, bName) {
     // (which also holds the self-pairs), pair order comes from the
     // kernel's sorted-name generation, and any result not already in the
     // pool joins the next generation's pool — not only globally-new
-    // discoveries.
+    // discoveries. Pair fetch/progress/cancel/target-ack is shared via
+    // runPairsInner; pool bookkeeping + selective print stay here.
     const pool = new Map([[a.text, a], [b.text, b]]);
     const triedKeys = [];
     let gen = 1;
@@ -856,51 +870,29 @@ async function doCrawl(aName, bName) {
         toTuples([...pool.values()]),
         triedKeys
       );
-      const pairs = prioritizePairs(pairsFromBoundary(rawPairs));
+      const pairs = pairsFromBoundary(rawPairs);
       for (const k of newKeys) triedKeys.push(k);
       if (!pairs.length) { print("  " + dim("No more untried pairs.")); break; }
       print(`  ${dim(`Gen ${gen}:`)} ${pairs.length} pairs to try...`);
       let newInGen = 0;
-      let genDone = 0;
-      const genTotal = pairs.length;
-      setJobProgress(0, genTotal);
-      for (let i = 0; i < pairs.length; i++) {
-        const [pa, pb] = pairs[i];
-        if (cancelled) break;
-        // Progress = current pair index (1-based), updated *before* the fetch so
-        // gen transitions never look frozen at 0/N with a live last-pair.
-        setLastPair(pa.text, pb.text);
-        setJobProgress(i + 1, genTotal);
-        try {
-          const r = await apiPair(pa.text, pb.text);
-          genDone = i + 1;
-          if (r) {
-            addElement(pa.text, pa.emoji, false);
-            addElement(pb.text, pb.emoji, false);
-            const isNew = addElement(r.text, r.emoji, r.discovered);
-            recordRecipe(r.text, pa.text, pb.text);
-            history.push({ a: pa.text, b: pb.text, result: r.text });
-            if (!pool.has(r.text)) {
-              pool.set(r.text, { text: r.text, emoji: r.emoji, discovered: r.discovered });
-              newInGen++;
-            }
-            let extra = isNew ? " " + green("(new)") : "";
-            if (isTargetHit(r.text)) extra += " " + bold(yellow("★ TARGET ★"));
-            if (isNew || isTargetHit(r.text)) {
-              print(`  ${formatResult(pa, pb, r)}${extra}`);
-            }
-            if (isTargetHit(r.text)) {
-              if (await acknowledgeTargetHit(pa.text, pb.text, r.text)) break;
-            }
+      await runPairsInner(pairs, {
+        skipSummary: true,
+        // Suppress default `[n/total]` lines; crawl prints new/target only
+        // without the ordinal prefix.
+        shouldPrint: () => false,
+        onResult: ({ a: pa, b: pb, result: r, isNew, isTarget, extra }) => {
+          addElement(pa.text, pa.emoji, false);
+          addElement(pb.text, pb.emoji, false);
+          if (!pool.has(r.text)) {
+            pool.set(r.text, { text: r.text, emoji: r.emoji, discovered: r.discovered });
+            newInGen++;
           }
-        } catch (e) {
-          // Count the attempt even on error (parity with runPairsInner) so a
-          // run of API failures can't pin the chrome at 0/N while pairs advance.
-          genDone = i + 1;
-          if (cancelled) break;
-        }
-        await new Promise(r => setTimeout(r, 0));
-      }
+          if (isNew || isTarget) {
+            print(`  ${formatResult(pa, pb, r)}${extra}`);
+          }
+        },
+      });
+      if (cancelled) break;
       print(`  ${dim(`Gen ${gen} done:`)} ${green(String(newInGen))} new elements.`);
       if (newInGen === 0) break;
       gen++;
@@ -953,10 +945,10 @@ async function doPermutate(query) {
       const pairs = pairsFromBoundary(permutePairsBoundary(toTuples(matches)));
       print(`  ${dim(`--- Round ${round}:`)} ${matches.length} elements, ${pairs.length} pairs ---`);
 
-      if (!confirmed && pairs.length > BULK_WARN) {
-        print(`  ${yellow(`${pairs.length} pairs per round`)} — press ${bold("y")} to continue, ${bold("n")} / Esc / Stop to cancel.`);
-        const answer = await waitForConfirmKey();
-        if (cancelled || answer === "__cancelled__" || !confirmShouldContinue(answer)) {
+      if (!confirmed && shouldBulkWarn(pairs.length, BULK_WARN)) {
+        if (!(await confirmOrCancel([
+          `  ${yellow(`${pairs.length} pairs per round`)} — press ${bold("y")} to continue, ${bold("n")} / Esc / Stop to cancel.`,
+        ]))) {
           print("  Cancelled.");
           return;
         }
@@ -1138,11 +1130,11 @@ async function doFill() {
   let filled = 0, errors = 0, skipped = 0;
   try {
     beginRun();
-    setIbJobProgress(0, missing.length);
+    setLaneProgress("ib", 0, missing.length);
     for (let i = 0; i < missing.length; i++) {
       if (cancelled) { print("  " + yellow("Fill cancelled.")); break; }
       const el = missing[i];
-      setIbJobProgress(i + 1, missing.length);
+      setLaneProgress("ib", i + 1, missing.length);
       // Prior lineage may have already recorded a recipe for this name.
       if (!stillMissing.has(el.text)) {
         skipped++;
@@ -1217,11 +1209,11 @@ async function doPrune() {
   let pruned = 0, kept = 0, skipped = 0;
   try {
     beginRun();
-    setIbJobProgress(0, candidates.length);
+    setLaneProgress("ib", 0, candidates.length);
     for (let i = 0; i < candidates.length; i++) {
       if (cancelled) { print("  " + yellow("Prune cancelled.")); break; }
       const el = candidates[i];
-      setIbJobProgress(i + 1, candidates.length);
+      setLaneProgress("ib", i + 1, candidates.length);
       const fillable = await ibCanFill(el.text);
       if (fillable === null) {
         skipped++;
@@ -1242,10 +1234,6 @@ async function doPrune() {
     endRun();
   }
   print(`  Done: ${green(String(pruned))} pruned, ${kept} fillable on Infinibrowser (kept), ${skipped ? yellow(String(skipped)) + " skipped (API errors)" : "0 skipped"}.`);
-}
-
-function exportIncludedCore() {
-  return exportElementsBoundary(elementTuples(), recipeIndex);
 }
 
 async function doExport() {
@@ -1325,9 +1313,14 @@ function doHelp() {
     ${cyan("/help")}                       Show this help`);
 }
 
-function setJobProgress(done, total) {
-  jobDone = done;
-  jobTotal = total;
+function setLaneProgress(lane, done, total) {
+  if (lane === "ib") {
+    ibJobDone = done;
+    ibJobTotal = total;
+  } else {
+    jobDone = done;
+    jobTotal = total;
+  }
   updateChrome();
 }
 
@@ -1337,46 +1330,22 @@ function setLastPair(a, b) {
   updateChrome();
 }
 
-function clearJobChrome() {
-  jobDone = 0;
-  jobTotal = 0;
-  lastPairA = null;
-  lastPairB = null;
-  // IB progress is cleared by the IB worker when its command ends.
+function clearLaneProgress(lane) {
+  if (lane === "ib") {
+    ibJobDone = 0;
+    ibJobTotal = 0;
+  } else {
+    jobDone = 0;
+    jobTotal = 0;
+    lastPairA = null;
+    lastPairB = null;
+  }
   updateChrome();
 }
 
-function setIbJobProgress(done, total) {
-  ibJobDone = done;
-  ibJobTotal = total;
-  updateChrome();
-}
-
-function ellipsizeEnd(s, maxChars) {
-  if (maxChars <= 0) return "";
-  if (s.length <= maxChars) return s;
-  if (maxChars === 1) return "…";
-  return s.slice(0, maxChars - 1) + "…";
-}
-
-function formatPairForWidth(a, b, availChars) {
-  // End-ellipsis per operand; split remaining width after " + ".
-  const sep = " + ";
-  if (availChars <= sep.length + 2) return ellipsizeEnd(`${a}${sep}${b}`, availChars);
-  const each = Math.floor((availChars - sep.length) / 2);
-  const leftExtra = (availChars - sep.length) - each * 2;
-  return ellipsizeEnd(a, each + leftExtra) + sep + ellipsizeEnd(b, each);
-}
-
-function rateBarSegment(filled, width) {
-  const n = Math.max(0, Math.min(width, filled));
-  return "█".repeat(n) + "░".repeat(width - n);
-}
-
-function rateBarHtml(remaining, max, oldestFrac) {
-  const fracMilli = Math.round(Math.max(0, Math.min(1, oldestFrac)) * 1000);
+function rateBarHtml(remaining, max, oldestFracMilli) {
   const [leftFilled, rightFilled] = rateBarFills(
-    remaining, max, fracMilli, RATE_BAR_LEFT, RATE_BAR_RIGHT
+    remaining, max, oldestFracMilli, RATE_BAR_LEFT, RATE_BAR_RIGHT
   );
   const left = rateBarSegment(leftFilled, RATE_BAR_LEFT);
   const right = rateBarSegment(rightFilled, RATE_BAR_RIGHT);
@@ -1392,8 +1361,8 @@ function updateChrome() {
   if (!rateEl || !jobEl || !queueEl) return;
 
   // Permanent rate line: segmented bar + optional last pair (pair lane only).
-  const { remaining, max, oldestFrac } = rateChromeSnapshot();
-  const ratePrefix = `<span class="ict-rate-label">rate</span> ${rateBarHtml(remaining, max, oldestFrac)}`;
+  const { remaining, max, oldestFracMilli } = rateChromeSnapshot();
+  const ratePrefix = `<span class="ict-rate-label">rate</span> ${rateBarHtml(remaining, max, oldestFracMilli)}`;
   if (currentPairCommand && lastPairA != null && lastPairB != null) {
     // Width-aware: measure leftover cells after painting the rate segment once.
     rateEl.innerHTML = ratePrefix + ` <span class="ict-rate-sep">·</span> <span class="ict-rate-pair"></span>`;
@@ -1408,7 +1377,7 @@ function updateChrome() {
       + 16;
     const charPx = 7.2; // monospace ~13px font
     const avail = Math.max(8, Math.floor((totalPx - usedPx) / charPx));
-    if (pairSpan) pairSpan.textContent = formatPairForWidth(lastPairA, lastPairB, avail);
+    if (pairSpan) pairSpan.textContent = rateFormatPairForWidth(lastPairA, lastPairB, avail);
   } else {
     rateEl.innerHTML = ratePrefix;
   }
@@ -1417,7 +1386,7 @@ function updateChrome() {
   // Job line(s): pair and/or IB can run concurrently (interlaced status).
   const jobParts = [];
   if (waitingForConfirm) {
-    jobParts.push(`<div class="ict-job-row"><span class="ict-job-mark">◆</span> <span class="ict-job-label">confirm</span> <span class="ict-job-cmd">${esc(currentPairCommand || currentCommand || "")}</span> <span class="ict-job-hint">y / n</span></div>`);
+    jobParts.push(`<div class="ict-job-row"><span class="ict-job-mark">◆</span> <span class="ict-job-label">confirm</span> <span class="ict-job-cmd">${esc(currentPairCommand)}</span> <span class="ict-job-hint">y / n</span></div>`);
   } else if (currentPairCommand) {
     const prog = jobTotal > 0 ? ` <span class="ict-job-prog">${jobDone}/${jobTotal}</span>` : "";
     jobParts.push(`<div class="ict-job-row"><span class="ict-job-mark">▶</span> <span class="ict-job-label">running</span> <span class="ict-job-cmd">${esc(currentPairCommand)}</span>${prog}</div>`);
@@ -1450,11 +1419,6 @@ function updateChrome() {
   }
 }
 
-/** @deprecated name kept for call sites during transition */
-function updateQueueDisplay() {
-  updateChrome();
-}
-
 function totalPending() {
   return pairQueue.length + ibQueue.length;
 }
@@ -1462,15 +1426,20 @@ function totalPending() {
 function enqueueCommand(line) {
   const lane = commandQueueLane(line);
   const ib = lane === "ib";
-  const laneBusy = ib
-    ? (ibWorkerRunning || currentIbCommand !== null)
-    : (pairWorkerRunning || currentPairCommand !== null || waitingForConfirm);
+  const current = ib ? currentIbCommand : currentPairCommand;
+  const queue = ib ? ibQueue : pairQueue;
+  // Fold workerRunning into confirm_active; pair also maps waitingForConfirm.
+  // Kernel rule: current non-empty OR pending_len>0 OR confirm_active.
+  const confirmActive = ib
+    ? ibWorkerRunning
+    : (waitingForConfirm || pairWorkerRunning);
+  const laneBusy = queueLaneBusy(current, queue.length, confirmActive);
   if (ib) ibQueue.push(line);
   else pairQueue.push(line);
   updateChrome();
   if (laneBusy) print("  " + dim(`Queued: ${esc(line)}`));
-  if (ib) ensureIbWorker();
-  else ensurePairWorker();
+  if (ib) ensureLaneWorker(ibCfg);
+  else ensureLaneWorker(pairCfg);
 }
 
 function tryEnqueue(line) {
@@ -1481,20 +1450,20 @@ function tryEnqueue(line) {
   }
   const lane = commandQueueLane(line);
   const ib = lane === "ib";
-  if (ib) {
-    if (line === currentIbCommand || ibQueue.includes(line)) {
-      print("  " + dim("Already queued."));
-      return false;
-    }
-  } else if (
-    line === currentPairCommand ||
-    line === currentCommand ||
-    pairQueue.includes(line)
-  ) {
+  const current = ib ? currentIbCommand : currentPairCommand;
+  const laneQueue = ib ? ibQueue.slice() : pairQueue.slice();
+  const decision = queueAccept(
+    line,
+    current,
+    laneQueue,
+    totalPending(),
+    MAX_QUEUE_DEPTH,
+  );
+  if (decision === "dup") {
     print("  " + dim("Already queued."));
     return false;
   }
-  if (totalPending() >= MAX_QUEUE_DEPTH) {
+  if (decision === "full") {
     print("  " + yellow(`Queue full (max ${MAX_QUEUE_DEPTH}).`));
     return false;
   }
@@ -1502,78 +1471,66 @@ function tryEnqueue(line) {
   return true;
 }
 
-async function ensurePairWorker() {
-  if (pairWorkerRunning) return;
-  pairWorkerRunning = true;
+// Pair: confirm UI cleanup on error. Cancel-reset is peer-aware via kernel
+// (lane_should_reset_cancel): both lanes share cancelled; reset only when peer idle.
+const pairCfg = {
+  lane: "pair",
+  queue: pairQueue,
+  getCurrent: () => currentPairCommand,
+  setCurrent: (v) => { currentPairCommand = v; },
+  getRunning: () => pairWorkerRunning,
+  setRunning: (v) => { pairWorkerRunning = v; },
+  clearJob: () => clearLaneProgress("pair"),
+  cleanupConfirmOnError: true,
+};
+const ibCfg = {
+  lane: "ib",
+  queue: ibQueue,
+  getCurrent: () => currentIbCommand,
+  setCurrent: (v) => { currentIbCommand = v; },
+  getRunning: () => ibWorkerRunning,
+  setRunning: (v) => { ibWorkerRunning = v; },
+  clearJob: () => clearLaneProgress("ib"),
+  cleanupConfirmOnError: false,
+};
+
+async function ensureLaneWorker(cfg) {
+  if (cfg.getRunning()) return;
+  cfg.setRunning(true);
   try {
-    while (pairQueue.length) {
-      const line = pairQueue.shift();
-      currentPairCommand = line;
-      currentCommand = line; // bulk confirm / chrome alias
-      jobDone = 0;
-      jobTotal = 0;
-      lastPairA = null;
-      lastPairB = null;
-      updateChrome();
-      cancelled = false;
+    while (cfg.queue.length) {
+      // Peer = other lane's current command; confirm_active = waitingForConfirm.
+      const peerBusy = cfg.lane === "ib"
+        ? !!(currentPairCommand)
+        : !!(currentIbCommand);
+      if (laneShouldResetCancel(cfg.lane, peerBusy, waitingForConfirm)) {
+        cancelled = false;
+      }
+      const line = cfg.queue.shift();
+      cfg.setCurrent(line);
+      cfg.clearJob();
       try {
         await executeCommand(line);
       } catch (err) {
         endRun();
-        waitingForConfirm = false;
-        confirmResolve = null;
-        if (promptEl) promptEl.textContent = "craft>";
-        if (input) {
-          input.placeholder = "Type /help for commands";
-          try { input.readOnly = false; } catch {}
+        if (cfg.cleanupConfirmOnError) {
+          waitingForConfirm = false;
+          confirmResolve = null;
+          if (promptEl) promptEl.textContent = "craft>";
+          if (input) {
+            input.placeholder = "Type /help for commands";
+            try { input.readOnly = false; } catch {}
+          }
         }
         print("  " + red("Error: " + esc(err && err.message || String(err))));
       }
-      currentPairCommand = null;
-      currentCommand = null;
-      jobDone = 0;
-      jobTotal = 0;
-      lastPairA = null;
-      lastPairB = null;
-      updateChrome();
+      cfg.setCurrent("");
+      cfg.clearJob();
     }
   } finally {
-    pairWorkerRunning = false;
+    cfg.setRunning(false);
     updateChrome();
   }
-}
-
-async function ensureIbWorker() {
-  if (ibWorkerRunning) return;
-  ibWorkerRunning = true;
-  try {
-    while (ibQueue.length) {
-      const line = ibQueue.shift();
-      currentIbCommand = line;
-      ibJobDone = 0;
-      ibJobTotal = 0;
-      updateChrome();
-      // Do not clear global cancelled here — pair lane may still be running.
-      try {
-        await executeCommand(line);
-      } catch (err) {
-        endRun();
-        print("  " + red("Error: " + esc(err && err.message || String(err))));
-      }
-      currentIbCommand = null;
-      ibJobDone = 0;
-      ibJobTotal = 0;
-      updateChrome();
-    }
-  } finally {
-    ibWorkerRunning = false;
-    updateChrome();
-  }
-}
-
-/** @deprecated name kept for call sites; routes to pair worker */
-async function ensureQueueWorker() {
-  return ensurePairWorker();
 }
 
 // ── Command dispatcher ───────────────────────────────────────────────
@@ -1677,10 +1634,6 @@ export {
   resolveElement,
   recordRecipe,
   traceRecipeCore,
-  exportIncludedCore,
-  elementTuples,
-  _resetStateForParity,
-  _getRecipeIndexForParity,
 };
 
 // ── Browser bootstrap ────────────────────────────────────────────────
@@ -1813,8 +1766,7 @@ function initBrowserUI() {
         endRun();
         waitingForConfirm = false;
         confirmResolve = null;
-        currentCommand = null;
-        clearJobChrome();
+        clearLaneProgress("pair");
         print("  " + red("Error: " + esc(err && err.message || String(err))));
       });
     } else if (e.key === "ArrowUp") {

@@ -68,11 +68,6 @@ def fetch_json(
     return result
 
 
-def clear_fetch_cache():
-    """Clear the sync fetch cache (useful for testing)."""
-    _sync_cache.clear()
-
-
 class InfiniteCraftClient:
     """Async client for the neal.fun Infinite Craft pairing API."""
 

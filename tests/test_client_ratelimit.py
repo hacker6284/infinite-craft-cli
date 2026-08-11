@@ -62,7 +62,9 @@ class TestPairRateLimitIntegration:
 
         run_async(run())
         assert mock_session.get.await_count == 1
-        assert len(limiter._timestamps) == 1
+        # First acquire still holds the only slot; cancelled pair did not HTTP.
+        left, _, _ = limiter.chrome_snapshot()
+        assert left == 0
 
     def test_post_acquire_cancel_releases_token_and_allows_retry(self):
         limiter = RateLimiter(max_requests=1, window_seconds=5.0)
@@ -85,7 +87,9 @@ class TestPairRateLimitIntegration:
                 await client.__aenter__()
                 with pytest.raises(RateLimitCancelled):
                     await client.pair("Water", "Fire")
-                assert len(limiter._timestamps) == 0
+                # Post-acquire cancel released the slot; retry can re-acquire.
+                left, _, _ = limiter.chrome_snapshot()
+                assert left == 1
                 cancelled = False
                 result = await client.pair("Water", "Fire")
                 assert result.name == "Steam"
@@ -141,4 +145,3 @@ class TestPairRateLimitIntegration:
         assert all(r.name == "Steam" for r in results)
         # __aenter__ cloudflare visit + two successful pair HTTP calls
         assert mock_session.get.await_count == 3
-        assert len(limiter._timestamps) == 2
