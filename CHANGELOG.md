@@ -7,10 +7,13 @@
   shows rate budget, job progress, and the current pair. Pair work and
   Infinibrowser fill/import/prune use independent queues. The rate bar's
   left segment is next-slot wait refill; the right is remaining budget.
-  Bulk confirm is instant y/n.
-- **`/target` pause on craft hit.** Watch for a named result; on hit,
-  highlight and pause batch/queue progress until y (continue) or n/Esc
-  (stop), using the same confirm chrome as bulk y/n.
+  Bulk confirm is instant y/n. Confirm reason sits on the job row next to
+  the prompt (`◆ confirm /exhaust … · 331 pairs`); y/n appears only on
+  `confirm [y/n]>`.
+- **`/target` confirm on craft hit.** Watch for a named result; on hit,
+  highlight and ask y (continue) or n/Esc (stop) before more batch/queue
+  work, using the same confirm chrome as bulk y/n. Setting a target says
+  you'll be asked — it does not auto-halt.
 - **CLI version banner.** Dim package version next to the welcome title.
 - **Playwright CDP launcher** for live trainer reinjection.
 

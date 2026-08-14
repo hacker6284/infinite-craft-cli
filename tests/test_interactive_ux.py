@@ -60,6 +60,20 @@ def _confirm_prompts(calls: list[tuple[str, str]]) -> list[str]:
     return [p for p, _ in calls if "confirm" in p.lower()]
 
 
+async def _await_confirm_ready(repl_harness, ready: asyncio.Event) -> None:
+    """Wait until confirm chrome/prompt is up (keys live on the prompt now)."""
+    import infinite_craft_cli.cli as cli
+
+    while not ready.is_set():
+        if any("confirm" in (p or "").lower() for p, _ in repl_harness.prompt_calls):
+            ready.set()
+            return
+        if cli._waiting_for_confirm() or cli._bulk_confirm_pending:
+            ready.set()
+            return
+        await asyncio.sleep(0)
+
+
 def _craft_prompts(calls: list[tuple[str, str]]) -> list[str]:
     return [p for p, _ in calls if "craft>" in p.lower() and "confirm" not in p.lower()]
 
@@ -297,24 +311,6 @@ class TestREPLHarnessEdges:
         mock_client = repl_harness.set_mock_client()
 
         confirm_ready = asyncio.Event()
-        real_repl_lines = repl_harness.get_repl_print_lines()
-
-        def instrument_repl_lines(text):
-            # set when the bulk confirm msg is emitted (before y prompt)
-            try:
-                t = str(text) if text else ""
-                if "pairs" in t and (
-                    "y" in t.lower() or "yes" in t.lower() or "to continue" in t
-                ):
-                    # use call_soon to be safe across threads
-                    try:
-                        loop = asyncio.get_running_loop()
-                        loop.call_soon_threadsafe(confirm_ready.set)
-                    except RuntimeError:
-                        confirm_ready.set()
-            except Exception:
-                pass
-            return real_repl_lines(text)
 
         async def slow_pair(a, b):
             await asyncio.sleep(0)
@@ -331,7 +327,7 @@ class TestREPLHarnessEdges:
                     client=mock_client, auto_feed_quit=False, storage=storage
                 )
             )
-            await confirm_ready.wait()
+            await _await_confirm_ready(repl_harness, confirm_ready)
             await asyncio.sleep(0)
             repl_harness.feed("y")
             repl_harness.feed("/quit")
@@ -343,7 +339,6 @@ class TestREPLHarnessEdges:
             patch("sys.stdin.isatty", return_value=True),
             patch("sys.stdout.isatty", return_value=True),
         ):
-            repl_harness.install_repl_lines_wrapper(instrument_repl_lines)
             run_async(drive())
 
         out = capsys.readouterr().out
@@ -389,22 +384,6 @@ class TestREPLHarnessEdges:
         mock_client = repl_harness.set_mock_client()
 
         confirm_ready = asyncio.Event()
-        real_repl_lines = repl_harness.get_repl_print_lines()
-
-        def instrument_repl_lines(text):
-            try:
-                t = str(text) if text else ""
-                if "pairs" in t and (
-                    "y" in t.lower() or "yes" in t.lower() or "to continue" in t
-                ):
-                    try:
-                        loop = asyncio.get_running_loop()
-                        loop.call_soon_threadsafe(confirm_ready.set)
-                    except RuntimeError:
-                        confirm_ready.set()
-            except Exception:
-                pass
-            return real_repl_lines(text)
 
         async def slow_pair(a, b):
             await asyncio.sleep(0)
@@ -423,7 +402,7 @@ class TestREPLHarnessEdges:
                     client=mock_client, auto_feed_quit=False, storage=storage
                 )
             )
-            await confirm_ready.wait()
+            await _await_confirm_ready(repl_harness, confirm_ready)
             await asyncio.sleep(0)
             # ESC via tty bytes for special key; \n to submit if needed for confirm read unblock
             repl_harness.feed_tty_bytes(b"\x1b\n")
@@ -436,7 +415,6 @@ class TestREPLHarnessEdges:
             patch("sys.stdin.isatty", return_value=True),
             patch("sys.stdout.isatty", return_value=True),
         ):
-            repl_harness.install_repl_lines_wrapper(instrument_repl_lines)
             run_async(drive())
 
         out = capsys.readouterr().out
@@ -473,22 +451,6 @@ class TestREPLHarnessEdges:
         mock_client = repl_harness.set_mock_client()
 
         confirm_ready = asyncio.Event()
-        real_repl_lines = repl_harness.get_repl_print_lines()
-
-        def instrument_repl_lines(text):
-            try:
-                t = str(text) if text else ""
-                if "pairs" in t and (
-                    "y" in t.lower() or "yes" in t.lower() or "to continue" in t
-                ):
-                    try:
-                        loop = asyncio.get_running_loop()
-                        loop.call_soon_threadsafe(confirm_ready.set)
-                    except RuntimeError:
-                        confirm_ready.set()
-            except Exception:
-                pass
-            return real_repl_lines(text)
 
         async def slow_pair(a, b):
             await asyncio.sleep(0)
@@ -507,7 +469,7 @@ class TestREPLHarnessEdges:
                     client=mock_client, auto_feed_quit=False, storage=storage
                 )
             )
-            await confirm_ready.wait()
+            await _await_confirm_ready(repl_harness, confirm_ready)
             await asyncio.sleep(0)
             repl_harness.feed("y")
             repl_harness.feed("/quit")
@@ -519,7 +481,6 @@ class TestREPLHarnessEdges:
             patch("sys.stdin.isatty", return_value=True),
             patch("sys.stdout.isatty", return_value=True),
         ):
-            repl_harness.install_repl_lines_wrapper(instrument_repl_lines)
             run_async(drive())
 
         out = capsys.readouterr().out
@@ -602,10 +563,9 @@ class TestREPLHarnessEdges:
         out = capsys.readouterr().out
         calls = repl_harness.prompt_calls
 
-        # warning phrase present
-        assert "pairs" in out and (
-            "press" in out.lower() or "y" in out.lower() or "to continue" in out.lower()
-        )
+        # pair count still in the log/chrome; keys live only on confirm [y/n]>
+        assert "pairs" in out
+        assert "confirm" in out.lower()
         # clean progress after y
         assert (
             "Permutate done" in out
@@ -985,22 +945,6 @@ class TestREPLHarnessEdges:
         mock_client = repl_harness.set_mock_client()
 
         confirm_ready = asyncio.Event()
-        real_repl = repl_harness.get_repl_print_lines()
-
-        def instrument(text):
-            try:
-                t = str(text) if text else ""
-                if "pairs" in t and (
-                    "y" in t.lower() or "yes" in t.lower() or "continue" in t
-                ):
-                    try:
-                        loop = asyncio.get_running_loop()
-                        loop.call_soon_threadsafe(confirm_ready.set)
-                    except Exception:
-                        confirm_ready.set()
-            except Exception:
-                pass
-            return real_repl(text)
 
         combine_started = asyncio.Event()
 
@@ -1021,7 +965,7 @@ class TestREPLHarnessEdges:
                     auto_feed_quit=False, client=mock_client, storage=storage
                 )
             )
-            await confirm_ready.wait()
+            await _await_confirm_ready(repl_harness, confirm_ready)
             await asyncio.sleep(0)
             repl_harness.feed("y")
             await combine_started.wait()
@@ -1038,7 +982,6 @@ class TestREPLHarnessEdges:
             patch("sys.stdin.isatty", return_value=True),
             patch("sys.stdout.isatty", return_value=True),
         ):
-            repl_harness.install_repl_lines_wrapper(instrument)
             run_async(drive_bulk())
 
         out = capsys.readouterr().out

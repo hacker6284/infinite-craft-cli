@@ -69,6 +69,7 @@ let running = false;
 let activeRuns = 0; // refcount: pair + IB can run concurrently
 let waitingForConfirm = false;
 let confirmResolve = null;
+let confirmReason = ""; // chrome job-row reason; keys live only on the prompt
 // Two independent queues: neal.fun pair API vs Infinibrowser (import/fill/prune).
 const pairQueue = [];
 const ibQueue = [];
@@ -568,7 +569,7 @@ function doTarget(arg) {
   } else if (kind === "clear") {
     print(`  Target cleared (was ${yellow(esc(detail))}).`);
   } else {
-    print(`  Target set: ${bold(yellow(esc(newState)))} — batch work pauses when this is crafted.`);
+    print(`  Target set: ${bold(yellow(esc(newState)))} — you'll be asked whether to continue the batch when this is crafted.`);
   }
   updateChrome();
 }
@@ -582,10 +583,10 @@ async function acknowledgeTargetHit(aName, bName, resultName) {
   await prev;
   try {
     if (cancelled) return true;
-    if (!(await confirmOrCancel([
-      `  ${bold(yellow("★ TARGET HIT ★"))} ${esc(aName)} + ${esc(bName)} = ${bold(yellow(esc(resultName)))}`,
-      `  Press ${bold("y")} to continue, ${bold("n")} / Esc / Stop to halt the batch.`,
-    ]))) {
+    if (!(await confirmOrCancel(
+      [`  ${bold(yellow("★ TARGET HIT ★"))} ${esc(aName)} + ${esc(bName)} = ${bold(yellow(esc(resultName)))}`],
+      { reason: "target hit" },
+    ))) {
       cancelled = true;
       print("  " + yellow("Stopped after target hit."));
       return true;
@@ -679,9 +680,7 @@ async function confirmAndRunPairs(pairs) {
   try {
     beginRun();
     if (shouldBulkWarn(pairs.length, BULK_WARN)) {
-      if (!(await confirmOrCancel([
-        `  ${yellow(`${pairs.length} pairs`)} — press ${bold("y")} to continue, ${bold("n")} / Esc / Stop to cancel.`,
-      ]))) {
+      if (!(await confirmOrCancel([], { reason: `${pairs.length} pairs` }))) {
         print("  Cancelled.");
         return;
       }
@@ -694,11 +693,21 @@ async function confirmAndRunPairs(pairs) {
   }
 }
 
-/** Print warn lines, await y/n, return true to continue / false if cancelled. */
-async function confirmOrCancel(warnLines) {
-  for (const line of warnLines) print(line);
-  const answer = await waitForConfirmKey();
-  return !(cancelled || answer === "__cancelled__" || !confirmShouldContinue(answer));
+/** Print optional context, await y/n, return true to continue / false if cancelled.
+
+    Reason belongs on the job chrome next to the prompt. Keybindings live only
+    on confirm [y/n]>.
+ */
+async function confirmOrCancel(warnLines, { reason } = {}) {
+  for (const line of warnLines || []) print(line);
+  confirmReason = reason || "";
+  try {
+    const answer = await waitForConfirmKey();
+    return !(cancelled || answer === "__cancelled__" || !confirmShouldContinue(answer));
+  } finally {
+    confirmReason = "";
+    updateChrome();
+  }
 }
 
 function waitForConfirmKey() {
@@ -712,7 +721,7 @@ function waitForConfirmKey() {
     if (promptEl) promptEl.textContent = "confirm [y/n]>";
     if (input) {
       input.value = "";
-      input.placeholder = "y / n";
+      input.placeholder = "";
       try { input.readOnly = false; } catch {}
     }
     updateChrome();
@@ -946,9 +955,7 @@ async function doPermutate(query) {
       print(`  ${dim(`--- Round ${round}:`)} ${matches.length} elements, ${pairs.length} pairs ---`);
 
       if (!confirmed && shouldBulkWarn(pairs.length, BULK_WARN)) {
-        if (!(await confirmOrCancel([
-          `  ${yellow(`${pairs.length} pairs per round`)} — press ${bold("y")} to continue, ${bold("n")} / Esc / Stop to cancel.`,
-        ]))) {
+        if (!(await confirmOrCancel([], { reason: `${pairs.length} pairs per round` }))) {
           print("  Cancelled.");
           return;
         }
@@ -1308,7 +1315,7 @@ function doHelp() {
     ${cyan("/prune")}                      Remove orphan elements Infinibrowser can't fill
     ${cyan("/export")}                     Download discoveries as .ic save file
     ${cyan("/history")}                    Show combinations this session
-    ${cyan("/target [element|clear]")}     Watch for a result; pause batch on hit
+    ${cyan("/target [element|clear]")}     Watch for a result; ask y/n to continue on hit
     ${cyan("/clear")}                      Clear output (browser only)
     ${cyan("/help")}                       Show this help`);
 }
@@ -1386,7 +1393,10 @@ function updateChrome() {
   // Job line(s): pair and/or IB can run concurrently (interlaced status).
   const jobParts = [];
   if (waitingForConfirm) {
-    jobParts.push(`<div class="ict-job-row"><span class="ict-job-mark">◆</span> <span class="ict-job-label">confirm</span> <span class="ict-job-cmd">${esc(currentPairCommand)}</span> <span class="ict-job-hint">y / n</span></div>`);
+    const extra = confirmReason
+      ? ` <span class="ict-job-sep">·</span> <span class="ict-job-reason">${esc(confirmReason)}</span>`
+      : "";
+    jobParts.push(`<div class="ict-job-row"><span class="ict-job-mark">◆</span> <span class="ict-job-label">confirm</span> <span class="ict-job-cmd">${esc(currentPairCommand)}</span>${extra}</div>`);
   } else if (currentPairCommand) {
     const prog = jobTotal > 0 ? ` <span class="ict-job-prog">${jobDone}/${jobTotal}</span>` : "";
     jobParts.push(`<div class="ict-job-row"><span class="ict-job-mark">▶</span> <span class="ict-job-label">running</span> <span class="ict-job-cmd">${esc(currentPairCommand)}</span>${prog}</div>`);
@@ -1667,6 +1677,8 @@ function initBrowserUI() {
     #ict-job .ict-job-cmd{color:#ffeb3b}
     #ict-job .ict-job-prog{color:#00bcd4;margin-left:8px}
     #ict-job .ict-job-hint{color:#888;margin-left:8px}
+    #ict-job .ict-job-sep{color:#555;margin:0 4px}
+    #ict-job .ict-job-reason{color:#888}
     #ict-queue{display:none;border-top:1px solid #0f3460;padding:4px 10px;background:#12182b;font-size:12px;max-height:80px;overflow-y:auto}
     #ict-queue .ict-queue-label{color:#ffeb3b;margin-bottom:2px}
     #ict-queue .ict-queue-item{margin:1px 0;opacity:.85}

@@ -180,6 +180,7 @@ def _reset_test_state() -> None:
     _discard_queue_after_cancel = False
     global _job_done, _job_total, _ib_job_done, _ib_job_total
     global _last_pair, _active_client, _rate_ticker_task, _target_element
+    global _confirm_reason
     _job_done = 0
     _job_total = 0
     _ib_job_done = 0
@@ -188,6 +189,7 @@ def _reset_test_state() -> None:
     _active_client = None
     _rate_ticker_task = None
     _target_element = ""
+    _confirm_reason = ""
     _skip_summary_shown = False
     _sigint_previous = None
     _winch_previous = None
@@ -667,6 +669,8 @@ _rate_ticker_task: asyncio.Task | None = None
 # Empty string = no target (kernel is_target_hit/apply_target_state treat "" as idle).
 _target_element: str = ""
 _target_hit_lock = asyncio.Lock()
+# Confirm chrome reason (e.g. "331 pairs"); keys live only on the prompt.
+_confirm_reason: str = ""
 
 
 def _reset_cancelled():
@@ -1761,18 +1765,22 @@ async def _await_confirmation(prompt: str) -> str:
 
 
 async def _prompt_continue(
-    warn_lines: str | list[str],
+    warn_lines: str | list[str] | None = None,
     *,
     bulk_pending: bool = False,
     cancel_msg: str = "Cancelled.",
+    reason: str = "",
 ) -> bool:
-    """Print warn lines, await y/n, return True to continue / False to cancel.
+    """Print optional context, await y/n, return True to continue / False to cancel.
 
-    Owns cleanup of _bulk_confirm_pending / _confirm_expected / _confirm_answer_buffer.
+    Reason belongs on the job chrome next to the prompt. Keybindings live only
+    on confirm [y/n]>. Owns cleanup of _bulk_confirm_pending / _confirm_expected
+    / _confirm_answer_buffer / _confirm_reason.
     Policy is craft.confirm_should_continue; I/O is _await_confirmation.
     EOF/KeyboardInterrupt → cancel.
     """
     global _bulk_confirm_pending, _confirm_expected, _confirm_answer_buffer
+    global _confirm_reason
 
     # Bulk path mirrors historical isatty-only prompt; target hit also allows
     # interactive mode without a TTY (harness / non-TTY interactive).
@@ -1780,17 +1788,22 @@ async def _prompt_continue(
         sys.stdin.isatty() or _interactive_mode_active
     )
 
+    _confirm_reason = reason
     if bulk_pending and can_prompt:
         _bulk_confirm_pending = True
         _chrome_sync()
 
-    if isinstance(warn_lines, str):
+    if isinstance(warn_lines, str) and warn_lines:
         _repl_print_lines(warn_lines)
-    else:
+    elif isinstance(warn_lines, list):
         for line in warn_lines:
-            _repl_print_lines(line)
+            if line:
+                _repl_print_lines(line)
 
     if not can_prompt:
+        # No chrome/prompt — keep a one-line reason so non-TTY logs stay useful.
+        if reason and not warn_lines:
+            _repl_print_lines(f"  {reason}")
         return True
 
     try:
@@ -1809,6 +1822,7 @@ async def _prompt_continue(
         _bulk_confirm_pending = False
         _confirm_expected = False
         _confirm_answer_buffer = None
+        _confirm_reason = ""
         if _chrome_enabled:
             _chrome_prompt = _craft_prompt()
         _chrome_sync()
@@ -1940,9 +1954,8 @@ async def _confirm_and_run_pairs(client, storage, pairs: list[tuple]):
     global _bulk_confirm_resolved
     if craft.should_bulk_warn(len(pairs), _BULK_WARN_THRESHOLD):
         if not await _prompt_continue(
-            f"  {_color(f'{len(pairs)} pairs', YELLOW)} — press "
-            f"{_color('y', BOLD)} to continue, {_color('n', BOLD)} / Esc to cancel.",
             bulk_pending=True,
+            reason=f"{len(pairs)} pairs",
         ):
             return
         _bulk_confirm_resolved = True
@@ -2022,9 +2035,8 @@ async def do_permutate(client, storage, query: str):
 
             if not confirmed and craft.should_bulk_warn(len(pairs), _BULK_WARN_THRESHOLD):
                 if not await _prompt_continue(
-                    f"  {_color(f'{len(pairs)} pairs per round', YELLOW)} — press "
-                    f"{_color('y', BOLD)} to continue, {_color('n', BOLD)} / Esc to cancel.",
                     bulk_pending=True,
+                    reason=f"{len(pairs)} pairs per round",
                 ):
                     return
                 confirmed = True
@@ -2491,7 +2503,7 @@ def do_help() -> str:
     /exhaust <query>            Each match combined with all discoveries
 
   Target:
-    /target <element>           Pause batches when this result is crafted
+    /target <element>           Ask y/n to continue the batch when this is crafted
     /target                     Show current target
     /target clear               Clear target
 
@@ -2514,7 +2526,7 @@ def do_help() -> str:
     /prune                      Remove orphan elements Infinibrowser can't fill
     /export [path]              Export discoveries as .ic save file
     /history                    Show combinations tried this session
-    /target [element|clear]     Watch for a result; pause batch on hit
+    /target [element|clear]     Watch for a result; ask y/n to continue on hit
     /clear                      Clear output (browser only)
     /queue                      Show running and pending commands (status also appears above the prompt)
     /help                       Show this help
@@ -2564,7 +2576,7 @@ def do_target(arg: str) -> str:
         return f"  Target cleared (was {_color(detail, YELLOW)})."
     return (
         f"  Target set: {_color(new_state, BOLD + YELLOW)} — "
-        "batch work pauses when this is crafted."
+        "you'll be asked whether to continue the batch when this is crafted."
     )
 
 
@@ -2582,8 +2594,8 @@ async def _acknowledge_target_hit(a_name: str, b_name: str, result_name: str) ->
             f"{_tty(a_name)} + {_tty(b_name)} = {_color(_tty(result_name), BOLD + YELLOW + MAGENTA)}"
         )
         if not await _prompt_continue(
-            f"  Press {_color('y', BOLD)} to continue, {_color('n', BOLD)} / Esc to stop the batch.",
             cancel_msg="Stopped after target hit.",
+            reason="target hit",
         ):
             _cancelled = True
             return True
@@ -2682,12 +2694,13 @@ def _format_queue_display() -> str:
     if _waiting_for_confirm() or _bulk_confirm_pending:
         prefix = f"  {_color('◆', YELLOW)} {_color('confirm', BOLD + YELLOW)}  "
         cmd = _sanitize_queue_line(running or "")
-        hint = _color("y / n", DIM)
-        pvis = _ansi_visible_len(prefix) + _ansi_visible_len(hint) + 1
+        reason = _sanitize_queue_line(_confirm_reason) if _confirm_reason else ""
+        reason_part = f" {_color('·', DIM)} {reason}" if reason else ""
+        pvis = _ansi_visible_len(prefix) + _ansi_visible_len(reason_part)
         avail = max(1, width - pvis - 1)
         if _ansi_visible_len(cmd) > avail:
             cmd = _fit_visible(cmd, max(0, avail - 1)) + "…"
-        content.append(f"{prefix}{_color(cmd, YELLOW)} {hint}")
+        content.append(f"{prefix}{_color(cmd, YELLOW)}{reason_part}")
     elif running:
         prefix = f"  {_color('▶', YELLOW)} {_color('running', DIM)}  "
         cmd = _sanitize_queue_line(running)

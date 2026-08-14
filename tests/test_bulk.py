@@ -51,7 +51,6 @@ class TestConfirmAndRunPairs:
             run_async(_confirm_and_run_pairs(client, storage, pairs))
         captured = capsys.readouterr()
         assert "pairs" in captured.out
-        assert "press y" in captured.out
         assert "Done" in captured.out
         assert "Cancelled" not in captured.out
 
