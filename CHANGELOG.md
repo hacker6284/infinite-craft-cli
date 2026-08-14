@@ -1,5 +1,35 @@
 # Changelog
 
+## [1.9.0] - 2026-08-14
+
+### Added
+- **Sticky chrome, dual queues, and a segmented rate bar.** Hybrid chrome
+  shows rate budget, job progress, and the current pair. Pair work and
+  Infinibrowser fill/import/prune use independent queues. The rate bar's
+  left segment is next-slot wait refill; the right is remaining budget.
+  Bulk confirm is instant y/n.
+- **`/target` pause on craft hit.** Watch for a named result; on hit,
+  highlight and pause batch/queue progress until y (continue) or n/Esc
+  (stop), using the same confirm chrome as bulk y/n.
+- **CLI version banner.** Dim package version next to the welcome title.
+- **Playwright CDP launcher** for live trainer reinjection.
+
+### Changed
+- **Shared kernel policy.** Queue accept, lane classification, confirm
+  routing, target parse/hit/apply, and rate-bar math live in
+  `sudo/craft.sudo`. Python and the trainer call the same rules; hosts
+  keep async workers, TTY/DOM paint, clocks, and HTTP.
+- **sudocode toolchain v0.5.0.** Codegen is byte-identical to v0.4.0 for
+  this project's py/js backends.
+- **Cleanup-loop workflow** now uses a residual ledger, greppable signal
+  proof, dual-host-only invent classes, and a no-shrink stop. Sudo lockstep
+  is the kernel parity guarantee; host `tests/parity` is wiring only.
+
+### Removed
+- Low-value tests that re-asserted source, poked private globals as the
+  oracle, or duplicated stronger UX / parity / kernel coverage. Behavioral
+  harnesses, host-surface smokes, and kernel lockstep stay.
+
 ## [1.8.4] - 2026-08-08
 
 ### Fixed

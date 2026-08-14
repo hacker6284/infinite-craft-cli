@@ -1,45 +1,49 @@
 // Continuous quality loop for infinite-craft-cli:
 // cull useless tests → drop seams they forced → push pure logic into
 // craft.sudo → thin/dedupe Python+JS hosts → simplify → verify → repeat
-// until dry, stalled, or max_rounds.
+// until residual is dry, residual stops shrinking, or max_rounds.
+//
+// Convergence model (the point of this script):
+//   - Findings are finite defects with a greppable `signal` and stable `key`.
+//   - A residual ledger carries unsolved keys across rounds.
+//   - "Solved" requires signal-proof (signal gone / replacement present), not ok=true.
+//   - Invent (new findings) is capped; after a no-shrink round, invent is off until residual shrinks.
+//   - Flat invent forever is a bug; re-enumeration of residual is intentional.
 //
 // Args (all optional):
-//   max_rounds: int (default 3, minimum 1) — runaway brake for number of discover→verify cycles
-//   max_actions_per_round: int (optional) — ONLY if set >0, hard-cap planned actions (debug).
-//     Default: no cap. Plan must cover all findings worth doing this round.
+//   max_rounds: int (default 3, min 1) — hard brake on discover→verify cycles
+//   max_actions_per_round: int (optional) — ONLY if set >0, hard-cap planned actions (debug)
+//   max_new_findings_per_round: int (default 5, min 0) — invent budget; residual recheck is unlimited
 //   dry_run: bool — discover + plan only, no edits
 //   approve_each_round: bool — await_user before implement
 //   focus: "all" | "tests" | "seams" | "kernel" | "hosts" | "simplify"
 //   base_ref: git ref for optional pre-diff context (default "HEAD")
 //   verify_cmd: override bazel verify command (string)
-//   act_mode: "sequential" (default, one agent per action) | "batch" (single agent)
-//   use_grok_implementer: bool (default false) — prefer session implementer; grok lane
-//     previously bailed on dirty trees without applying the plan
+//   act_mode: "sequential" (default) | "batch"
+//   use_grok_implementer: bool (default false)
 //
-// Agent budget (workflow tool agent_budget) is the real cost ceiling when many
-// actions run sequentially in one round — not max_actions_per_round.
+// Agent budget (workflow tool agent_budget) is the cost ceiling for sequential acts.
 
 let meta = #{
     name: "cleanup-loop",
-    description: "Loop: cull low-value tests, remove seams, consolidate pure logic into craft.sudo, thin PY/JS hosts, verify with bazel",
-    when_to_use: "Continuous maintainability pass when hosts duplicate pure rules, tests assert implementation, or craft.sudo should own more business logic",
+    description: "Loop: residual-ledger cleanup — cull tests, drop seams, dual-host kernel extract, thin hosts; prove signals; stop when residual dries or stops shrinking",
+    when_to_use: "Maintainability pass when hosts duplicate pure rules, tests assert implementation, or craft.sudo should own more business logic — not open-ended polish farming",
     phases: [
-        #{ title: "Discover", detail: "parallel scanners: tests, seams, kernel candidates, host dup" },
-        #{ title: "Plan", detail: "ordered actions covering all findings worth doing" },
-        #{ title: "Act", detail: "implement every planned action (or dry-run skip)" },
-        #{ title: "Verify", detail: "bazel proof gate; one fix attempt on failure" },
-        #{ title: "Loop", detail: "fingerprint progress; stop when dry or stalled" },
+        #{ title: "Discover", detail: "residual recheck first; capped invent scanners if allowed" },
+        #{ title: "Plan", detail: "actions from residual + admitted new only" },
+        #{ title: "Act", detail: "implement planned actions" },
+        #{ title: "Verify", detail: "bazel gate + signal proof; update residual ledger" },
+        #{ title: "Loop", detail: "shrink residual or stop inventing / exit" },
     ],
 };
 
 // --- schemas -----------------------------------------------------------------
 
-// Findings are WORK ORDERS only. No inventory / "for completeness" rows.
-// remedy:
-//   delete  — remove the test/code; coverage already exists or is not needed
-//   replace — remove bad test/code AND add the behavioral replacement described
-//   extract / inline / refactor — host/kernel/seam work (non-test)
-// replacement: required non-empty prose when remedy is replace; else "".
+// Work orders only. Every finding needs a stable key + greppable signal.
+// signal: substring that must be GONE after a successful fix (grep evidence).
+// For remedy=replace, also describe what must appear in replacement (prose);
+// signal still targets the bad artifact that must leave.
+// key: stable id = kind|primary_path|signal_slug — same problem keeps same key across rounds.
 let findings_schema = #{
     "type": "object",
     "required": ["findings", "dimension"],
@@ -47,12 +51,16 @@ let findings_schema = #{
         "dimension": #{ "type": "string" },
         "findings": #{
             "type": "array",
-            "maxItems": 64,
+            "maxItems": 8,
             "items": #{
                 "type": "object",
-                "required": ["id", "kind", "remedy", "title", "detail", "paths", "confidence", "replacement"],
+                "required": [
+                    "id", "key", "kind", "remedy", "title", "detail",
+                    "paths", "confidence", "replacement", "signal",
+                ],
                 "properties": #{
                     "id": #{ "type": "string" },
+                    "key": #{ "type": "string" },
                     "kind": #{
                         "type": "string",
                         "enum": ["cull_test", "drop_seam", "kernel_extract", "host_dedup", "simplify"],
@@ -66,10 +74,55 @@ let findings_schema = #{
                     "paths": #{
                         "type": "array",
                         "items": #{ "type": "string" },
-                        "maxItems": 16,
+                        "maxItems": 8,
                     },
                     "confidence": #{ "type": "string", "enum": ["high", "medium", "low"] },
                     "replacement": #{ "type": "string" },
+                    "signal": #{ "type": "string" },
+                },
+            },
+        },
+        "notes": #{ "type": "string" },
+    },
+};
+
+// Residual recheck: is each open key's signal still present in its paths?
+let residual_schema = #{
+    "type": "object",
+    "required": ["results"],
+    "properties": #{
+        "results": #{
+            "type": "array",
+            "maxItems": 80,
+            "items": #{
+                "type": "object",
+                "required": ["key", "still_present", "evidence"],
+                "properties": #{
+                    "key": #{ "type": "string" },
+                    "still_present": #{ "type": "boolean" },
+                    "evidence": #{ "type": "string" },
+                },
+            },
+        },
+        "notes": #{ "type": "string" },
+    },
+};
+
+// Signal proof after act: did the planned keys clear?
+let signal_proof_schema = #{
+    "type": "object",
+    "required": ["checks"],
+    "properties": #{
+        "checks": #{
+            "type": "array",
+            "maxItems": 80,
+            "items": #{
+                "type": "object",
+                "required": ["key", "cleared", "evidence"],
+                "properties": #{
+                    "key": #{ "type": "string" },
+                    "cleared": #{ "type": "boolean" },
+                    "evidence": #{ "type": "string" },
                 },
             },
         },
@@ -85,12 +138,13 @@ let plan_schema = #{
         "rationale": #{ "type": "string" },
         "actions": #{
             "type": "array",
-            "maxItems": 80,
+            "maxItems": 40,
             "items": #{
                 "type": "object",
-                "required": ["id", "kind", "remedy", "title", "spec", "paths"],
+                "required": ["id", "key", "kind", "remedy", "title", "spec", "paths", "signal"],
                 "properties": #{
                     "id": #{ "type": "string" },
+                    "key": #{ "type": "string" },
                     "kind": #{
                         "type": "string",
                         "enum": ["cull_test", "drop_seam", "kernel_extract", "host_dedup", "simplify"],
@@ -104,8 +158,9 @@ let plan_schema = #{
                     "paths": #{
                         "type": "array",
                         "items": #{ "type": "string" },
-                        "maxItems": 16,
+                        "maxItems": 8,
                     },
+                    "signal": #{ "type": "string" },
                 },
             },
         },
@@ -114,7 +169,7 @@ let plan_schema = #{
 
 let act_schema = #{
     "type": "object",
-    "required": ["ok", "summary", "changed_paths", "deleted_tests", "added_tests", "notes"],
+    "required": ["ok", "summary", "changed_paths", "deleted_tests", "added_tests", "notes", "keys_touched"],
     "properties": #{
         "ok": #{ "type": "boolean" },
         "summary": #{ "type": "string" },
@@ -129,6 +184,11 @@ let act_schema = #{
             "maxItems": 80,
         },
         "added_tests": #{
+            "type": "array",
+            "items": #{ "type": "string" },
+            "maxItems": 40,
+        },
+        "keys_touched": #{
             "type": "array",
             "items": #{ "type": "string" },
             "maxItems": 40,
@@ -155,7 +215,6 @@ let verify_schema = #{
 // --- helpers -----------------------------------------------------------------
 
 fn clamp_int(v, lo, hi, fallback) {
-    // hi < lo means "no upper bound" (only enforce lo).
     if type_of(v) != "i64" && type_of(v) != "f64" && type_of(v) != "i32" {
         return fallback;
     }
@@ -184,7 +243,6 @@ fn trimmed(s) {
 }
 
 fn kind_rank(kind) {
-    // Strict order: tests first so seams can die; kernel before host dedup.
     if kind == "cull_test" { return 0; }
     if kind == "drop_seam" { return 1; }
     if kind == "kernel_extract" { return 2; }
@@ -204,9 +262,6 @@ fn focus_allows(focus, kind) {
 }
 
 fn finding_has_valid_remedy(f) {
-    // Schema-level contract: every finding is a work order with a remedy.
-    // replace requires a non-empty replacement brief; delete/extract/inline/refactor
-    // use replacement "".
     if f == () { return false; }
     let remedy = as_str(f.remedy, "");
     if remedy == "delete" { return true; }
@@ -224,12 +279,43 @@ fn finding_has_valid_remedy(f) {
     false
 }
 
+fn finding_has_signal(f) {
+    if f == () { return false; }
+    let sig = trimmed(as_str(f.signal, ""));
+    sig != ""
+}
+
+fn slug_signal(sig) {
+    // Compact signal for key suffix (no regex in Rhai — truncate only).
+    let s = trimmed(sig);
+    if s.len() > 48 {
+        return s.sub_string(0, 48);
+    }
+    s
+}
+
+fn primary_path(paths) {
+    if type_of(paths) != "array" || paths.len() == 0 { return ""; }
+    as_str(paths[0], "")
+}
+
+fn ensure_key(f) {
+    // Prefer agent key; else derive stable key from kind|path|signal.
+    let k = trimmed(as_str(f.key, ""));
+    if k != "" {
+        f.key = k;
+        return f;
+    }
+    let kind = as_str(f.kind, "unknown");
+    let path = primary_path(f.paths);
+    let sig = slug_signal(as_str(f.signal, as_str(f.title, "")));
+    f.key = kind + "|" + path + "|" + sig;
+    f
+}
+
 fn normalize_repo_path(p) {
-    // Accept absolute or relative paths; return repo-relative when possible.
     if type_of(p) != "string" { return ""; }
     let s = p;
-    // Strip common absolute prefixes (agents often return abs paths).
-    // Match trailing repo-relative segments by searching for known roots.
     let markers = [
         "/tests/",
         "/sudo/",
@@ -238,7 +324,6 @@ fn normalize_repo_path(p) {
         "/.grok/",
     ];
     for m in markers {
-        // find last occurrence via scan
         let idx = -1;
         let i = 0;
         while i + m.len() <= s.len() {
@@ -248,16 +333,13 @@ fn normalize_repo_path(p) {
             i += 1;
         }
         if idx >= 0 {
-            // drop leading slash from marker: "/tests/" → "tests/..."
             return s.sub_string(idx + 1, s.len() - (idx + 1));
         }
     }
-    // Already relative?
     s
 }
 
 fn path_in_scope(p) {
-    // Script-side invariant: only touch this project's known surfaces.
     let s = normalize_repo_path(p);
     if s == "" { return false; }
     if s == "sudo/craft.sudo" { return true; }
@@ -295,11 +377,73 @@ fn filter_paths(paths) {
     out
 }
 
+fn has_py_and_js_paths(paths) {
+    // kernel_extract / host_dedup must cite both hosts (or craft.sudo + both).
+    let py = false;
+    let js = false;
+    let sudo = false;
+    if type_of(paths) != "array" { return false; }
+    for p in paths {
+        let s = as_str(p, "");
+        if s.len() >= 22 && s.sub_string(0, 22) == "src/infinite_craft_cli/" { py = true; }
+        if s == "src/infinite_craft_cli/cli.py" { py = true; }
+        if s == "src/infinite_craft_cli/ratelimit.py" { py = true; }
+        if s.len() >= 11 && s.sub_string(0, 11) == "bookmarklet/" { js = true; }
+        if s == "sudo/craft.sudo" { sudo = true; }
+    }
+    // dual-host pure: both hosts, or one host + kernel when extracting
+    if py && js { return true; }
+    if sudo && (py || js) { return true; }
+    false
+}
+
+fn finding_passes_class_gate(f) {
+    // Closed problem classes — reject open polish that cannot shrink residual.
+    let kind = as_str(f.kind, "");
+    let paths = f.paths;
+    if kind == "kernel_extract" {
+        // Must cite dual-host (or kernel+host) pure duplication — not "extract this string".
+        if !has_py_and_js_paths(paths) { return false; }
+        return true;
+    }
+    if kind == "host_dedup" {
+        if !has_py_and_js_paths(paths) { return false; }
+        return true;
+    }
+    // cull_test / drop_seam / simplify: path filter already applied
+    true
+}
+
+fn key_in_list(list, key) {
+    if type_of(list) != "array" { return false; }
+    for x in list {
+        if as_str(x, "") == key { return true; }
+    }
+    false
+}
+
+fn finding_by_key(arr, key) {
+    if type_of(arr) != "array" { return (); }
+    for f in arr {
+        if as_str(f.key, "") == key { return f; }
+    }
+    ()
+}
+
+fn remove_finding_key(arr, key) {
+    let out = [];
+    if type_of(arr) != "array" { return out; }
+    for f in arr {
+        if as_str(f.key, "") != key { out.push(f); }
+    }
+    out
+}
+
 fn merge_act_output(out) {
-    // Parse act_schema agent output into a plain map.
     let local_changed = [];
     let local_deleted = [];
     let local_added = [];
+    let keys_touched = [];
     let notes = "";
     let summary = "";
     let ok = false;
@@ -320,6 +464,11 @@ fn merge_act_output(out) {
                 if type_of(t) == "string" { local_added.push(t); }
             }
         }
+        if out.keys_touched != () {
+            for k in out.keys_touched {
+                if type_of(k) == "string" { keys_touched.push(k); }
+            }
+        }
     }
     #{
         ok: ok,
@@ -328,10 +477,10 @@ fn merge_act_output(out) {
         changed: local_changed,
         deleted: local_deleted,
         added: local_added,
+        keys_touched: keys_touched,
     }
 }
 
-// Note: Rhai fn bodies do not close over outer `let` maps — pass schemas in.
 fn build_act_opts(label, use_grok_flag, schema) {
     let opts = #{
         label: label,
@@ -367,20 +516,20 @@ fn doctrine_text() {
     d += "behavior would go untested.\n";
     d += "5. After bad tests leave, DELETE seams they forced (thin wrappers, aliases, getattr soup).\n";
     d += "Findings are work orders only — never inventory rows about things to leave alone.\n";
-    d += "6. Then SIMPLIFY: one confirm helper, one parameterized lane worker, empty-string target, ";
-    d += "inline pure re-exports of craft.*, direct chrome_snapshot calls.\n";
+    d += "6. SIMPLIFY only finite defects: dead duals, pure re-exports, single-use wrappers — not endless polish.\n";
     d += "7. Do NOT fully split cli.py into modules in this workflow unless an action explicitly says so.\n";
     d += "8. Do NOT commit or push unless the plan explicitly includes a commit action (default: no commit).\n";
     d += "9. KEEP high-value behavior: dual-queue UX harnesses, confirm FSM harnesses, target set/show/clear, ";
     d += "ratelimit chrome math, noninteractive CLI, parity lockstep, kernel tests.\n";
+    d += "10. CONVERGENCE: empty findings is success. Do not invent work to fill a quota. ";
+    d += "kernel_extract / host_dedup require the SAME pure rule on BOTH hosts (cite both paths). ";
+    d += "Do NOT propose extracting message templates / prose / copy into the kernel unless both hosts ";
+    d += "already implement the same pure decision with duplicated logic.\n";
     d
 }
 
 fn default_verify_cmd() {
     // ONLY package globs — never named //pkg:target that a cull can delete.
-    // History: hard-coded //tests:test_trainer_parity, //tests:test_extension_loader,
-    // and //bookmarklet:kernel_smoke_test each blocked the loop after intentional deletes.
-    // Globs expand to whatever is still declared in those packages.
     let c = "bazel test ";
     c += "//sudo/... ";
     c += "//tests/... ";
@@ -390,11 +539,27 @@ fn default_verify_cmd() {
     c
 }
 
+fn invent_rules_blob() {
+    let p = "";
+    p += "INVENT RULES (new findings only — residual is handled separately):\n";
+    p += "- Prefer findings=[] after a real inspection. Empty is success, not failure.\n";
+    p += "- Emit ONLY high-confidence finite defects you want fixed NOW.\n";
+    p += "- Every finding MUST have: key (stable, kind|path|signal), signal (greppable substring that ";
+    p += "must DISAPPEAR when fixed), paths (repo-relative), remedy, replacement (\"\" unless replace).\n";
+    p += "- Do NOT invent inventory, polish, or 'for completeness' rows.\n";
+    p += "- Do NOT re-emit keys listed as RESOLVED or already OPEN.\n";
+    p += "- kernel_extract / host_dedup: cite BOTH Python and JS paths (or craft.sudo + host). ";
+    p += "Reject single-host message-template farming.\n";
+    p += "- Cap yourself: few findings beat many weak ones.\n";
+    p
+}
+
 // --- args --------------------------------------------------------------------
 
 let max_rounds = 3;
-// 0 = no cap (default). Optional debug: pass max_actions_per_round > 0 to truncate plans.
 let max_actions = 0;
+// Invent budget per round (residual recheck is unlimited). Default 5.
+let max_new = 5;
 let dry_run = false;
 let approve_each = false;
 let focus = "all";
@@ -404,11 +569,12 @@ let act_mode = "sequential";
 let use_grok = false;
 
 if args != () {
-    // max_rounds: only floor at 1 — caller-chosen cap is the runaway limit for rounds.
     if args.max_rounds != () { max_rounds = at_least_int(args.max_rounds, 1, 3); }
-    // Optional debug-only action cap. Default is unlimited (0).
     if args.max_actions_per_round != () {
         max_actions = at_least_int(args.max_actions_per_round, 0, 0);
+    }
+    if args.max_new_findings_per_round != () {
+        max_new = at_least_int(args.max_new_findings_per_round, 0, 5);
     }
     if args.dry_run != () { dry_run = as_bool(args.dry_run, false); }
     if args.approve_each_round != () { approve_each = as_bool(args.approve_each_round, false); }
@@ -434,220 +600,312 @@ let max_actions_label = "unlimited";
 if max_actions > 0 { max_actions_label = max_actions.to_string(); }
 log("cleanup-loop start: max_rounds=" + max_rounds.to_string()
     + " max_actions_per_round=" + max_actions_label
+    + " max_new_findings_per_round=" + max_new.to_string()
     + " focus=" + focus
     + " dry_run=" + dry_run.to_string()
     + " act_mode=" + act_mode
     + " use_grok=" + use_grok.to_string());
 
-// --- loop state --------------------------------------------------------------
+// --- loop state (residual ledger) --------------------------------------------
 
 let round = 0;
 let empty_streak = 0;
+let no_shrink_streak = 0;
+let invent_allowed = true;
 let last_fp = "";
 let history = [];
 let all_deleted_tests = [];
 let all_added_tests = [];
 let all_changed = [];
+// Open residual: finding maps with key/signal/paths/...
+let open_residual = [];
+// Resolved keys (never re-admit invent for these)
+let resolved_keys = [];
+let stop_reason = "";
 
 while round < max_rounds {
     round += 1;
     let round_label = "round-" + round.to_string();
-    log("--- " + round_label + " ---");
+    log("--- " + round_label + " residual_open=" + open_residual.len().to_string()
+        + " invent_allowed=" + invent_allowed.to_string()
+        + " no_shrink_streak=" + no_shrink_streak.to_string() + " ---");
 
-    // ── Discover ────────────────────────────────────────────────────────────
     phase("Discover");
-
     let doctrine = doctrine_text();
+
     let scope_blob = "";
     scope_blob += "In-scope paths only (repo-RELATIVE, never absolute):\n";
     scope_blob += "  sudo/craft.sudo, src/infinite_craft_cli/**, bookmarklet/**, tests/**\n";
     scope_blob += "Always set finding.paths to relative paths like \"bookmarklet/trainer.src.mjs\" ";
     scope_blob += "or \"src/infinite_craft_cli/cli.py\" — NOT /Users/... absolute paths.\n";
     scope_blob += "Focus filter for this run: " + focus + "\n";
-    scope_blob += "You MUST use tools (grep, read_file, list_dir, git). ";
-    scope_blob += "Empty findings only after you actually inspected the tree.\n";
-    scope_blob += "For focus=seams: report concrete drop_seam items (aliases, pure re-export wrappers, ";
-    scope_blob += "getattr soup, remaining() dual API, deprecated currentCommand) with file paths.\n";
+    scope_blob += "You MUST use tools (grep, read_file, list_dir, git).\n";
 
-    let scan_jobs = [];
+    // ── Residual recheck (always when ledger non-empty) ─────────────────────
+    let still_open = [];
+    let recheck_cleared = 0;
+    if open_residual.len() > 0 {
+        let b0 = budget();
+        if b0.remaining < 3 {
+            log("budget low before residual recheck; stopping");
+            stop_reason = "budget";
+            break;
+        }
+        let recheck_prompt = "";
+        recheck_prompt += doctrine + "\n" + scope_blob;
+        recheck_prompt += "RESIDUAL RECHECK only. Do NOT invent new findings.\n";
+        recheck_prompt += "For each OPEN item, grep/read its paths for its signal.\n";
+        recheck_prompt += "still_present=true only if the greppable signal is still in those files.\n";
+        recheck_prompt += "still_present=false if the defect is gone (signal absent / test deleted / seam gone).\n";
+        recheck_prompt += "evidence: short quote or 'not found' + tool used.\n";
+        recheck_prompt += "OPEN RESIDUAL JSON:\n";
+        recheck_prompt += json_encode(open_residual) + "\n";
+        recheck_prompt += "Return one results[] entry per open key.\n";
 
-    // tests scanner
-    if focus == "all" || focus == "tests" {
-        let p = "";
-        p += doctrine + "\n" + scope_blob;
-        p += "DIMENSION: cull_test (tests that need change now)\n";
-        p += "Audit tests/ for low-value or implementation-asserting tests. Prioritize:\n";
-        p += "- tests that read source and assert identifiers / index order\n";
-        p += "- tests that poke cli._command_queue, _chrome_*, private workers as assertions\n";
-        p += "- tests that only exist to pin thin wrappers or getattr seams\n";
-        p += "- tests duplicated by test_interactive_ux harnesses or tests/parity\n";
-        p += "Read at least: tests/test_interactive.py, tests/test_interactive_ux.py (sample via grep), ";
-        p += "tests/test_formatting.py, tests/test_bulk.py, tests/test_cli.py, tests/parity/.\n";
-        p += "FINDINGS ARE WORK ORDERS ONLY:\n";
-        p += "- Emit a finding only when you want the implementer to change the suite now.\n";
-        p += "- Set remedy=delete when coverage already exists elsewhere (name that coverage in detail).\n";
-        p += "- Set remedy=replace when the bad test still guards behavior that would be untested after delete; ";
-        p += "put a concrete replacement brief in replacement (what behavioral test to add, where, what it asserts). ";
-        p += "Implementers must ADD that test, not only delete.\n";
-        p += "- replacement=\"\" when remedy is delete.\n";
-        p += "- If a test is fine and should stay, emit NOTHING about it (not even a 'keep' finding). Use notes only for ";
-        p += "global remarks. Empty findings means the suite is fine for this dimension.\n";
-        p += "- Do not invent inventory rows for completeness.\n";
-        p += "Do NOT propose deleting high-value dual-queue/confirm harnesses without a replace that preserves that coverage.\n";
-        p += "Return dimension=\"tests\".\n";
-        scan_jobs.push(#{
-            prompt: p,
-            label: round_label + ":scan-tests",
+        let rr = agent(recheck_prompt, #{
+            label: round_label + ":residual-recheck",
             capability_mode: "read-only",
-            output_schema: findings_schema,
+            output_schema: residual_schema,
         });
-    }
 
-    // seams scanner
-    if focus == "all" || focus == "seams" {
-        let p = "";
-        p += doctrine + "\n" + scope_blob;
-        p += "DIMENSION: drop_seam\n";
-        p += "Find production seams that exist mainly for tests or as dead aliases:\n";
-        p += "- JS currentCommand deprecated alias, ensureQueueWorker alias\n";
-        p += "- Python pure re-export wrappers of craft.*\n";
-        p += "- getattr soup / dual APIs only for tests\n";
-        p += "Use grep/read_file on cli.py, ratelimit.py, trainer.src.mjs and tests that reference them.\n";
-        p += "WORK ORDERS ONLY: emit findings you want implemented now.\n";
-        p += "remedy=inline or delete for pure removals; remedy=replace if tests must be rewritten to the new surface ";
-        p += "(describe the new test approach in replacement). If a seam must stay for harnesses, emit nothing for it.\n";
-        p += "Return dimension=\"seams\".\n";
-        scan_jobs.push(#{
-            prompt: p,
-            label: round_label + ":scan-seams",
-            capability_mode: "read-only",
-            output_schema: findings_schema,
-        });
-    }
-
-    // kernel candidates
-    if focus == "all" || focus == "kernel" {
-        let p = "";
-        p += doctrine + "\n" + scope_blob;
-        p += "DIMENSION: kernel_extract\n";
-        p += "Find pure logic still duplicated or host-only that belongs in sudo/craft.sudo.\n";
-        p += "Read craft.sudo exports AND matching host call sites.\n";
-        p += "WORK ORDERS ONLY. remedy=extract for new kernel APIs + host wiring. ";
-        p += "remedy=replace if tests that pinned the old host path must become kernel/parity tests (spell that out in replacement).\n";
-        p += "If nothing should change now, findings=[]. Return dimension=\"kernel\".\n";
-        scan_jobs.push(#{
-            prompt: p,
-            label: round_label + ":scan-kernel",
-            capability_mode: "read-only",
-            output_schema: findings_schema,
-        });
-    }
-
-    // host duplication
-    if focus == "all" || focus == "hosts" || focus == "simplify" {
-        let p = "";
-        p += doctrine + "\n" + scope_blob;
-        p += "DIMENSION: host_dedup and simplify\n";
-        p += "Compare Python cli.py vs JS trainer.src.mjs for cloned control flow worth collapsing.\n";
-        p += "WORK ORDERS ONLY. remedy=refactor/inline/extract as appropriate; replace if tests must follow.\n";
-        p += "If nothing should change now, findings=[]. Do not propose full file splits of cli.py.\n";
-        p += "Return dimension=\"hosts\".\n";
-        scan_jobs.push(#{
-            prompt: p,
-            label: round_label + ":scan-hosts",
-            capability_mode: "read-only",
-            output_schema: findings_schema,
-        });
-    }
-
-    if scan_jobs.len() == 0 {
-        complete(#{
-            summary: "No scanners for focus=" + focus,
-            rounds: history,
-        });
-    }
-
-    let b = budget();
-    if b.remaining < scan_jobs.len() + 4 {
-        log("budget low before scan; stopping");
-        break;
-    }
-
-    let scan_results = parallel(scan_jobs);
-
-    let pooled = [];
-    let si = 0;
-    let raw_count = 0;
-    let dropped_kind = 0;
-    let dropped_path = 0;
-    let dropped_bad_remedy = 0;
-    for r in scan_results {
-        if r != () && r.success && r.output != () && r.output.findings != () {
-            for f in r.output.findings {
-                if f == () { continue; }
-                raw_count += 1;
-                let k = as_str(f.kind, "");
-                if !focus_allows(focus, k) {
-                    dropped_kind += 1;
-                    continue;
+        // Default: keep all open if recheck fails (fail closed on residual).
+        let present_map_keys = [];
+        let gone_map_keys = [];
+        if rr != () && rr.success && rr.output != () && rr.output.results != () {
+            for row in rr.output.results {
+                if row == () { continue; }
+                let rk = as_str(row.key, "");
+                if rk == "" { continue; }
+                if as_bool(row.still_present, true) {
+                    present_map_keys.push(rk);
+                } else {
+                    gone_map_keys.push(rk);
                 }
-                if !finding_has_valid_remedy(f) {
-                    dropped_bad_remedy += 1;
-                    log("drop finding missing valid remedy/replacement: "
-                        + as_str(f.id, "?") + " remedy=" + as_str(f.remedy, "?"));
-                    continue;
-                }
-                let paths = filter_paths(f.paths);
-                // require at least one in-scope path, or allow cull_test with tests/ implied by title
-                if paths.len() == 0 && k != "cull_test" {
-                    dropped_path += 1;
-                    log("drop finding (paths out of scope): " + as_str(f.title, "?")
-                        + " raw_paths=" + json_encode(f.paths));
-                    continue;
-                }
-                if paths.len() == 0 && k == "cull_test" {
-                    // force tests/ prefix if agent omitted paths
-                    paths = ["tests/"];
-                }
-                f.paths = paths;
-                pooled.push(f);
             }
         } else {
-            log("scanner slot " + si.to_string() + " failed or empty");
+            log("residual recheck failed — keeping all open keys");
+            for f in open_residual {
+                present_map_keys.push(as_str(f.key, ""));
+            }
         }
-        si += 1;
+
+        for f in open_residual {
+            let k = as_str(f.key, "");
+            if key_in_list(gone_map_keys, k) {
+                recheck_cleared += 1;
+                if !key_in_list(resolved_keys, k) { resolved_keys.push(k); }
+                log("residual cleared (pre-act): " + k);
+            } else {
+                still_open.push(f);
+            }
+        }
+        open_residual = still_open;
+        log("residual recheck: still_open=" + open_residual.len().to_string()
+            + " cleared=" + recheck_cleared.to_string());
     }
 
-    log("pooled findings: " + pooled.len().to_string()
-        + " (raw=" + raw_count.to_string()
-        + " dropped_kind=" + dropped_kind.to_string()
-        + " dropped_path=" + dropped_path.to_string()
-        + " dropped_bad_remedy=" + dropped_bad_remedy.to_string() + ")");
+    let open_after_recheck = open_residual.len();
+
+    // ── Invent scanners (capped; skipped when invent not allowed) ───────────
+    let invented = [];
+    let raw_invent = 0;
+    let dropped_invent = 0;
+
+    if invent_allowed && max_new > 0 {
+        let invent_jobs = [];
+        let resolved_json = json_encode(resolved_keys);
+        let open_keys = [];
+        for f in open_residual { open_keys.push(as_str(f.key, "")); }
+        let open_keys_json = json_encode(open_keys);
+        let ledger_blob = "";
+        ledger_blob += "RESOLVED keys (do not re-emit): " + resolved_json + "\n";
+        ledger_blob += "OPEN keys (already on residual; do not re-emit): " + open_keys_json + "\n";
+        ledger_blob += invent_rules_blob();
+
+        if focus == "all" || focus == "tests" {
+            let p = "";
+            p += doctrine + "\n" + scope_blob + ledger_blob;
+            p += "DIMENSION: cull_test\n";
+            p += "Audit tests/ for low-value or implementation-asserting tests.\n";
+            p += "Prioritize: source identifier asserts; private _command_queue/_chrome_* oracles; ";
+            p += "seams-only pins; duplicates of test_interactive_ux or tests/parity.\n";
+            p += "Read at least samples of: tests/test_interactive.py, tests/test_interactive_ux.py, ";
+            p += "tests/test_formatting.py, tests/test_bulk.py, tests/test_cli.py, tests/parity/.\n";
+            p += "remedy=delete with named remaining coverage, or remedy=replace with replacement brief.\n";
+            p += "signal = greppable test name or unique assertion fragment that must leave the suite.\n";
+            p += "Empty findings if suite is fine. Return dimension=\"tests\".\n";
+            invent_jobs.push(#{
+                prompt: p,
+                label: round_label + ":scan-tests",
+                capability_mode: "read-only",
+                output_schema: findings_schema,
+            });
+        }
+        if focus == "all" || focus == "seams" {
+            let p = "";
+            p += doctrine + "\n" + scope_blob + ledger_blob;
+            p += "DIMENSION: drop_seam\n";
+            p += "Finite seams only: dead aliases, pure re-export wrappers of craft.*, getattr soup ";
+            p += "only for tests, deprecated dual APIs.\n";
+            p += "signal = symbol name that must disappear (e.g. function def line fragment).\n";
+            p += "If a seam must stay for harnesses, emit nothing. Return dimension=\"seams\".\n";
+            invent_jobs.push(#{
+                prompt: p,
+                label: round_label + ":scan-seams",
+                capability_mode: "read-only",
+                output_schema: findings_schema,
+            });
+        }
+        if focus == "all" || focus == "kernel" {
+            let p = "";
+            p += doctrine + "\n" + scope_blob + ledger_blob;
+            p += "DIMENSION: kernel_extract\n";
+            p += "ONLY pure logic duplicated on BOTH hosts (or host clone of something that belongs in ";
+            p += "craft.sudo). Cite BOTH py and js paths (and craft.sudo if adding API).\n";
+            p += "FORBIDDEN: message templates, prose, copy-only 'extract this string', single-host polish.\n";
+            p += "signal = greppable host fragment that should leave after extract.\n";
+            p += "If nothing dual-host remains, findings=[]. Return dimension=\"kernel\".\n";
+            invent_jobs.push(#{
+                prompt: p,
+                label: round_label + ":scan-kernel",
+                capability_mode: "read-only",
+                output_schema: findings_schema,
+            });
+        }
+        if focus == "all" || focus == "hosts" || focus == "simplify" {
+            let p = "";
+            p += doctrine + "\n" + scope_blob + ledger_blob;
+            p += "DIMENSION: host_dedup / simplify\n";
+            p += "Cloned control flow across py+js, or finite dead duals/wrappers on one host.\n";
+            p += "host_dedup MUST cite both hosts. simplify: dead duals / pure re-exports only.\n";
+            p += "Do not propose full cli.py splits. Empty is success. Return dimension=\"hosts\".\n";
+            invent_jobs.push(#{
+                prompt: p,
+                label: round_label + ":scan-hosts",
+                capability_mode: "read-only",
+                output_schema: findings_schema,
+            });
+        }
+
+        if invent_jobs.len() > 0 {
+            let b1 = budget();
+            if b1.remaining < invent_jobs.len() + 5 {
+                log("budget low before invent scan; skipping invent");
+            } else {
+                let scan_results = parallel(invent_jobs);
+                let si = 0;
+                for r in scan_results {
+                    if r != () && r.success && r.output != () && r.output.findings != () {
+                        for f in r.output.findings {
+                            if f == () { continue; }
+                            raw_invent += 1;
+                            let kind = as_str(f.kind, "");
+                            if !focus_allows(focus, kind) {
+                                dropped_invent += 1;
+                                continue;
+                            }
+                            if !finding_has_valid_remedy(f) {
+                                dropped_invent += 1;
+                                continue;
+                            }
+                            if !finding_has_signal(f) {
+                                dropped_invent += 1;
+                                log("drop invent (no signal): " + as_str(f.title, "?"));
+                                continue;
+                            }
+                            let paths = filter_paths(f.paths);
+                            if paths.len() == 0 && kind == "cull_test" { paths = ["tests/"]; }
+                            if paths.len() == 0 {
+                                dropped_invent += 1;
+                                continue;
+                            }
+                            f.paths = paths;
+                            f = ensure_key(f);
+                            let fk = as_str(f.key, "");
+                            if key_in_list(resolved_keys, fk) {
+                                dropped_invent += 1;
+                                continue;
+                            }
+                            if finding_by_key(open_residual, fk) != () {
+                                dropped_invent += 1;
+                                continue;
+                            }
+                            if finding_by_key(invented, fk) != () {
+                                dropped_invent += 1;
+                                continue;
+                            }
+                            // High confidence preferred; drop low on invent
+                            let conf = as_str(f.confidence, "medium");
+                            if conf == "low" {
+                                dropped_invent += 1;
+                                continue;
+                            }
+                            if !finding_passes_class_gate(f) {
+                                dropped_invent += 1;
+                                log("drop invent (class gate): " + fk);
+                                continue;
+                            }
+                            invented.push(f);
+                        }
+                    } else {
+                        log("invent scanner slot " + si.to_string() + " failed or empty");
+                    }
+                    si += 1;
+                }
+            }
+        }
+
+        // Cap invent admissions
+        if invented.len() > max_new {
+            log("invent cap: truncating " + invented.len().to_string()
+                + " → " + max_new.to_string());
+            let capped = [];
+            let i = 0;
+            while i < max_new {
+                capped.push(invented[i]);
+                i += 1;
+            }
+            invented = capped;
+        }
+
+        // Admit invent into residual
+        for f in invented {
+            open_residual.push(f);
+        }
+        log("invent: admitted=" + invented.len().to_string()
+            + " raw=" + raw_invent.to_string()
+            + " dropped=" + dropped_invent.to_string());
+    } else {
+        log("invent skipped (allowed=" + invent_allowed.to_string()
+            + " max_new=" + max_new.to_string() + ")");
+    }
+
+    let work = open_residual;
+    log("work set size: " + work.len().to_string()
+        + " (open_after_recheck=" + open_after_recheck.to_string()
+        + " + invent this round)");
 
     // ── Plan ────────────────────────────────────────────────────────────────
     phase("Plan");
 
-    let findings_json = json_encode(pooled);
+    let findings_json = json_encode(work);
     let plan_prompt = "";
     plan_prompt += doctrine + "\n";
     plan_prompt += "You are the planner for round " + round.to_string() + " of cleanup-loop.\n";
-    plan_prompt += "Findings are work orders with remedy delete|replace|extract|inline|refactor.\n";
-    plan_prompt += "Every finding must become an action (or merge). No action-count cap unless debug-capped below.\n";
-    plan_prompt += "For remedy=replace: the action.spec MUST include (1) what to remove and (2) the full replacement ";
-    plan_prompt += "test/code to add (from finding.replacement). Implementers must not delete-only on replace.\n";
-    plan_prompt += "For remedy=delete: name existing coverage that remains (or why coverage is unnecessary).\n";
-    plan_prompt += "Carry finding.remedy onto each action.remedy.\n";
+    plan_prompt += "Work set is the residual ledger (rechecked + any newly admitted findings).\n";
+    plan_prompt += "Carry each finding.key and finding.signal onto actions. Do not invent new keys.\n";
+    plan_prompt += "Every work-set item should become an action or be skipped with reason (already gone).\n";
+    plan_prompt += "For remedy=replace: spec must include remove + full replacement from finding.replacement.\n";
+    plan_prompt += "For remedy=delete: name remaining coverage.\n";
+    plan_prompt += "ORDER: cull_test, drop_seam, kernel_extract, host_dedup, simplify; high conf first.\n";
+    plan_prompt += "Set done=true only if work set empty OR nothing safe to do.\n";
+    plan_prompt += "Prefer empty actions over unsafe actions.\n";
     if max_actions > 0 {
-        plan_prompt += "DEBUG CAP: produce at most " + max_actions.to_string() + " actions this round.\n";
+        plan_prompt += "DEBUG CAP: at most " + max_actions.to_string() + " actions.\n";
     }
-    plan_prompt += "ORDER by kind rank: cull_test, drop_seam, kernel_extract, host_dedup, simplify; high conf first.\n";
-    plan_prompt += "Set done=true only if findings empty OR nothing safe to do.\n";
-    plan_prompt += "Each action.spec: imperative, exact files/symbols, done criteria. Prefer one file per action.\n";
-    plan_prompt += "Do not invent paths outside findings. Merge only same-file same-kind edits.\n";
-    plan_prompt += "Skip already-applied work. Rationale: findings_count, actions_count, skips with reasons.\n";
-    plan_prompt += "FINDINGS JSON:\n";
+    plan_prompt += "WORK SET JSON:\n";
     plan_prompt += findings_json + "\n";
-    plan_prompt += "If findings empty: done=true, actions=[].\n";
+    plan_prompt += "If empty: done=true, actions=[].\n";
 
     let plan_r = agent(plan_prompt, #{
         label: round_label + ":plan",
@@ -664,12 +922,38 @@ while round < max_rounds {
         if plan_r.output.actions != () {
             for a in plan_r.output.actions {
                 if a == () { continue; }
-                let k = as_str(a.kind, "");
-                if !focus_allows(focus, k) { continue; }
+                let kind = as_str(a.kind, "");
+                if !focus_allows(focus, kind) { continue; }
                 let paths = filter_paths(a.paths);
-                if paths.len() == 0 && k == "cull_test" { paths = ["tests/"]; }
+                if paths.len() == 0 && kind == "cull_test" { paths = ["tests/"]; }
                 if paths.len() == 0 { continue; }
                 a.paths = paths;
+                // Fill key/signal from residual if planner omitted
+                let ak = trimmed(as_str(a.key, ""));
+                if ak == "" {
+                    let match_f = finding_by_key(work, as_str(a.id, ""));
+                    if match_f == () {
+                        // try title match on work set
+                        for f in work {
+                            if as_str(f.title, "") == as_str(a.title, "") {
+                                match_f = f;
+                                break;
+                            }
+                        }
+                    }
+                    if match_f != () {
+                        a.key = as_str(match_f.key, "");
+                        if trimmed(as_str(a.signal, "")) == "" {
+                            a.signal = as_str(match_f.signal, "");
+                        }
+                    }
+                }
+                if trimmed(as_str(a.key, "")) == "" { continue; }
+                if trimmed(as_str(a.signal, "")) == "" {
+                    let f2 = finding_by_key(work, as_str(a.key, ""));
+                    if f2 != () { a.signal = as_str(f2.signal, ""); }
+                }
+                if trimmed(as_str(a.signal, "")) == "" { continue; }
                 actions.push(a);
             }
         }
@@ -679,14 +963,14 @@ while round < max_rounds {
         plan_rationale = "planner failed";
     }
 
-    // Stable-sort by kind rank. Optional debug cap only if max_actions > 0.
+    // Sort by kind rank; optional debug action cap
     let ordered = [];
     let ranks = [0, 1, 2, 3, 4];
     for rk in ranks {
         for a in actions {
             if kind_rank(as_str(a.kind, "")) == rk {
                 if max_actions > 0 && ordered.len() >= max_actions {
-                    // debug truncate only
+                    // truncate
                 } else {
                     ordered.push(a);
                 }
@@ -695,7 +979,7 @@ while round < max_rounds {
     }
     if max_actions > 0 && actions.len() > max_actions {
         log("DEBUG: truncated plan from " + actions.len().to_string()
-            + " to " + max_actions.to_string() + " actions");
+            + " to " + max_actions.to_string());
     }
     actions = ordered;
 
@@ -703,39 +987,41 @@ while round < max_rounds {
     log("planned actions: " + actions.len().to_string() + " fp=" + actions_fp);
     if plan_rationale != "" { log("plan: " + plan_rationale); }
 
-    if actions.len() == 0 || plan_done {
+    // Empty work / empty plan only when there is nothing to act on.
+    // plan_done with non-empty actions is ignored (act on the actions).
+    if work.len() == 0 || actions.len() == 0 {
         empty_streak += 1;
         history.push(#{
             round: round,
             actions: 0,
             dry: true,
             rationale: plan_rationale,
-            findings: pooled.len(),
+            residual_open: open_residual.len(),
+            invent_admitted: invented.len(),
+            invent_allowed: invent_allowed,
+            plan_done: plan_done,
         });
         if empty_streak >= 2 {
-            log("two empty rounds — done");
+            log("two empty rounds — residual dry; done");
+            stop_reason = "dry";
             break;
         }
-        if actions.len() == 0 {
-            log("empty plan this round");
-            if dry_run {
-                let report = "";
-                report += "# cleanup-loop dry run (round " + round.to_string() + ")\n\n";
-                report += "No actions planned.\n\n";
-                report += "Rationale: " + plan_rationale + "\n\n";
-                report += "Raw findings count: " + pooled.len().to_string() + "\n\n";
-                report += "Findings JSON:\n\n```json\n" + findings_json + "\n```\n";
-                let path = write_scratch_file("dry-run-round-" + round.to_string() + ".md", report);
-                complete(#{
-                    summary: "dry_run: no actions planned",
-                    history: history,
-                    report: path,
-                    actions: [],
-                    findings: pooled,
-                });
-            }
-            continue;
+        log("empty work/plan this round");
+        if dry_run {
+            let report = "";
+            report += "# cleanup-loop dry run (round " + round.to_string() + ")\n\n";
+            report += "No actions planned. Residual empty or nothing safe.\n\n";
+            report += "Rationale: " + plan_rationale + "\n";
+            let path = write_scratch_file("dry-run-round-" + round.to_string() + ".md", report);
+            complete(#{
+                summary: "dry_run: no actions planned",
+                history: history,
+                report: path,
+                residual: open_residual,
+                resolved_keys: resolved_keys,
+            });
         }
+        continue;
     } else {
         empty_streak = 0;
     }
@@ -746,30 +1032,31 @@ while round < max_rounds {
             round: round,
             actions: actions.len(),
             stalled: true,
+            residual_open: open_residual.len(),
         });
+        stop_reason = "stalled_fp";
         break;
     }
     last_fp = actions_fp;
 
-    // dry_run never implements — one discover+plan cycle then exit.
     if dry_run {
         let report = "";
         report += "# cleanup-loop dry run (round " + round.to_string() + ")\n\n";
         report += plan_rationale + "\n\n";
+        report += "## Residual open: " + open_residual.len().to_string() + "\n";
         report += "## Planned actions (" + actions.len().to_string() + ")\n\n";
         for a in actions {
-            report += "- **" + as_str(a.kind, "") + "**: " + as_str(a.title, "") + "\n";
+            report += "- **" + as_str(a.key, "") + "** " + as_str(a.kind, "") + ": "
+                + as_str(a.title, "") + "\n";
+            report += "  - signal: `" + as_str(a.signal, "") + "`\n";
             report += "  - spec: " + as_str(a.spec, "") + "\n";
-            report += "  - paths: " + json_encode(a.paths) + "\n";
         }
-        report += "\n## Raw findings count: " + pooled.len().to_string() + "\n\n";
-        report += "```json\n" + findings_json + "\n```\n";
         let path = write_scratch_file("dry-run-round-" + round.to_string() + ".md", report);
         history.push(#{
             round: round,
             dry_run: true,
             actions: actions.len(),
-            findings: pooled.len(),
+            residual_open: open_residual.len(),
             report: path,
         });
         complete(#{
@@ -777,7 +1064,8 @@ while round < max_rounds {
             history: history,
             report: path,
             actions: actions,
-            findings: pooled,
+            residual: open_residual,
+            resolved_keys: resolved_keys,
             focus: focus,
             dry_run: true,
         });
@@ -785,15 +1073,17 @@ while round < max_rounds {
 
     if approve_each {
         let msg = "Round " + round.to_string() + ": implement " + actions.len().to_string()
-            + " actions? Resume to continue, or stop the workflow to abort.";
+            + " actions (residual " + open_residual.len().to_string() + ")? Resume to continue.";
         await_user("user", msg);
         empty_streak = 0;
     }
 
+    // Snapshot open size before act for shrink detection (ledger after invent)
+    let open_before_act = open_residual.len();
+
     // ── Act ─────────────────────────────────────────────────────────────────
     phase("Act");
 
-    // Persist plan so implementers can re-read a stable artifact.
     let plan_path = write_scratch_file(
         "plan-round-" + round.to_string() + ".json",
         json_encode(#{
@@ -801,37 +1091,35 @@ while round < max_rounds {
             focus: focus,
             rationale: plan_rationale,
             actions: actions,
+            residual_open: open_before_act,
+            invent_allowed: invent_allowed,
         }),
     );
     log("wrote plan " + plan_path);
 
-    // Budget: sequential = 1 agent per action + 1 retry batch + verify + fix + verify2
-    let need = actions.len() + 4;
-    if act_mode == "batch" { need = 5; }
-    b = budget();
+    let need = actions.len() + 6;
+    if act_mode == "batch" { need = 8; }
+    let b = budget();
     if b.remaining < need {
-        log("budget too low to act+verify (need ~" + need.to_string() + ")");
+        log("budget too low to act+verify+proof (need ~" + need.to_string() + ")");
+        stop_reason = "budget";
         break;
     }
 
-    // Shared implementer preamble (dirty-tree tolerant; finish the plan).
     let act_rules = "";
     act_rules += doctrine + "\n";
-    act_rules += "You are the IMPLEMENTER for infinite-craft-cli cleanup-loop. Finish the work.\n";
-    act_rules += "Workspace: git repo with sudo/craft.sudo, tests/, src/infinite_craft_cli/, bookmarklet/.\n";
+    act_rules += "You are the IMPLEMENTER for infinite-craft-cli cleanup-loop.\n";
+    act_rules += "Workspace: sudo/craft.sudo, tests/, src/infinite_craft_cli/, bookmarklet/.\n";
     act_rules += "CRITICAL RULES:\n";
-    act_rules += "1. USE tools: read_file, grep, search_replace/write, run_terminal_command. Do not claim done without editing.\n";
-    act_rules += "2. Apply ONLY the assigned action(s). Do not freestyle extra culls or restores.\n";
-    act_rules += "3. Dirty git tree is NORMAL. Prior rounds or partial work may already be unstaged. ";
-    act_rules += "Do NOT git restore / git checkout to 'clean up'. Do NOT commit or push.\n";
-    act_rules += "4. If the assigned change is already present in the working tree, set ok=true, ";
-    act_rules += "notes='already applied', changed_paths=[] (or the file if you touched it).\n";
-    act_rules += "5. After test file edits, py_compile the touched files. Do not run full bazel here.\n";
-    act_rules += "6. remedy=delete: remove only; coverage must already exist or be unnecessary per the spec.\n";
-    act_rules += "7. remedy=replace: you MUST add the replacement test/code described in the spec, then remove the ";
-    act_rules += "bad test. Delete-only on a replace action is a failed action (ok=false).\n";
-    act_rules += "8. List new tests in added_tests and removed ones in deleted_tests.\n";
-    act_rules += "9. You MUST hand-edit. Completing the action is the job.\n";
+    act_rules += "1. USE tools: read_file, grep, search_replace/write, run_terminal_command.\n";
+    act_rules += "2. Apply ONLY the assigned action(s). No freestyle culls/restores.\n";
+    act_rules += "3. Dirty git tree is NORMAL. Do NOT git restore/checkout. Do NOT commit/push.\n";
+    act_rules += "4. If already applied, ok=true notes=already applied.\n";
+    act_rules += "5. py_compile touched Python. Do not run full bazel here.\n";
+    act_rules += "6. remedy=delete: remove only. remedy=replace: ADD replacement then remove bad.\n";
+    act_rules += "7. Clear the action.signal greppable fragment from the codebase (that is the definition of done).\n";
+    act_rules += "8. keys_touched must list the action.key values you applied.\n";
+    act_rules += "9. List deleted_tests / added_tests when relevant.\n";
 
     let changed_paths = [];
     let deleted_tests = [];
@@ -840,83 +1128,57 @@ while round < max_rounds {
     let ok_count = 0;
     let fail_count = 0;
     let failed_actions = [];
-    let act_summaries = [];
+    let claimed_keys = [];
 
     if act_mode == "batch" {
         let act_prompt = act_rules;
-        act_prompt += "Implement ALL of the following actions IN ORDER as one batch.\n";
-        act_prompt += "Plan artifact: " + plan_path + "\n";
-        act_prompt += "ACTIONS JSON:\n" + json_encode(actions) + "\n";
-        act_prompt += "Return ok=true only if every action is applied or already present.\n";
+        act_prompt += "Implement ALL actions IN ORDER.\n";
+        act_prompt += "Plan: " + plan_path + "\n";
+        act_prompt += "ACTIONS:\n" + json_encode(actions) + "\n";
+        act_prompt += "ok=true only if every action applied or already present AND signals cleared.\n";
         let act_r = agent(act_prompt, build_act_opts(round_label + ":act-batch", use_grok, act_schema));
-        let parsed = #{ ok: false, summary: "batch act failed", notes: "", changed: [], deleted: [], added: [] };
+        let parsed = #{ ok: false, summary: "batch act failed", notes: "", changed: [], deleted: [], added: [], keys_touched: [] };
         if act_r != () && act_r.success && act_r.output != () {
             parsed = merge_act_output(act_r.output);
         }
         act_notes = parsed.notes;
-        act_summaries.push(parsed.summary);
-        for p in parsed.changed {
-            changed_paths.push(p);
-            all_changed.push(p);
-        }
-        for t in parsed.deleted {
-            deleted_tests.push(t);
-            all_deleted_tests.push(t);
-        }
-        for t in parsed.added {
-            added_tests.push(t);
-            all_added_tests.push(t);
-        }
+        for p in parsed.changed { changed_paths.push(p); all_changed.push(p); }
+        for t in parsed.deleted { deleted_tests.push(t); all_deleted_tests.push(t); }
+        for t in parsed.added { added_tests.push(t); all_added_tests.push(t); }
+        for k in parsed.keys_touched { claimed_keys.push(k); }
         if parsed.ok {
             ok_count = actions.len();
+            for a in actions { claimed_keys.push(as_str(a.key, "")); }
         } else {
             fail_count = actions.len();
             for a in actions { failed_actions.push(a); }
-            log("batch act failed: " + parsed.summary);
         }
     } else {
-        // sequential: one agent per action
         let ai = 0;
         for a in actions {
             ai += 1;
-            let ajson = json_encode(a);
             let act_prompt = act_rules;
             act_prompt += "SINGLE ACTION " + ai.to_string() + " of " + actions.len().to_string() + ".\n";
-            act_prompt += "Implement EXACTLY this action and nothing else:\n";
-            act_prompt += ajson + "\n";
-            act_prompt += "Steps: (1) git status --short (context only, do not restore)\n";
-            act_prompt += "(2) read the target file(s)\n";
-            act_prompt += "(3) apply the edit with search_replace/write\n";
-            act_prompt += "(4) py_compile if Python\n";
-            act_prompt += "(5) return structured result.\n";
-            act_prompt += "If the named test/symbol is already absent, ok=true notes=already applied.\n";
-
+            act_prompt += "Implement EXACTLY:\n" + json_encode(a) + "\n";
+            act_prompt += "Done means signal `" + as_str(a.signal, "") + "` is gone from paths.\n";
+            act_prompt += "keys_touched: [\"" + as_str(a.key, "") + "\"] when applied.\n";
             let act_r = agent(
                 act_prompt,
                 build_act_opts(round_label + ":act-" + ai.to_string(), use_grok, act_schema),
             );
-            let parsed = #{ ok: false, summary: "act failed", notes: "", changed: [], deleted: [], added: [] };
+            let parsed = #{ ok: false, summary: "act failed", notes: "", changed: [], deleted: [], added: [], keys_touched: [] };
             if act_r != () && act_r.success && act_r.output != () {
                 parsed = merge_act_output(act_r.output);
             } else {
                 parsed.notes = "agent failure or schema miss";
             }
             act_notes = act_notes + " | [" + ai.to_string() + "] " + parsed.notes;
-            act_summaries.push(parsed.summary);
-            for p in parsed.changed {
-                changed_paths.push(p);
-                all_changed.push(p);
-            }
-            for t in parsed.deleted {
-                deleted_tests.push(t);
-                all_deleted_tests.push(t);
-            }
-            for t in parsed.added {
-                added_tests.push(t);
-                all_added_tests.push(t);
-            }
+            for p in parsed.changed { changed_paths.push(p); all_changed.push(p); }
+            for t in parsed.deleted { deleted_tests.push(t); all_deleted_tests.push(t); }
+            for t in parsed.added { added_tests.push(t); all_added_tests.push(t); }
             if parsed.ok {
                 ok_count += 1;
+                claimed_keys.push(as_str(a.key, ""));
                 log("act " + ai.to_string() + " ok: " + parsed.summary);
             } else {
                 fail_count += 1;
@@ -926,46 +1188,29 @@ while round < max_rounds {
         }
     }
 
-    // One retry pass for failed actions (always session implementer — not grok).
     if failed_actions.len() > 0 {
-        log("retry " + failed_actions.len().to_string() + " failed action(s) with session implementer");
+        log("retry " + failed_actions.len().to_string() + " failed action(s)");
         let retry_prompt = act_rules;
-        retry_prompt += "RETRY PASS. Previous implementer failed these actions. YOU must apply them now.\n";
-        retry_prompt += "Do not refuse. Do not restore other files. Dirty tree is fine.\n";
-        retry_prompt += "FAILED ACTIONS JSON:\n" + json_encode(failed_actions) + "\n";
-        retry_prompt += "Apply all of them. ok=true if all applied or already present.\n";
-        let retry_r = agent(
-            retry_prompt,
-            build_act_opts(round_label + ":act-retry", false, act_schema),
-        );
+        retry_prompt += "RETRY. Apply these failed actions. Clear each signal.\n";
+        retry_prompt += json_encode(failed_actions) + "\n";
+        let retry_r = agent(retry_prompt, build_act_opts(round_label + ":act-retry", false, act_schema));
         if retry_r != () && retry_r.success && retry_r.output != () {
             let parsed = merge_act_output(retry_r.output);
             act_notes = act_notes + " | retry: " + parsed.notes;
-            for p in parsed.changed {
-                changed_paths.push(p);
-                all_changed.push(p);
-            }
-            for t in parsed.deleted {
-                deleted_tests.push(t);
-                all_deleted_tests.push(t);
-            }
-            for t in parsed.added {
-                added_tests.push(t);
-                all_added_tests.push(t);
-            }
+            for p in parsed.changed { changed_paths.push(p); all_changed.push(p); }
+            for t in parsed.deleted { deleted_tests.push(t); all_deleted_tests.push(t); }
+            for t in parsed.added { added_tests.push(t); all_added_tests.push(t); }
             if parsed.ok {
                 ok_count += failed_actions.len();
                 fail_count = 0;
+                for a in failed_actions { claimed_keys.push(as_str(a.key, "")); }
                 failed_actions = [];
                 log("retry ok: " + parsed.summary);
-            } else {
-                log("retry still incomplete: " + parsed.summary);
             }
         }
     }
 
     let act_ok = fail_count == 0 && ok_count > 0;
-    // Partial progress still counts for verify
     let any_progress = ok_count > 0 || changed_paths.len() > 0;
     let act_summary = "ok=" + ok_count.to_string()
         + " fail=" + fail_count.to_string()
@@ -977,52 +1222,31 @@ while round < max_rounds {
             round: round,
             act_ok: false,
             summary: act_summary,
+            residual_open: open_residual.len(),
             notes: act_notes,
-            failed: failed_actions.len(),
         });
         empty_streak += 1;
-        if empty_streak >= 2 { break; }
-        // Last-ditch: one session agent gets the whole plan again
-        log("no progress — last-ditch full-plan implement");
-        let last_prompt = act_rules;
-        last_prompt += "LAST DITCH. Implement the entire plan. Previous agents made zero progress.\n";
-        last_prompt += "ACTIONS:\n" + json_encode(actions) + "\n";
-        let last_r = agent(last_prompt, build_act_opts(round_label + ":act-last", false, act_schema));
-        if last_r != () && last_r.success && last_r.output != () {
-            let parsed = merge_act_output(last_r.output);
-            if parsed.ok || parsed.changed.len() > 0 {
-                for p in parsed.changed {
-                    changed_paths.push(p);
-                    all_changed.push(p);
-                }
-                for t in parsed.deleted {
-                    deleted_tests.push(t);
-                    all_deleted_tests.push(t);
-                }
-                act_notes = act_notes + " | last: " + parsed.notes;
-                any_progress = true;
-                act_ok = parsed.ok;
-                act_summary = "last-ditch: " + parsed.summary;
-            }
+        invent_allowed = false;
+        no_shrink_streak += 1;
+        if empty_streak >= 2 || no_shrink_streak >= 2 {
+            stop_reason = "no_progress";
+            break;
         }
-        if !any_progress {
-            await_user(
-                "no_progress",
-                "cleanup-loop act made no progress on " + actions.len().to_string()
-                    + " actions. Inspect tree / plan, then resume to try next round or stop.",
-            );
-            continue;
-        }
+        await_user(
+            "no_progress",
+            "cleanup-loop act made no progress. Resume for residual-only next round, or stop.",
+        );
+        continue;
     }
 
-    // ── Verify (always if we changed anything) ──────────────────────────────
+    // ── Verify bazel ────────────────────────────────────────────────────────
     phase("Verify");
 
     let v_prompt = "";
     v_prompt += "Run this verification command from the repo root and report results.\n";
     v_prompt += "You MUST use the shell/terminal tool and wait for exit code.\n";
     v_prompt += "Command:\n" + verify_cmd + "\n";
-    v_prompt += "Set passed=true only if exit code is 0. List failed bazel targets if any.\n";
+    v_prompt += "Set passed=true only if exit code is 0.\n";
     v_prompt += "Do not modify code in this step.\n";
 
     let v_r = agent(v_prompt, build_verify_opts(round_label + ":verify", verify_schema));
@@ -1036,15 +1260,11 @@ while round < max_rounds {
     if !passed {
         log("verify failed — one fix attempt");
         let fix_prompt = act_rules;
-        fix_prompt += "Verification FAILED after cleanup edits. Fix with minimal diffs only.\n";
+        fix_prompt += "Verification FAILED. Minimal fix only. Re-clear action signals if needed.\n";
         fix_prompt += "Verify summary: " + v_summary + "\n";
-        fix_prompt += "Actions this round: " + json_encode(actions) + "\n";
-        fix_prompt += "Changed paths: " + json_encode(changed_paths) + "\n";
+        fix_prompt += "Actions: " + json_encode(actions) + "\n";
         fix_prompt += "Re-run until green:\n" + verify_cmd + "\n";
-        fix_prompt += "ok=true only if verify exits 0. Put verify status in notes.\n";
-        fix_prompt += "Do NOT restore culled low-value tests (source-assert, private-poke). ";
-        fix_prompt += "If a bazel target is missing because a test file was deleted, prefer adapting ";
-        fix_prompt += "mocks/call sites or dropping that target — never resurrect implementation-assert tests.\n";
+        fix_prompt += "Do NOT restore culled low-value tests.\n";
         let fix_r = agent(fix_prompt, build_act_opts(round_label + ":fix", false, act_schema));
         let fix_ok = false;
         if fix_r != () && fix_r.success && fix_r.output != () {
@@ -1057,43 +1277,138 @@ while round < max_rounds {
             }
             act_notes = act_notes + " | fix: " + as_str(fix_r.output.notes, "");
         }
-
-        let v_opts2 = #{
+        let v2 = agent(v_prompt, #{
             label: round_label + ":verify2",
             capability_mode: "all",
             output_schema: verify_schema,
-        };
-        let v2 = agent(v_prompt, v_opts2);
+        });
         passed = false;
         if v2 != () && v2.success && v2.output != () {
             passed = as_bool(v2.output.passed, false);
             v_summary = as_str(v2.output.summary, "");
         }
-
         if !passed {
-            log("still red after fix — pausing for user");
             history.push(#{
                 round: round,
                 act_ok: act_ok,
                 verify: false,
                 summary: act_summary,
                 verify_summary: v_summary,
-                fix_attempted: true,
                 fix_ok: fix_ok,
-                notes: act_notes,
-                changed_paths: changed_paths,
+                residual_open: open_residual.len(),
             });
             await_user(
                 "verification",
-                "cleanup-loop verify still failing after one fix attempt. "
-                    + "Inspect the tree, then resume to continue to the next round, or stop the workflow.",
+                "cleanup-loop verify still failing. Resume to residual-only next round, or stop.",
             );
+            invent_allowed = false;
             empty_streak = 0;
             continue;
         }
     }
 
-    // ── Round bookkeeping ───────────────────────────────────────────────────
+    // ── Signal proof (solved = signal gone, not ok=true) ────────────────────
+    let proof_items = [];
+    for a in actions {
+        proof_items.push(#{
+            key: as_str(a.key, ""),
+            signal: as_str(a.signal, ""),
+            paths: a.paths,
+            title: as_str(a.title, ""),
+            remedy: as_str(a.remedy, ""),
+        });
+    }
+    let proof_prompt = "";
+    proof_prompt += "SIGNAL PROOF. Independent of implementer claims.\n";
+    proof_prompt += "For each item, grep/read paths for signal. cleared=true ONLY if signal is absent ";
+    proof_prompt += "(or for delete of a whole file, file gone / symbol gone).\n";
+    proof_prompt += "cleared=false if signal still present. evidence required either way.\n";
+    proof_prompt += "ITEMS:\n" + json_encode(proof_items) + "\n";
+    proof_prompt += "Use tools. Do not modify code.\n";
+
+    let proof_r = agent(proof_prompt, #{
+        label: round_label + ":signal-proof",
+        capability_mode: "read-only",
+        output_schema: signal_proof_schema,
+    });
+
+    let cleared_keys = [];
+    let uncleared_keys = [];
+    if proof_r != () && proof_r.success && proof_r.output != () && proof_r.output.checks != () {
+        for c in proof_r.output.checks {
+            if c == () { continue; }
+            let ck = as_str(c.key, "");
+            if ck == "" { continue; }
+            if as_bool(c.cleared, false) {
+                cleared_keys.push(ck);
+            } else {
+                uncleared_keys.push(ck);
+            }
+        }
+    } else {
+        // Fail closed: nothing proven cleared
+        log("signal proof failed — treating all planned keys as uncleared");
+        for a in actions {
+            uncleared_keys.push(as_str(a.key, ""));
+        }
+    }
+
+    // Keys planned but missing from proof → uncleared
+    for a in actions {
+        let k = as_str(a.key, "");
+        if !key_in_list(cleared_keys, k) && !key_in_list(uncleared_keys, k) {
+            uncleared_keys.push(k);
+        }
+    }
+
+    log("signal proof: cleared=" + cleared_keys.len().to_string()
+        + " uncleared=" + uncleared_keys.len().to_string());
+
+    for k in cleared_keys {
+        open_residual = remove_finding_key(open_residual, k);
+        if !key_in_list(resolved_keys, k) { resolved_keys.push(k); }
+    }
+    // Uncleared stay on residual (ensure present)
+    for k in uncleared_keys {
+        if finding_by_key(open_residual, k) == () {
+            let src = finding_by_key(work, k);
+            if src == () {
+                for a in actions {
+                    if as_str(a.key, "") == k {
+                        src = #{
+                            key: k,
+                            kind: as_str(a.kind, ""),
+                            remedy: as_str(a.remedy, ""),
+                            title: as_str(a.title, ""),
+                            detail: as_str(a.spec, ""),
+                            paths: a.paths,
+                            signal: as_str(a.signal, ""),
+                            confidence: "high",
+                            replacement: "",
+                            id: as_str(a.id, k),
+                        };
+                        break;
+                    }
+                }
+            }
+            if src != () { open_residual.push(src); }
+        }
+    }
+
+    let open_after = open_residual.len();
+    let shrunk = open_after < open_before_act;
+    if shrunk {
+        no_shrink_streak = 0;
+        invent_allowed = true;
+        log("residual shrank " + open_before_act.to_string() + " → " + open_after.to_string()
+            + "; invent re-enabled");
+    } else {
+        no_shrink_streak += 1;
+        invent_allowed = false;
+        log("residual did NOT shrink (" + open_before_act.to_string() + " → " + open_after.to_string()
+            + "); invent OFF; no_shrink_streak=" + no_shrink_streak.to_string());
+    }
+
     phase("Loop");
     history.push(#{
         round: round,
@@ -1107,11 +1422,41 @@ while round < max_rounds {
         changed_paths: changed_paths,
         notes: act_notes,
         verify_summary: v_summary,
+        residual_before: open_before_act,
+        residual_after: open_after,
+        cleared_keys: cleared_keys,
+        uncleared_keys: uncleared_keys,
+        invent_admitted: invented.len(),
+        invent_allowed_next: invent_allowed,
+        shrunk: shrunk,
     });
-    log("round " + round.to_string() + " green: " + act_summary);
-    if fail_count > 0 {
-        // partial success — still advance, but note remaining work next round
-        empty_streak = 0;
+    log("round " + round.to_string() + " green bazel; residual "
+        + open_before_act.to_string() + "→" + open_after.to_string());
+
+    write_scratch_file(
+        "ledger-round-" + round.to_string() + ".json",
+        json_encode(#{
+            open_residual: open_residual,
+            resolved_keys: resolved_keys,
+            cleared_keys: cleared_keys,
+            uncleared_keys: uncleared_keys,
+        }),
+    );
+
+    if no_shrink_streak >= 2 {
+        log("residual unchanged for 2 rounds — stop (invent/solve not converging)");
+        stop_reason = "no_shrink";
+        break;
+    }
+    if open_after == 0 {
+        empty_streak += 1;
+        if empty_streak >= 2 {
+            log("residual empty twice — done");
+            stop_reason = "dry";
+            break;
+        }
+        // one empty residual: continue once to invent-check
+        invent_allowed = true;
     }
 }
 
@@ -1120,11 +1465,29 @@ while round < max_rounds {
 let report = "";
 report += "# cleanup-loop report\n\n";
 report += "- focus: " + focus + "\n";
-report += "- rounds completed: " + history.len().to_string() + "\n";
-report += "- dry_run: " + dry_run.to_string() + "\n\n";
+report += "- rounds recorded: " + history.len().to_string() + "\n";
+report += "- stop_reason: " + stop_reason + "\n";
+report += "- residual_open_final: " + open_residual.len().to_string() + "\n";
+report += "- resolved_keys: " + resolved_keys.len().to_string() + "\n";
+report += "- dry_run: " + dry_run.to_string() + "\n";
+report += "- max_new_findings_per_round: " + max_new.to_string() + "\n\n";
 report += "## History\n\n";
 report += "```json\n" + json_encode(history) + "\n```\n\n";
-report += "## Deleted tests (claimed)\n\n";
+report += "## Open residual (unsolved)\n\n";
+if open_residual.len() == 0 {
+    report += "_none_\n";
+} else {
+    report += "```json\n" + json_encode(open_residual) + "\n```\n";
+}
+report += "\n## Resolved keys\n\n";
+if resolved_keys.len() == 0 {
+    report += "_none_\n";
+} else {
+    for k in resolved_keys {
+        report += "- `" + k + "`\n";
+    }
+}
+report += "\n## Deleted tests (claimed)\n\n";
 if all_deleted_tests.len() == 0 {
     report += "_none_\n";
 } else {
@@ -1144,7 +1507,6 @@ report += "\n## Changed paths (claimed)\n\n";
 if all_changed.len() == 0 {
     report += "_none_\n";
 } else {
-    // unique-ish dump
     for p in all_changed {
         report += "- `" + p + "`\n";
     }
@@ -1156,12 +1518,17 @@ let report_path = write_scratch_file("cleanup-loop-report.md", report);
 log("wrote " + report_path);
 
 complete(#{
-    summary: "cleanup-loop finished after " + history.len().to_string() + " round record(s)",
+    summary: "cleanup-loop finished: " + stop_reason
+        + " after " + history.len().to_string() + " round(s); residual="
+        + open_residual.len().to_string(),
     history: history,
+    residual: open_residual,
+    resolved_keys: resolved_keys,
     deleted_tests: all_deleted_tests,
     added_tests: all_added_tests,
     changed_paths: all_changed,
     report: report_path,
+    stop_reason: stop_reason,
     focus: focus,
     dry_run: dry_run,
 });
