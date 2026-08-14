@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.9.1] - 2026-08-14
+
+### Changed
+- **Docs for 1.9.0 surfaces.** README covers `/target`, dual pair/IB queues,
+  sticky rate + confirm chrome (`confirm [y/n]>` only), and the version
+  banner. The GitHub Pages command list includes `/target`.
+
 ## [1.9.0] - 2026-08-14
 
 ### Added

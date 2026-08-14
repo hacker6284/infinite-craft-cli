@@ -37,14 +37,21 @@ infinite-craft
 This opens a REPL where you can combine elements, search discoveries, and more:
 
 ```
+=== Infinite Craft CLI ===  v1.9.0
+
 craft> Water + Fire
   💨 Water + 🔥 Fire = 💨 Steam
 
 craft> /search steam
   💨 Steam
 
+craft> /target Steam
+  Target set: Steam — you'll be asked whether to continue the batch when this is crafted.
+
 craft> /help
 ```
+
+Sticky chrome under the log always shows the pair-API **rate** bar (next-slot wait + remaining budget). While a job runs it also shows **running** command + progress, or **◆ confirm** with the reason (pair count, target hit). `y` / `n` is only on `confirm [y/n]>`.
 
 ### Non-interactive mode
 
@@ -114,20 +121,25 @@ Used by `/search`, `/with`, `/permute`, `/permutate`, `/cross`, `/exhaust`, and 
 | `/prune` | Remove orphan elements Infinibrowser can't fill |
 | `/export [path]` | Export discoveries as `.ic` save file |
 | `/history` | Show combinations tried this session |
-| `/queue` | Show running and pending commands (status also appears above `craft>`) |
+| `/target <element>` | Watch for a result; ask y/n to continue the batch on hit |
+| `/target` | Show current target |
+| `/target clear` | Clear target |
+| `/queue` | Show running and pending commands (status also appears in chrome) |
 | `/help` | Show help |
 | `/quit` | Exit |
 
-### Background queue (Python REPL)
+### Queues and confirm (Python REPL + trainer)
 
-Long-running API commands queue FIFO. Local commands (`/help`, `/search`, `/list`, `/recipe`, `/history`, `/clear`, `/unfilled`, `/queue`) run immediately — output from a local command may interleave with a running queued command (e.g. `/search` during `/crawl`).
+Pair-API work (combine, crawl, permute, exhaust, …) and Infinibrowser work (`/fill`, `/prune`, `/import`) use **independent queues** so one lane can run while the other is busy. Local commands (`/help`, `/search`, `/list`, `/recipe`, `/history`, `/clear`, `/unfilled`, `/queue`, `/target`) run immediately — their output may interleave with a running job.
+
+Large batches and `/target` hits pause on `confirm [y/n]>`: **y** continues, **n** / Esc / Stop cancels remaining work. The job row states the reason (`331 pairs`, `target hit`); keybindings are not repeated in the log.
 
 | Key | Action |
 |-----|--------|
-| Esc | Skip current command, continue to next in queue (TTY only) |
-| Ctrl+C | While running: stop and discard remaining queue; at bulk confirm `[y/N]`: decline only |
+| Esc | Skip current command, continue to next in that lane (TTY / Stop in the trainer) |
+| Ctrl+C | While running: stop and discard remaining queue; at confirm: decline only |
 
-Deferred commands print `Queued:` when another command is already running.
+Deferred commands print `Queued:` when that lane is already running.
 
 ## Data storage
 
@@ -139,7 +151,7 @@ Discoveries and recipes are stored in `~/.infinite-craft-cli/`:
 
 ## Browser extension / bookmarklet
 
-The [browser trainers](https://hacker6284.github.io/infinite-craft-cli/) share the same command syntax and query matching as the Python CLI (wildcards, `/regex/`, `!` exclude, `^` first discoveries, `/combine`, `/with`, `/cross`, and operator shorthands `+`, `++`, `+|`, `*`). Browser-only additions: `/clear` to clear the output panel, and IndexedDB storage instead of `~/.infinite-craft-cli/`. Queue status is shown in the panel above the input (visual-only; no `/queue` command). Local commands such as `/search` may interleave output with a running queued command.
+The [browser trainers](https://hacker6284.github.io/infinite-craft-cli/) share the same command syntax and query matching as the Python CLI (wildcards, `/regex/`, `!` exclude, `^` first discoveries, `/combine`, `/with`, `/cross`, `/target`, and operator shorthands `+`, `++`, `+|`, `*`). Browser-only additions: `/clear` to clear the output panel, and IndexedDB storage instead of `~/.infinite-craft-cli/`. Rate, job, and queue status live in the sticky panel above the input (visual-only; no `/queue` command). Local commands such as `/search` may interleave output with a running queued command.
 
 ## Development
 
