@@ -40,14 +40,12 @@ register_toolchains("@rust_toolchains//:all")
 # Consumed from a matched-pair release (design §8 Phase 5 Task 8), which
 # publishes BOTH the ruleset tarball AND the matched binary SET (sudoc +
 # lockstep_diff + capture_run + emit_unpack). Each binary's per-platform sha256 is
-# pinned in the tarball's versions.bzl, so sudo.toolchain(version = "v0.5.0")
+# pinned in the tarball's versions.bzl, so sudo.toolchain(version = "v0.7.3")
 # resolves the whole set with no local sha overrides.
 #
-# The ruleset has not moved since v0.3.0: diffing the v0.4.0 and v0.5.0
-# tarballs, versions.bzl is the ONLY file that differs (defs.bzl,
-# extensions.bzl and private/*.bzl are byte-identical), so the module stays at
-# 1.0.0 / compatibility_level 2 and no rule attributes moved. These are
-# compiler releases -- what changes is the pinned `sudoc` binary:
+# The module stays at 1.0.0 / compatibility_level 2 and defs.bzl (the public
+# rule surface) is byte-identical across every bump so far -- no rule
+# attributes have moved. What changes is the pinned `sudoc` binary:
 #
 #   v0.4.0  breaking: `record`/`enum` names may no longer contain `_`.
 #           No effect here -- Element, RecipeStep and RecipeResult are
@@ -55,16 +53,39 @@ register_toolchains("@rust_toolchains//:all")
 #   v0.5.0  no language change. Haskell `List<T>` moved to Data.Sequence
 #           (this project builds py/js only) and `sudoc check` now reports
 #           every signature-pass error instead of just the first.
+#   v0.6.0  std.sorting.sort_by became a stable O(n log n) merge sort. NOT
+#           adoptable on its own: it regressed passing a comparator over a
+#           caller-declared record into an imported generic, which is exactly
+#           what `sorting.sort_by(pool, element_name_less)` does -- craft.sudo
+#           failed `sudoc check` outright. Skipped; never pinned here.
+#   v0.7.0  fixes that (a caller-declared record/enum is now a legal type
+#           argument to an imported generic), which is what let the kernel's
+#           hand-rolled heapsort go. Also: `regex` gained a 100k-NFA-state
+#           compile budget in v0.6.0, which is what finally makes DIVERGENCES
+#           ruling 7's "hosts may drop their own complexity gates" true
+#           rather than merely asserted.
+#   v0.7.1  std.sorting.sort_by finally beat the kernel's hand-rolled heapsort
+#           (swap-as-rebinding + copy-on-write lists), so the heapsort is gone.
+#   v0.7.3  copy-on-write made uniform across every composite, and read-only
+#           tuple destructures no longer copy their source. prioritize_pairs
+#           at 97,020 pairs: 26.1s -> 6.6s, same output ordering.
+#
+# The protocol bumps (2 -> 3 in v0.6.0, 3 -> 4 in v0.7.0) bind `sudoc` to its
+# matched emitter; the matched-pair release ships both and we register no
+# sudo_external_backend, so they do not reach this project. v0.7.0 does add a
+# generated `sudo_types.*` file whenever a nominal type crosses a module
+# boundary -- rules_sudo declares it as an output, so it flows into the wheel
+# and the bookmarklet bundle without a BUILD change.
 bazel_dep(name = "rules_sudo", version = "1.0.0")
 archive_override(
     module_name = "rules_sudo",
-    urls = ["https://github.com/hacker6284/sudocode/releases/download/v0.5.0/rules_sudo-v0.5.0.tar.gz"],
+    urls = ["https://github.com/hacker6284/sudocode/releases/download/v0.7.3/rules_sudo-v0.7.3.tar.gz"],
     strip_prefix = "rules_sudo",
-    sha256 = "f04cf6c023fdac54ebe3ac1a39b75564a70d8092d975c907df9a2de6b9558ad9",
+    sha256 = "25391a009113e9e7df693688476b1ec6c51fb58af0fbced9e8802b13b973acf4",
 )
 
 sudo = use_extension("@rules_sudo//:extensions.bzl", "sudo")
-sudo.toolchain(version = "v0.5.0")
+sudo.toolchain(version = "v0.7.3")
 use_repo(sudo, "sudo_toolchain")
 
 # Hermetic esbuild (bundles the bookmarklet; replaces npx esbuild/terser).
