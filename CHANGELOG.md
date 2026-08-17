@@ -1,5 +1,26 @@
 # Changelog
 
+## [1.9.2] - 2026-08-18
+
+### Changed
+- **Bulk commands sort their work queue ~6x faster.** Every bulk command
+  (`/permute`, `/cross`, `/with`, `/exhaust`, and each crawl generation, in
+  both the CLI and the browser trainer) orders its pairs by ingredient-usage
+  score before running them. On a full inventory that is ~97,000 pairs, and
+  the ordering step dominated the wait before the first API call went out.
+  It now takes about 6.6s where it took about 40s. The resulting order is
+  byte-identical — this is purely how fast the queue is built.
+
+  The kernel had carried a hand-rolled heapsort since 1.8.4 because the sudo
+  standard library's `sort_by` was an insertion sort that froze the trainer at
+  that scale. sudocode v0.7.1 and v0.7.3 made the standard sort faster than
+  the hand-rolled one, so the bespoke sort is gone and the kernel now
+  hand-rolls no sort of any kind.
+
+- **sudocode toolchain pinned to v0.7.3** (from v0.5.0). No generated-code
+  behaviour change beyond the above; `defs.bzl` is byte-identical, so no
+  build rules moved.
+
 ## [1.9.1] - 2026-08-14
 
 ### Changed
