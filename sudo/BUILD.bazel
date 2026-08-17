@@ -17,7 +17,14 @@ sudo_lockstep_test(
         "py",
         "js",
     ],
-    # 18 tests x 2 backends runs ~3.5min locally and ~2x that on CI —
-    # the default moderate (300s) timeout is exactly the wrong size.
-    timeout = "long",
+    # Was "long" when 18 tests x 2 backends took ~3.5min locally (~2x on CI),
+    # back when std.sorting.sort_by was quadratic. It is now 31 tests x 2
+    # backends in ~2.3s, so Bazel flags "long" as oversized and it is.
+    #
+    # "short" (60s) is also the failure signal for the
+    # "prioritize_pairs order contract at scale" test: that case sorts 19,900
+    # pairs, which is sub-second at O(n log n) and hundreds of millions of
+    # comparisons if anything reintroduces a quadratic sort. A regression
+    # blows this timeout rather than quietly taking 15 minutes.
+    timeout = "short",
 )

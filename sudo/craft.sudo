@@ -2834,6 +2834,75 @@ test "compute_layers readiness and ordering invariants"
         case Unreachable(n)
             assert n.length < 0
 
+// Scale guard for prioritize_pairs. Asserts ONLY the documented ordering
+// contract — never which algorithm produces it, and no timing — at a size
+// where a quadratic implementation cannot finish inside the test timeout.
+// 200 elements choose-2 = 19,900 pairs, the shape of /permute on a real
+// inventory. n log n is well under a second; n squared is ~400M comparisons
+// and blows the timeout, which is the failure signal.
+//
+// This exists because the kernel shipped a hand-rolled heapsort from v1.8.4
+// to v1.9.2 purely because the stdlib sort was quadratic, and nothing in the
+// suite would have caught either the original problem or a reintroduction:
+// the next largest ordering test uses three recipes.
+test "prioritize_pairs order contract at scale"
+    els: List<Element> = []
+    for i = 0 to 199
+        els.append(Element(name = "E" + int_to_text(i), emoji = "", first = false))
+    recipes: Map<text, List<(text, text)>> = Map()
+    for i = 0 to 199
+        if i mod 3 == 0
+            recipes["R" + int_to_text(i)] = [(els[i].name, els[(i + 7) mod 200].name)]
+    pairs: List<(Element, Element)> = []
+    for i = 0 to els.length - 1
+        for j = i + 1 to els.length - 1
+            pairs.append((els[i], els[j]))
+    assert pairs.length == 19900
+
+    out = prioritize_pairs(pairs, recipes)
+
+    // 1. It is a permutation of the input: nothing dropped, duplicated or
+    //    invented. Every input pair is distinct, so key counts settle it.
+    //    ("|" is an unambiguous joiner here: every name is E<digits>.)
+    assert out.length == pairs.length
+    in_keys: Set<text> = Set()
+    for p in pairs
+        pa, pb = p
+        ka, kb = pair_key(pa.name, pb.name)
+        in_keys.add(ka + "|" + kb)
+    out_keys: Set<text> = Set()
+    for p in out
+        pa, pb = p
+        ka, kb = pair_key(pa.name, pb.name)
+        key = ka + "|" + kb
+        assert in_keys.has(key)
+        out_keys.add(key)
+    assert out_keys.items().length == in_keys.items().length
+
+    // 2. Adjacent outputs respect the documented order: higher score first,
+    //    ties by ascending canonical pair key.
+    counts = ingredient_usage_counts(recipes)
+    seen_any = false
+    prev_score = 0
+    prev_k1: text = ""
+    prev_k2: text = ""
+    for p in out
+        pa, pb = p
+        score = counts.get(pa.name).get_or(0) + counts.get(pb.name).get_or(0)
+        k1, k2 = pair_key(pa.name, pb.name)
+        if seen_any
+            assert prev_score >= score
+            if prev_score == score
+                c = strings.lex_compare(prev_k1, k1)
+                assert c <= 0
+                if c == 0
+                    assert strings.lex_compare(prev_k2, k2) <= 0
+        prev_score = score
+        prev_k1 = k1
+        prev_k2 = k2
+        seen_any = true
+    assert seen_any
+
 test "boundary adapters smoke"
     // match_elements_boundary
     els: List<(text, text, bool)> = []
