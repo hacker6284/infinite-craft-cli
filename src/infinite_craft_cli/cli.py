@@ -2486,60 +2486,60 @@ def do_export(storage, path: str = EXPORT_PATH) -> str:
 
 def do_help() -> str:
     return """  Combine:
-    <element> + <element>       Combine two elements
+    <element> + <element>         Combine two elements
     /combine <element> <element>  Combine two elements
 
   Crawl:
-    <element> ++ <element>      Combine & crawl until no new discoveries
-    /crawl <element> <element>  Combine & crawl until no new discoveries
+    <element> ++ <element>        Combine & crawl until no new discoveries
+    /crawl <element> <element>    Combine & crawl until no new discoveries
 
   Bulk combine (query syntax below):
-    <element> +| <query>        Combine element with all matching discoveries
-    /with <element> <query>     Combine element with all matching discoveries
-    <query> * <query>           Cross-combine matches from both queries
-    /cross <query> <query>    Cross-combine matches from both queries
-    /permute <query>            Combine all matching elements with each other
-    /permutate <query>          Permute repeatedly until no new discoveries
-    /exhaust <query>            Each match combined with all discoveries
+    <element> +| <query>          Combine element with all matching discoveries
+    /with <element> <query>       Combine element with all matching discoveries
+    <query> * <query>             Cross-combine matches from both queries
+    /cross <query> <query>        Cross-combine matches from both queries
+    /permute <query>              Combine all matching elements with each other
+    /permutate <query>            Permute repeatedly until no new discoveries
+    /exhaust <query>              Each match combined with all discoveries
 
   Target:
-    /target <element>           Ask y/n to continue the batch when this is crafted
-    /target                     Show current target
-    /target clear               Clear target
+    /target <element>             Ask y/n to continue the batch when this is crafted
+    /target                       Show current target
+    /target clear                 Clear target
 
   Query syntax (/search, /with, /permute, /permutate, /cross, /exhaust, shorthands):
-    substring                   Default: case-insensitive substring
-    * ? []                      fnmatch wildcards (e.g. fire*, mu?)
-    /pattern/                   Regex, case-insensitive (| alternation, \\d escapes)
-    !<query>                    Exclude matches (e.g. !fire* = everything except fire*)
-    !                           All elements (exclude nothing)
-    ^<query>                    First discoveries only (e.g. ^fire* = new fire* matches)
-    ^                           All first discoveries
+    substring                     Default: case-insensitive substring
+    * ? []                        fnmatch wildcards (e.g. fire*, mu?)
+    /pattern/                     Regex, case-insensitive (| alternation, \\d escapes)
+    !<query>                      Exclude matches (e.g. !fire* = everything except fire*)
+    !                             All elements (exclude nothing)
+    ^<query>                      First discoveries only (e.g. ^fire* = new fire* matches)
+    ^                             All first discoveries
 
   Discoveries & recipes:
-    /search <query>             Search discoveries
-    /recipe <element>           Show shortest recipe from base elements
-    /list                       List all discovered elements
-    /import <element|file.ic>   Import from Infinibrowser or .ic save file
-    /fill                       Fetch missing recipes from Infinibrowser
-    /unfilled                   List elements without recipes
-    /prune                      Remove orphan elements Infinibrowser can't fill
-    /export [path]              Export discoveries as .ic save file
-    /history                    Show combinations tried this session
-    /target [element|clear]     Watch for a result; ask y/n to continue on hit
-    /clear                      Clear output (browser only)
-    /queue                      Show running and pending commands (status also appears above the prompt)
-    /help                       Show this help
-    /quit                       Exit
+    /search <query>               Search discoveries
+    /recipe <element>             Show shortest recipe from base elements
+    /list                         List all discovered elements
+    /import <element|file.ic>     Import from Infinibrowser or .ic save file
+    /fill                         Fetch missing recipes from Infinibrowser
+    /unfilled                     List elements without recipes
+    /prune                        Remove orphan elements Infinibrowser can't fill
+    /export [path]                Export discoveries as .ic save file
+    /history                      Show combinations tried this session
+    /clear                        Clear output (browser only)
+    /queue                        Show running and pending commands
+                                  (also shown above the prompt)
+    /help                         Show this help
+    /quit                         Exit
 
   Background queue (long API commands):
-    Esc                         Skip current command, continue to next in queue
-                                (TTY only; skips during rate-limit/backoff waits
-                                (⏳ rate limit shows in queue panel),
-                                not during an active network request; bulk
-                                commands may finish in-flight pairs first)
-    Ctrl+C                      While running: stop and discard remaining queue
-                                At bulk confirm [y/N]: decline only (queue kept)"""
+    Esc                           Skip current command, continue to next in queue
+                                  (TTY only; skips during rate-limit/backoff waits
+                                  (⏳ rate limit shows in queue panel),
+                                  not during an active network request; bulk
+                                  commands may finish in-flight pairs first)
+    Ctrl+C                        While running: stop and discard remaining queue
+                                  At bulk confirm [y/n]: decline only (queue kept)"""
 
 
 # ---------------------------------------------------------------------------

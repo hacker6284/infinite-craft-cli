@@ -37,7 +37,7 @@ infinite-craft
 This opens a REPL where you can combine elements, search discoveries, and more:
 
 ```
-=== Infinite Craft CLI ===  v1.9.0
+=== Infinite Craft CLI ===
 
 craft> Water + Fire
   💨 Water + 🔥 Fire = 💨 Steam
@@ -167,10 +167,14 @@ Build the Python wheel:
 bazel build //release:wheel.dist
 ```
 
-Run unit tests:
+Run all tests:
 ```bash
-bazel test //tests/...
+bazel test //...
 ```
+
+This includes `//sudo:craft_lockstep_test`, which runs the kernel's own test
+suite against both the generated Python and JavaScript and diffs the two.
+`//tests/...` alone skips it.
 
 Run integration tests (hits the real API):
 ```bash
