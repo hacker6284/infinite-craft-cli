@@ -296,8 +296,8 @@ func add_elements_batch(elements: inout List<Element>, items: List<(text, text, 
     return added
 
 // ---------------------------------------------------------------------------
-// Deterministic sorts — std.sorting.sort_by (stable insertion sort) with
-// top-level comparators; sudo has no closures, so anything a comparison
+// Deterministic sorts — std.sorting.sort_by (stable merge sort, O(n log n)
+// since sudoc v0.6.0) with top-level comparators; sudo has no closures, so anything a comparison
 // needs must live in the sorted items themselves.
 // NOTE: sorting.sort_by historically hit a Rust-backend cross-module
 // `inout` codegen bug (see DIVERGENCES.md, "sudo language friction");
@@ -408,8 +408,8 @@ export func ingredient_usage_counts(recipes: Map<text, List<(text, text)>>) -> M
     // +1 per ingredient slot per recorded recipe: a self-pair [X, X]
     // counts X twice; results do not count, only ingredient slots.
     // Iteration order does not affect the counts map — do not sort keys
-    // (sorted_text_list is O(n²) insertion sort and made prioritize_pairs
-    // lag on large recipe indexes for every bulk command).
+    // (sorting the keys is pure overhead on every bulk command; it was
+    // outright quadratic back when sort_by was insertion sort).
     counts: Map<text, int> = Map()
     for name in recipes.keys()
         for pair in recipes[name]
@@ -435,86 +435,6 @@ func priority_row_less(a: (int, text, text, int), b: (int, text, text, int)) -> 
         return c2 < 0
     return a_idx < b_idx
 
-// Heapsort under priority_row_less (ascending). std.sorting.sort_by is
-// insertion sort — O(n²) — and freezes the trainer on /permute|/permutate
-// with ~10^5 pairs (441 choose-2 ≈ 97k). Heapsort is O(n log n), not stable,
-// but priority_row_less includes input index so the order is still total and
-// deterministic. Candidate for upstreaming into std.sorting as an alternative
-// to insertion sort for large n.
-//
-// Critical: do NOT call helpers that take the row list or the row tuples as
-// parameters from inside the sift loop. sudoc deep-copies every List/tuple
-// arg on entry — a less(a, b) or before_at(items, i, j) helper would re-dup
-// the whole 10^5-row list (or both rows) on every comparison and hang again.
-// The comparison body is therefore fully inlined in the sift.
-func priority_heap_sift_down(items: inout List<(int, text, text, int)>, start: int, end: int)
-    root = start
-    while true
-        child = 2 * root + 1
-        if child > end
-            break
-        // Prefer the child that should sort later (not before sibling).
-        if child + 1 <= end
-            // items[child] before items[child+1]? then take child+1 as larger.
-            c_score, c_k1, c_k2, c_idx = items[child]
-            d_score, d_k1, d_k2, d_idx = items[child + 1]
-            take_right = false
-            if c_score != d_score
-                take_right = c_score > d_score
-            else
-                cc = strings.lex_compare(c_k1, d_k1)
-                if cc != 0
-                    take_right = cc < 0
-                else
-                    cc2 = strings.lex_compare(c_k2, d_k2)
-                    if cc2 != 0
-                        take_right = cc2 < 0
-                    else
-                        take_right = c_idx < d_idx
-            if take_right
-                child = child + 1
-        // items[root] before items[child]? then swap down.
-        r_score, r_k1, r_k2, r_idx = items[root]
-        k_score, k_k1, k_k2, k_idx = items[child]
-        root_before = false
-        if r_score != k_score
-            root_before = r_score > k_score
-        else
-            rc = strings.lex_compare(r_k1, k_k1)
-            if rc != 0
-                root_before = rc < 0
-            else
-                rc2 = strings.lex_compare(r_k2, k_k2)
-                if rc2 != 0
-                    root_before = rc2 < 0
-                else
-                    root_before = r_idx < k_idx
-        if root_before
-            items.swap(root, child)
-            root = child
-        else
-            break
-
-func sort_priority_rows(items: inout List<(int, text, text, int)>)
-    n = items.length
-    if n < 2
-        return
-    // Build max-heap (parent not before children under priority order).
-    // Sift is a separate function taking inout List — that is one ownership
-    // transfer per sift call (not a deep copy of the list contents into a
-    // fresh structure when the backend implements inout by reference). Do not
-    // factor the comparison into yet another list-taking helper.
-    start = (n - 2) / 2
-    while start >= 0
-        priority_heap_sift_down(items, start, n - 1)
-        start = start - 1
-    end = n - 1
-    while end > 0
-        items.swap(0, end)
-        end = end - 1
-        if end > 0
-            priority_heap_sift_down(items, 0, end)
-
 func prioritize_pairs(pairs: List<(Element, Element)>, recipes: Map<text, List<(text, text)>>) -> List<(Element, Element)>
     counts = ingredient_usage_counts(recipes)
     rows: List<(int, text, text, int)> = []
@@ -525,7 +445,15 @@ func prioritize_pairs(pairs: List<(Element, Element)>, recipes: Map<text, List<(
         ka, kb = pair_key(a.name, b.name)
         rows.append((score, ka, kb, idx))
         idx = idx + 1
-    sort_priority_rows(rows)
+    // One stdlib call. This was a hand-inlined heapsort until sudoc v0.7.1.
+    // sort_by was insertion sort (O(n²)) through v0.5.0; v0.6.0 made it a
+    // merge sort but the generated code still deep-copied the whole list four
+    // times per merge pass, so the builtin lost to the heapsort. v0.7.1 fixed
+    // the swap and added copy-on-write lists; v0.7.3 made that COW uniform and
+    // stopped read-only destructures copying. Measured on 441 choose-2 =
+    // 97,020 pairs, py backend, byte-identical output ordering throughout:
+    // heapsort 40.2s, this 6.6s.
+    sorting.sort_by(rows, priority_row_less)
     out: List<(Element, Element)> = []
     for row in rows
         r_score, r_k1, r_k2, r_idx = row
@@ -656,8 +584,9 @@ func trace_recipe(elements: List<Element>, recipes: Map<text, List<(text, text)>
 func included_element_names(recipes: Map<text, List<(text, text)>>) -> Set<text>
     // Transitive closure of recipe ingredients. The final Set is independent
     // of scan order, so we never sort keys/items here — sorted_text_list is
-    // O(n²) and re-sorting on every closure iteration made export/prune lag
-    // on large saves. The public boundary still returns a sorted name list.
+    // re-sorting on every closure iteration made export/prune lag on large
+    // saves, and is wasted work at any complexity. The public boundary still
+    // returns a sorted name list.
     included: Set<text> = Set()
     included.add("Water")
     included.add("Fire")
@@ -2479,7 +2408,8 @@ test "ingredient_usage_counts and prioritize_pairs"
     assert t2a.name == "C"
     // reversed-order pair (b, a) sorts by its CANONICAL key (A, B) but is
     // not reordered internally — (a,b) and (b,a) tie exactly, so their
-    // input order is preserved by the stable insertion sort
+    // priority_row_less falls through to its input-index tiebreak, so input
+    // order is preserved without relying on the sort being stable
     // boundary adapter round-trip
     bpairs: List<(text, text, bool, text, text, bool)> = []
     bpairs.append(("Zzz", "", false, "Earth", "", false))

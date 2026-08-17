@@ -71,7 +71,8 @@ returns:
    is exactly equivalent: `not has_pairs.has(n)` covers both "absent from
    `recipes`" and "present with an empty pair list".
 2. **Keys are never sorted.** `sorted_text_list` runs the stdlib
-   `sorting.sort_by`, an insertion sort — O(n²) per layer. Sorting cannot
+   `sorting.sort_by`, which was an insertion sort — O(n²) per layer — when
+   this was written. Sorting cannot
    affect the result: a layer's membership is computed against the *previous*
    layer's `visited`, which is not mutated mid-layer, so the committed set is
    independent of scan order, and pair choice is per-result list order.
@@ -104,10 +105,16 @@ with a mid-layer stop still yielding the correct ancestor chain.
   parameter re-deep-copy it on every call — `resolve_element` therefore
   inlines membership scans (not `get_by_name` ×4), and `add_elements_batch`
   inlines insert-or-ignore (not `find_index_by_name` / `add_element` per item).
-- **`prioritize_pairs` uses heapsort** (`sort_priority_rows`), not
-  `std.sorting.sort_by` (insertion sort). ~10⁵ pairs from a large
-  `/permutate` made insertion sort hang the browser; heapsort is O(n log n).
-  Candidate to upstream into `std.sorting` as a large-n alternative.
+- **`prioritize_pairs` used a hand-inlined heapsort** (`sort_priority_rows`)
+  because `std.sorting.sort_by` was insertion sort and ~10⁵ pairs from a large
+  `/permutate` hung the browser. **Retired at sudoc v0.7.1.** v0.6.0 made
+  `sort_by` a merge sort but its generated code still deep-copied the whole
+  list four times per merge pass, so the builtin still lost; v0.7.1 fixed the
+  swap and added copy-on-write lists, and v0.7.3 made COW uniform across every
+  composite and stopped read-only destructures copying their source. Measured
+  on 441 choose-2 = 97,020 pairs, py backend, byte-identical output ordering at
+  every step: heapsort 40.2s, `sorting.sort_by` 70.1s on v0.7.0, 26.1s on
+  v0.7.1, **6.6s on v0.7.3**. The kernel now hand-rolls no sort of any kind.
 
 ### 2. No discovered-flag promotion on re-add
 
@@ -358,8 +365,8 @@ that remain true of the v2 kernel, then findings new to this extraction.
   Multi-field values read more than once are more ergonomic as `record`s.
 
 - **`List<T>.sort()` only for `int` / `float`.** Sorting anything else goes
-  through `std.sorting.sort_by` (a stable insertion sort) with a top-level
-  comparator. **Updated v1.8.0:** `craft.sudo` now does exactly that for all
+  through `std.sorting.sort_by` (a stable merge sort since sudoc v0.6.0) with
+  a top-level comparator. **Updated v1.8.0:** `craft.sudo` now does exactly that for all
   three of its sorts (`sorted_text_list`, the crawl pool's name order, and
   the prioritizer's decorated rows) — the hand-rolled same-module insertion
   sorts are gone. This is viable because this repo builds only the py/js
