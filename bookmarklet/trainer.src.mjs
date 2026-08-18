@@ -51,6 +51,7 @@ import {
   parse_with_args as parseWithArgs,
   parse_cross_queries as parseCrossQueries,
 } from "./_sudo/craft.mjs";
+import { TRAINER_VERSION } from "./version.mjs";
 
 // ── Constants ────────────────────────────────────────────────────────
 const RATE_LIMIT = 60;
@@ -1809,7 +1810,7 @@ function initBrowserUI() {
     rebuildIndexes();
     rebuildRecipeIndex();
     output.innerHTML = "";
-    print(bold(cyan("=== Infinite Craft Trainer ===")) + dim("  (local build)"));
+    print(bold(cyan("=== Infinite Craft Trainer ===")) + dim(`  v${TRAINER_VERSION}`));
     print(`  Active save: ${bold(esc(saveName))} (id=${_saveId})`);
     print(`  ${green(String(_items.length))} elements loaded.`);
     const withRecipes = _items.filter(i => i.recipes && i.recipes.length).length;

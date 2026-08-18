@@ -2,6 +2,16 @@
 
 ## [1.9.2] - 2026-08-18
 
+### Fixed
+- **The browser trainer's banner announced every release as `(local build)`.**
+  The version banner added in 1.9.0 only ever landed on the CLI side; the
+  trainer half shipped a hardcoded string, so the bundle served from GitHub
+  Pages — the one live extensions and userscripts fetch — always claimed to be
+  a local build. It now prints the same stamped version the wheel is named
+  with, and the Pages deploy refuses to publish a bundle whose version is not
+  the tag being released, matching the gate `publish.yml` already applies to
+  the wheel.
+
 ### Changed
 - **Bulk commands sort their work queue ~6x faster.** Every bulk command
   (`/permute`, `/cross`, `/with`, `/exhaust`, and each crawl generation, in

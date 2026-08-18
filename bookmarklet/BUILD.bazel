@@ -1,5 +1,6 @@
 load("@aspect_rules_esbuild//esbuild:defs.bzl", "esbuild")
 load("@bazel_lib//lib:copy_to_directory.bzl", "copy_to_directory")
+load("@bazel_lib//lib:expand_template.bzl", "expand_template")
 load("@rules_sudo//:defs.bzl", "sudo_js_library")
 
 # Kernel adapters for craft.sudo (JS target), compiled by rules_sudo's
@@ -13,11 +14,26 @@ sudo_js_library(
     entry = "craft.sudo",
 )
 
+# The trainer's version, stamped from the same STABLE_VERSION that names the
+# wheel. stamp = 1 (not the default -1) makes this independent of whether
+# --stamp was passed: every build resolves a real value, so there is no
+# unstamped path that could quietly ship a placeholder. The banner previously
+# printed a hardcoded "(local build)", which was a lie in every released
+# bundle served from GitHub Pages.
+expand_template(
+    name = "version_mjs",
+    out = "version.mjs",
+    template = "version.mjs.tpl",
+    stamp = 1,
+    stamp_substitutions = {"STAMP_STABLE_VERSION": "{{STABLE_VERSION}}"},
+)
+
 filegroup(
     name = "trainer_srcs",
     srcs = [
         "trainer.src.mjs",
         ":_sudo",
+        ":version_mjs",
     ],
     visibility = ["//visibility:public"],
 )
@@ -46,7 +62,7 @@ filegroup(
 esbuild(
     name = "trainer_js",
     entry_point = "trainer.src.mjs",
-    srcs = ["trainer.src.mjs", ":_sudo"],
+    srcs = ["trainer.src.mjs", ":_sudo", ":version_mjs"],
     config = "esbuild.config.mjs",
     format = "iife",
     sourcemap = "",
@@ -59,7 +75,7 @@ esbuild(
 esbuild(
     name = "trainer_min_js",
     entry_point = "trainer.src.mjs",
-    srcs = ["trainer.src.mjs", ":_sudo"],
+    srcs = ["trainer.src.mjs", ":_sudo", ":version_mjs"],
     config = "esbuild.config.mjs",
     format = "iife",
     minify = True,

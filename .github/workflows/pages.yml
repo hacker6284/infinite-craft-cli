@@ -36,7 +36,40 @@ jobs:
       # is transpiled and the trainer re-bundled by Bazel, so Pages can never
       # serve an artifact that drifted from sudo/craft.sudo.
       - name: Build site
-        run: bazel build //bookmarklet:site
+        run: bazel build //bookmarklet:site //bookmarklet:version_mjs
+
+      # The trainer banner prints the stamped version. Refuse to deploy a
+      # bundle whose version is not the tag being released, or that never had
+      # the stamp baked in — the same refuse-don't-fallback gate publish.yml
+      # applies to the wheel. Before this existed the banner said
+      # "(local build)" in every deployed bundle.
+      - name: Verify the bundle carries this release's version
+        run: |
+          STAMPED="$(sed -n 's/.*TRAINER_VERSION = "\(.*\)".*/\1/p' \
+            bazel-bin/bookmarklet/version.mjs)"
+          if [ -z "$STAMPED" ]; then
+            echo "::error::could not read TRAINER_VERSION from the generated version.mjs"
+            exit 1
+          fi
+          echo "stamped version: ${STAMPED}"
+          # The deployed bundle must actually contain it, not just the
+          # generated module that fed the build.
+          if ! grep -qF "\"${STAMPED}\"" bazel-bin/bookmarklet/site/trainer.min.js; then
+            echo "::error::trainer.min.js does not embed '${STAMPED}' — the stamp did not reach the bundle"
+            exit 1
+          fi
+          # Tag pushes are the release path and must match exactly. Manual
+          # dispatch has no tag to compare against, so it only gets the
+          # stamp-reached-the-bundle check above.
+          case "${GITHUB_REF}" in
+            refs/tags/v*)
+              EXPECTED="${GITHUB_REF_NAME#v}"
+              if [ "$STAMPED" != "$EXPECTED" ]; then
+                echo "::error::bundle version '${STAMPED}' does not match tag '${EXPECTED}' — refusing to deploy"
+                exit 1
+              fi
+              ;;
+          esac
 
       - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0
       - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
