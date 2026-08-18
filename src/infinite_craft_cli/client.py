@@ -1,8 +1,11 @@
 """HTTP clients for Infinite Craft and Infinibrowser APIs."""
 
+import time
+
 from infinite_craft_cli.element import Element
 from typing import Callable
 
+from infinite_craft_cli._sudo import craft
 from infinite_craft_cli.ratelimit import RateLimiter, RateLimitCancelled, RateLimitToken
 
 _BASE_URL = "https://neal.fun"
@@ -49,21 +52,52 @@ def _get_sync_session():
     return _sync_session
 
 
+def ib_get(url: str, params: dict | None = None, timeout: float | None = None):
+    """Sync GET with the kernel's shared Infinibrowser retry policy.
+
+    Retries rate limiting (429) and transport failures with the kernel's
+    backoff schedule — the same policy the browser trainer applies — and
+    returns any other response as-is for the caller to interpret. Returns
+    None once transport-failure retries are exhausted.
+    """
+    if timeout is None:
+        timeout = craft.fetch_timeout_ms() / 1000.0
+    attempt = 0
+    while True:
+        resp = None
+        status = 0  # kernel convention: 0 = transport failure
+        try:
+            resp = _get_sync_session().get(url, params=params, timeout=timeout)
+            status = resp.status_code
+        except Exception:
+            pass
+        if resp is not None and status != 429:
+            return resp
+        if not craft.ib_should_retry(status, attempt):
+            return resp  # final 429 response, or None on transport failure
+        time.sleep(craft.ib_retry_backoff_ms(attempt) / 1000.0)
+        attempt += 1
+
+
 def fetch_json(
-    url: str, params: dict | None = None, timeout: int = 15, use_cache: bool = True
+    url: str, params: dict | None = None, timeout: float | None = None, use_cache: bool = True
 ) -> dict | None:
     """Sync GET returning parsed JSON, with caching. Returns None on error.
 
-    Uses curl_cffi with Chrome impersonation for Cloudflare bypass.
+    Error bodies are still parsed and returned (Infinibrowser reports
+    misses as JSON with a "code" key); None means transport or parse
+    failure. Uses curl_cffi with Chrome impersonation for Cloudflare bypass.
     """
     cache_key = f"{url}?{params}" if params else url
     if use_cache and cache_key in _sync_cache:
         return _sync_cache[cache_key]
+    resp = ib_get(url, params=params, timeout=timeout)
+    if resp is None:
+        return None  # don't cache errors
     try:
-        resp = _get_sync_session().get(url, params=params, timeout=timeout)
         result = resp.json()
     except Exception:
-        return None  # don't cache errors
+        return None
     _sync_cache[cache_key] = result
     return result
 
@@ -126,6 +160,8 @@ class InfiniteCraftClient:
             allow_redirects=True,
             verify=True,
             impersonate=_IMPERSONATE,
+            # Explicit: this matched curl_cffi's library default only by luck.
+            timeout=craft.fetch_timeout_ms() / 1000.0,
         )
         resp.raise_for_status()
         data = resp.json()

@@ -902,6 +902,53 @@ export func confirm_input_route(answer: text, waiting: bool, bulk_pending: bool)
     return "ignore"
 
 // ---------------------------------------------------------------------------
+// HTTP retry policy (pure). Hosts own sockets, timers, and abort plumbing;
+// the kernel owns how many attempts, which failures retry, and the backoff
+// schedule, so the CLI and trainer cannot drift apart (they had: the trainer
+// retried Infinibrowser 429s, the CLI gave up on first error).
+// Attempts are 0-based; backoff(attempt) is the wait after that attempt fails.
+// Status 0 means a transport-level failure (network error / timeout).
+// ---------------------------------------------------------------------------
+
+export func fetch_timeout_ms() -> int
+    return 30000
+
+export func pair_retry_max_attempts() -> int
+    return 3
+
+// 1s, 2s, 4s, ... doubling from 1000ms.
+export func pair_retry_backoff_ms(attempt: int) -> int
+    ms = 1000
+    i = 0
+    while i < attempt
+        ms = ms * 2
+        i = i + 1
+    return ms
+
+export func pair_should_retry(attempt: int) -> bool
+    // The pair API retries any failure: transport, bad status, bad body.
+    return attempt + 1 < pair_retry_max_attempts()
+
+export func ib_retry_max_attempts() -> int
+    return 4
+
+// 2s, 4s, 8s, ... doubling from 2000ms.
+export func ib_retry_backoff_ms(attempt: int) -> int
+    ms = 2000
+    i = 0
+    while i < attempt
+        ms = ms * 2
+        i = i + 1
+    return ms
+
+export func ib_should_retry(status: int, attempt: int) -> bool
+    // Infinibrowser retries only rate limiting and transport failures; any
+    // other status (404, 5xx) is a real answer the caller interprets.
+    if status != 429 and status != 0
+        return false
+    return attempt + 1 < ib_retry_max_attempts()
+
+// ---------------------------------------------------------------------------
 // Rate-window chrome math (pure). Hosts own clocks, deques, HTTP, paint.
 // Times are integer milliseconds (or any consistent unit).
 // ---------------------------------------------------------------------------
@@ -1634,6 +1681,28 @@ func match_names(els: List<Element>, query: text) -> (Set<text>, Option<text>)
     for e in matches
         names.add(e.name)
     return (names, err)
+
+test "retry policy parity"
+    assert fetch_timeout_ms() == 30000
+    assert pair_retry_max_attempts() == 3
+    assert pair_retry_backoff_ms(0) == 1000
+    assert pair_retry_backoff_ms(1) == 2000
+    assert pair_retry_backoff_ms(2) == 4000
+    assert pair_should_retry(0)
+    assert pair_should_retry(1)
+    assert not pair_should_retry(2)
+    assert ib_retry_max_attempts() == 4
+    assert ib_retry_backoff_ms(0) == 2000
+    assert ib_retry_backoff_ms(1) == 4000
+    assert ib_retry_backoff_ms(2) == 8000
+    assert ib_should_retry(429, 0)
+    assert ib_should_retry(0, 0)
+    assert ib_should_retry(429, 2)
+    assert not ib_should_retry(429, 3)
+    assert not ib_should_retry(0, 3)
+    assert not ib_should_retry(404, 0)
+    assert not ib_should_retry(500, 0)
+    assert not ib_should_retry(200, 0)
 
 test "is_local_command parity"
     assert is_local_command("/help")

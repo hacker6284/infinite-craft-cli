@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.10.2] - 2026-08-18
+
+### Changed
+- **HTTP retry and timeout policy moved into the shared kernel.** How many
+  attempts, which failures retry, the backoff schedule, and the 30s fetch
+  timeout are now kernel decisions (`pair_should_retry`, `ib_should_retry`,
+  and friends in `craft.sudo`), consumed by both the CLI and the browser
+  trainer — they had been duplicated constants that already drifted once.
+  Hosts keep the actual sockets, timers, and abort plumbing.
+
+### Fixed
+- **The CLI now retries Infinibrowser rate limits and network failures.**
+  The trainer retried 429s with backoff; the CLI gave up on the first
+  error, so `/fill` and `/prune` silently failed elements the trainer
+  would have recovered. Both hosts now apply the same kernel policy
+  (4 attempts, 2s/4s/8s backoff; 404s and 5xx are still returned as real
+  answers). The CLI's Infinibrowser timeout goes 15s → 30s to match, and
+  the pair API timeout is now explicit instead of inheriting the HTTP
+  library's default.
+
 ## [1.10.1] - 2026-08-18
 
 ### Fixed

@@ -35,7 +35,7 @@ from infinite_craft_cli.element import Element
 from infinite_craft_cli.client import (
     InfiniteCraftClient,
     fetch_json,
-    _get_sync_session,
+    ib_get,
 )
 from infinite_craft_cli.ratelimit import RateLimitCancelled
 from infinite_craft_cli.storage import DiscoveryStorage
@@ -364,7 +364,7 @@ async def _cached_pair(client, storage, a, b):
     key = craft.pair_key(a.name, b.name)
     if key in _pair_cache:
         return _pair_cache[key]
-    for attempt in range(3):
+    for attempt in range(craft.pair_retry_max_attempts()):
         _raise_if_cancelled()
         try:
             result = await client.pair(a.name, b.name)
@@ -372,9 +372,9 @@ async def _cached_pair(client, storage, a, b):
         except RateLimitCancelled:
             raise CommandCancelled() from None
         except Exception:
-            if attempt == 2:
+            if not craft.pair_should_retry(attempt):
                 raise
-            if await _sleep_cancellable_async(2**attempt):
+            if await _sleep_cancellable_async(craft.pair_retry_backoff_ms(attempt) / 1000.0):
                 raise CommandCancelled()
     _pair_cache[key] = result
     if result.name is not None:
@@ -2366,9 +2366,9 @@ def _ib_can_fill(name: str) -> bool | None:
     Returns True if fillable, False if Infinibrowser has no recipe, None on API error.
     """
     try:
-        item_resp = _get_sync_session().get(
-            f"{_IB_BASE}/item", params={"id": name}, timeout=15
-        )
+        item_resp = ib_get(f"{_IB_BASE}/item", params={"id": name})
+        if item_resp is None:
+            return None
         if item_resp.status_code == 404:
             return False
         if not item_resp.ok:
@@ -2377,9 +2377,9 @@ def _ib_can_fill(name: str) -> bool | None:
         if "code" in item_data:
             return False
 
-        recipe_resp = _get_sync_session().get(
-            f"{_IB_BASE}/recipe", params={"id": name}, timeout=15
-        )
+        recipe_resp = ib_get(f"{_IB_BASE}/recipe", params={"id": name})
+        if recipe_resp is None:
+            return None
         if recipe_resp.status_code == 404:
             return False
         if not recipe_resp.ok:

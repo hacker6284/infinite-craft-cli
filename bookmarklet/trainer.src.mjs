@@ -38,6 +38,11 @@ import {
   is_confirm_answer as isConfirmAnswer,
   confirm_answer_key as confirmAnswerKey,
   should_bulk_warn as shouldBulkWarn,
+  fetch_timeout_ms as fetchTimeoutMs,
+  pair_should_retry as pairShouldRetry,
+  pair_retry_backoff_ms as pairRetryBackoffMs,
+  ib_should_retry as ibShouldRetry,
+  ib_retry_backoff_ms as ibRetryBackoffMs,
   rate_slots_left as rateSlotsLeft,
   rate_next_slot_frac_milli as rateNextSlotFracMilli,
   rate_bar_fills as rateBarFills,
@@ -592,7 +597,7 @@ function acquireRate() {
 // Per-attempt abort: user Stop (activeAbort) or timeout, whichever fires
 // first. Without a timeout one stalled request (sleep/wake, network change,
 // proxy) hangs a bulk run forever with the job chrome frozen mid-count.
-const FETCH_TIMEOUT_MS = 30000;
+const FETCH_TIMEOUT_MS = fetchTimeoutMs();
 function attemptSignal(timeoutMs) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeoutMs);
@@ -625,7 +630,7 @@ async function apiPair(firstName, secondName) {
   const url = `/api/infinite-craft/pair?first=${encodeURIComponent(firstName)}&second=${encodeURIComponent(secondName)}`;
   let resp;
   let json = null;
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; ; attempt++) {
     if (cancelled) throw new Error("Cancelled");
     const guard = attemptSignal(FETCH_TIMEOUT_MS);
     try {
@@ -635,7 +640,8 @@ async function apiPair(firstName, secondName) {
     } catch (e) { /* retry */ } finally {
       guard.done();
     }
-    if (attempt < 2) await sleepCancellable(1000 * Math.pow(2, attempt));
+    if (!pairShouldRetry(attempt)) break;
+    await sleepCancellable(pairRetryBackoffMs(attempt));
   }
   if (cancelled) throw new Error("Cancelled");
   if (json == null) throw new Error("API request failed");
@@ -1182,30 +1188,30 @@ async function doCombineWithQuery(name, query) {
 }
 
 // Fetch with retry + backoff for 429s
-async function fetchRetry(url, maxRetries = 3) {
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+async function fetchRetry(url) {
+  // Attempt count, retryable statuses, and backoff all come from the kernel
+  // (shared with the CLI). Status 0 = transport failure.
+  for (let attempt = 0; ; attempt++) {
     if (cancelled) throw new Error("Cancelled");
     const guard = attemptSignal(FETCH_TIMEOUT_MS);
-    let resp;
+    let resp = null;
+    let err = null;
     try {
       resp = await fetch(url, { signal: guard.signal });
     } catch (e) {
       // User Stop propagates; a timeout/network failure retries with backoff.
       if (cancelled || (activeAbort && activeAbort.signal.aborted)) throw e;
-      if (attempt < maxRetries) {
-        await sleepCancellable(Math.pow(2, attempt + 1) * 1000);
-        continue;
-      }
-      throw e;
+      err = e;
     } finally {
       guard.done();
     }
-    if (resp.ok) return resp;
-    if (resp.status === 429 && attempt < maxRetries) {
-      await sleepCancellable(Math.pow(2, attempt + 1) * 1000);
-      continue;
+    if (resp && resp.status !== 429) return resp;
+    const status = resp ? resp.status : 0;
+    if (!ibShouldRetry(status, attempt)) {
+      if (resp) return resp;
+      throw err;
     }
-    return resp;
+    await sleepCancellable(ibRetryBackoffMs(attempt));
   }
 }
 
