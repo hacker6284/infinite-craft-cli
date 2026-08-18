@@ -494,19 +494,42 @@ if (typeof window === "undefined") {
 
 // ── Rate limiter ─────────────────────────────────────────────────────
 const timestamps = [];
+// Waits are one timer against a deadline, not a chain of 50ms polls: hidden
+// tabs throttle timer chains ≥5 deep to one fire per minute (Chrome
+// intensive throttling), which turned a single 60s rate-limit wait — 1200
+// chunks — into a ~20-hour stall for anyone running bulk work in a
+// background tab. Cancellation rejects the sleepers directly instead of
+// relying on the next poll tick.
+const activeSleepers = new Set();
 function sleepCancellable(ms) {
   return new Promise((resolve, reject) => {
-    const step = 50;
-    let elapsed = 0;
-    function tick() {
-      if (cancelled) { reject(new Error("Cancelled")); return; }
-      if (elapsed >= ms) { resolve(); return; }
-      const chunk = Math.min(step, ms - elapsed);
-      elapsed += chunk;
-      setTimeout(tick, chunk);
+    if (cancelled) { reject(new Error("Cancelled")); return; }
+    const deadline = Date.now() + ms;
+    const sleeper = { timer: 0, cancel: null };
+    function settleReject() {
+      clearTimeout(sleeper.timer);
+      activeSleepers.delete(sleeper);
+      reject(new Error("Cancelled"));
     }
-    tick();
+    function fire() {
+      if (cancelled) { settleReject(); return; }
+      const left = deadline - Date.now();
+      if (left <= 0) {
+        activeSleepers.delete(sleeper);
+        resolve();
+        return;
+      }
+      sleeper.timer = setTimeout(fire, left);
+    }
+    sleeper.cancel = settleReject;
+    activeSleepers.add(sleeper);
+    sleeper.timer = setTimeout(fire, ms);
   });
+}
+
+/** Reject every in-flight cancellable sleep; call after setting `cancelled`. */
+function cancelSleepers() {
+  for (const s of [...activeSleepers]) s.cancel();
 }
 
 // Time of last slot free (window expiry). Left half resets here and fills
@@ -566,6 +589,28 @@ function acquireRate() {
 }
 
 // ── API client ───────────────────────────────────────────────────────
+// Per-attempt abort: user Stop (activeAbort) or timeout, whichever fires
+// first. Without a timeout one stalled request (sleep/wake, network change,
+// proxy) hangs a bulk run forever with the job chrome frozen mid-count.
+const FETCH_TIMEOUT_MS = 30000;
+function attemptSignal(timeoutMs) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), timeoutMs);
+  const outer = activeAbort ? activeAbort.signal : null;
+  const onAbort = () => ctl.abort();
+  if (outer) {
+    if (outer.aborted) ctl.abort();
+    else outer.addEventListener("abort", onAbort, { once: true });
+  }
+  return {
+    signal: ctl.signal,
+    done() {
+      clearTimeout(timer);
+      if (outer) outer.removeEventListener("abort", onAbort);
+    },
+  };
+}
+
 function pairKey(a, b) {
   const [ka, kb] = pairKeyKernel(a, b);
   return ka + "\0" + kb;
@@ -579,17 +624,21 @@ async function apiPair(firstName, secondName) {
   if (cancelled) throw new Error("Cancelled");
   const url = `/api/infinite-craft/pair?first=${encodeURIComponent(firstName)}&second=${encodeURIComponent(secondName)}`;
   let resp;
+  let json = null;
   for (let attempt = 0; attempt < 3; attempt++) {
     if (cancelled) throw new Error("Cancelled");
+    const guard = attemptSignal(FETCH_TIMEOUT_MS);
     try {
-      resp = await fetch(url, { signal: activeAbort ? activeAbort.signal : undefined });
-      if (resp.ok) break;
-    } catch (e) { /* retry */ }
+      resp = await fetch(url, { signal: guard.signal });
+      // Body read shares the attempt guard so a stalled body times out too.
+      if (resp.ok) { json = await resp.json(); break; }
+    } catch (e) { /* retry */ } finally {
+      guard.done();
+    }
     if (attempt < 2) await sleepCancellable(1000 * Math.pow(2, attempt));
   }
   if (cancelled) throw new Error("Cancelled");
-  if (!resp || !resp.ok) throw new Error("API request failed");
-  const json = await resp.json();
+  if (json == null) throw new Error("API request failed");
   let result = null;
   if (json.result && json.result !== "Nothing") {
     result = { text: json.result, emoji: json.emoji || "", discovered: !!json.isNew };
@@ -699,6 +748,7 @@ async function acknowledgeTargetHit(aName, bName, resultName) {
       { reason: "target hit" },
     ))) {
       cancelled = true;
+      cancelSleepers();
       print("  " + yellow("Stopped after target hit."));
       return true;
     }
@@ -828,7 +878,9 @@ function waitForConfirmKey() {
   // fall through to the main keydown handler.
   return new Promise((resolve) => {
     waitingForConfirm = true;
-    confirmResolve = resolve;
+    // finish, not resolve: external settlers (Stop) must run cleanup() too,
+    // or the capture keydown handler leaks and eats the next y/n/Esc press.
+    confirmResolve = finish;
     if (promptEl) promptEl.textContent = "confirm [y/n]>";
     if (input) {
       input.value = "";
@@ -1133,11 +1185,24 @@ async function doCombineWithQuery(name, query) {
 async function fetchRetry(url, maxRetries = 3) {
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     if (cancelled) throw new Error("Cancelled");
-    const resp = await fetch(url, { signal: activeAbort ? activeAbort.signal : undefined });
+    const guard = attemptSignal(FETCH_TIMEOUT_MS);
+    let resp;
+    try {
+      resp = await fetch(url, { signal: guard.signal });
+    } catch (e) {
+      // User Stop propagates; a timeout/network failure retries with backoff.
+      if (cancelled || (activeAbort && activeAbort.signal.aborted)) throw e;
+      if (attempt < maxRetries) {
+        await sleepCancellable(Math.pow(2, attempt + 1) * 1000);
+        continue;
+      }
+      throw e;
+    } finally {
+      guard.done();
+    }
     if (resp.ok) return resp;
     if (resp.status === 429 && attempt < maxRetries) {
-      const wait = Math.pow(2, attempt + 1) * 1000;
-      await sleepCancellable(wait);
+      await sleepCancellable(Math.pow(2, attempt + 1) * 1000);
       continue;
     }
     return resp;
@@ -1162,6 +1227,9 @@ function pickFile(accept) {
     input.type = "file";
     if (accept) input.accept = accept;
     input.onchange = () => resolve(input.files[0] || null);
+    // Dismissing the dialog must settle too, or the ib lane worker waits on
+    // this promise forever and every later ib command queues behind it.
+    input.oncancel = () => resolve(null);
     input.click();
   });
 }
@@ -1846,6 +1914,7 @@ function initBrowserUI() {
   });
   stopBtn.addEventListener("click", () => {
     cancelled = true;
+    cancelSleepers();
     if (activeAbort) activeAbort.abort();
     if (waitingForConfirm && confirmResolve) {
       waitingForConfirm = false;

@@ -1,5 +1,37 @@
 # Changelog
 
+## [1.10.1] - 2026-08-18
+
+### Fixed
+- **Bulk runs no longer stall for hours in background tabs.** The rate
+  limiter sliced every wait into 50ms timer chunks, so one 60-second
+  rate-limit wait was a ~1,200-deep `setTimeout` chain. Chrome throttles
+  timer chains five or more deep in hidden tabs to one fire per minute,
+  which turned that single wait into a ~20-hour stall — an overnight
+  `/exhaust` or `/crawl` in a backgrounded tab simply froze until the tab
+  was foregrounded. Waits are now one timer against a deadline, staying
+  under the chain-depth threshold, and pressing Stop rejects in-flight
+  waits immediately instead of waiting for the next poll tick.
+
+- **A stalled network request no longer hangs a bulk run forever.** API and
+  Infinibrowser fetches had no timeout — only the Stop button's abort
+  signal — so one request that never completed (laptop sleep/wake, network
+  change) froze the run at `n/N` indefinitely. Every attempt now times out
+  after 30s and retries with the existing backoff; response-body reads are
+  covered by the same guard. Infinibrowser fetches also retry on network
+  errors instead of failing the whole element.
+
+- **Dismissing the `/import` file dialog no longer wedges the IB lane.**
+  The file-pick promise only settled when a file was chosen; cancelling the
+  dialog left the lane worker awaiting it forever, and every later
+  `/import`, `/fill`, or `/prune` queued behind it permanently — Stop
+  couldn't recover it. Dialog dismissal now settles the promise.
+
+- **Stop during a confirm prompt no longer eats the next keystroke.**
+  Stop resolved the confirm without running its cleanup, leaking the
+  capture keydown handler, which swallowed the next y/n/Esc pressed into
+  an empty input.
+
 ## [1.10.0] - 2026-08-18
 
 ### Added
