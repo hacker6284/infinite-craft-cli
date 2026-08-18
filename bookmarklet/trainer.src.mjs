@@ -252,6 +252,114 @@ function resolveElement(name) {
   return { text, emoji, discovered };
 }
 
+// ── Live page sync ───────────────────────────────────────────────────
+// The game's addAPI hook exposes window.IC; IC.getItems() returns the
+// reactive Vue array behind the sidebar, so pushing/splicing there updates
+// the open page without a refresh. The page does NOT persist items added
+// this way — IndexedDB writes stay on our side. Best-effort: if neal.fun
+// renames the hook the trainer still works (refresh to see changes).
+function livePageItems() {
+  try {
+    const ic = typeof window !== "undefined" ? window.IC : null;
+    if (!ic || typeof ic.getItems !== "function") return null;
+    // Never touch the page list while it shows a different save.
+    if (typeof ic.getCurrentSave === "function" && ic.getCurrentSave() !== _saveId) return null;
+    const arr = ic.getItems();
+    return Array.isArray(arr) ? arr : null;
+  } catch {
+    return null;
+  }
+}
+
+function pageAddItem(item) {
+  const arr = livePageItems();
+  if (!arr) return;
+  try {
+    // The page may already know the element (e.g. crafted by hand after we
+    // loaded); match by text so we never show a duplicate sidebar entry.
+    if (!arr.some((i) => i && (i.id === item.id || i.text === item.text))) arr.push(item);
+  } catch {}
+}
+
+function pageRemoveItem(id) {
+  const arr = livePageItems();
+  if (!arr) return;
+  try {
+    const idx = arr.findIndex((i) => i && i.id === id);
+    if (idx >= 0) arr.splice(idx, 1);
+  } catch {}
+}
+
+// Reverse direction: adopt elements the player crafts by hand (and follow
+// page-side deletions / save resets) so trainer commands see them without a
+// reload. Polling stays independent of the page's Vue internals; anything
+// exotic that slips through is recoverable via /import. The page persists
+// its own items, so adoption indexes the page's live objects — no putItem.
+const PAGE_SYNC_MS = 1500;
+let pageSyncId = null;
+const _pageRecipeCounts = new Map(); // page item id -> recipes.length already folded
+
+function syncFromPage() {
+  const arr = livePageItems();
+  if (!arr || !arr.length) return;
+  const pageIds = new Set();
+  const newRecipes = [];
+  for (const item of arr) {
+    if (!item || typeof item.text !== "string") continue;
+    pageIds.add(item.id);
+    if (!_idIndex[item.id] && !_nameIndex[item.text]) {
+      _items.push(item);
+      _allItems.push(item);
+      _nameIndex[item.text] = item;
+      _idIndex[item.id] = item;
+      if (item.id >= _nextId) _nextId = item.id + 1;
+    }
+  }
+  // Fold recipe deltas per item (count-diff); the kernel dedupes, so
+  // re-seeing a pair the trainer recorded itself is a no-op.
+  for (const item of arr) {
+    if (!item || typeof item.text !== "string") continue;
+    const recipes = Array.isArray(item.recipes) ? item.recipes : [];
+    const seen = _pageRecipeCounts.get(item.id) || 0;
+    for (let k = seen; k < recipes.length; k++) {
+      const pair = recipes[k];
+      if (!Array.isArray(pair) || pair.length !== 2) continue;
+      const a = _idIndex[pair[0]], b = _idIndex[pair[1]];
+      if (a && b) newRecipes.push([item.text, a.text, b.text]);
+    }
+    if (recipes.length !== seen) _pageRecipeCounts.set(item.id, recipes.length);
+  }
+  if (newRecipes.length) recordRecipesBatchKernel(recipeIndex, newRecipes);
+  // Adoption makes _items a superset of the page list, so a length mismatch
+  // can only mean page-side deletions.
+  if (_items.length !== pageIds.size) {
+    const gone = _items.filter((i) => !pageIds.has(i.id));
+    const goneIds = new Set(gone.map((i) => i.id));
+    _items = _items.filter((i) => !goneIds.has(i.id));
+    _allItems = _allItems.filter((i) => !goneIds.has(i.id));
+    for (const i of gone) {
+      delete _nameIndex[i.text];
+      delete _idIndex[i.id];
+      _pageRecipeCounts.delete(i.id);
+    }
+  }
+}
+
+function startPageSync() {
+  if (pageSyncId) clearInterval(pageSyncId);
+  // Prime the recipe counts so the first tick doesn't re-fold every recipe
+  // rebuildRecipeIndex() already indexed from the same rows.
+  const arr = livePageItems();
+  if (arr) {
+    for (const item of arr) {
+      if (item) _pageRecipeCounts.set(item.id, Array.isArray(item.recipes) ? item.recipes.length : 0);
+    }
+  }
+  pageSyncId = setInterval(() => {
+    try { syncFromPage(); } catch {}
+  }, PAGE_SYNC_MS);
+}
+
 function _materializeElement(text, emoji, discovered) {
   const item = { id: _nextId++, saveId: _saveId, text, emoji: emoji || "" };
   if (discovered) item.discovered = true;
@@ -259,6 +367,7 @@ function _materializeElement(text, emoji, discovered) {
   _nameIndex[text] = item;
   _idIndex[item.id] = item;
   putItem(item);
+  pageAddItem(item);
 }
 
 function addElement(text, emoji, discovered) {
@@ -297,6 +406,7 @@ async function removeElement(name) {
   delete _nameIndex[item.text];
   delete _idIndex[item.id];
   await deleteItem(item.id);
+  pageRemoveItem(item.id);
   return true;
 }
 
@@ -1809,6 +1919,7 @@ function initBrowserUI() {
     const saveName = (saves.find(s => s.id === _saveId) || {}).name || `Save ${_saveId}`;
     rebuildIndexes();
     rebuildRecipeIndex();
+    startPageSync();
     output.innerHTML = "";
     print(bold(cyan("=== Infinite Craft Trainer ===")) + dim(`  v${TRAINER_VERSION}`));
     print(`  Active save: ${bold(esc(saveName))} (id=${_saveId})`);

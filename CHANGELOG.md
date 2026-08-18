@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.10.0] - 2026-08-18
+
+### Added
+- **The browser trainer now syncs with the open page live, in both
+  directions.** Previously the trainer wrote discoveries only to the game's
+  IndexedDB, which neal.fun reads once at load — so new elements never
+  appeared in the sidebar until you refreshed the page. The trainer now also
+  pushes each new element into the page's live item list (via the `window.IC`
+  hook the game itself exposes), so combines, `/exhaust`, `/crawl`, and
+  `/import` results show up in the sidebar the moment they land. Deleting an
+  element through the trainer removes it from the page just as immediately.
+
+  The reverse direction is covered too: a lightweight poll adopts elements
+  crafted by hand on the page into the trainer's in-memory state — inventory,
+  name/id indexes, and recipe index — and follows page-side deletions and
+  save resets, so trainer commands see hand-crafted elements without a
+  reload. Anything exotic that slips past the poll remains recoverable via
+  `/import`. Every page touch is guarded: if neal.fun renames its hook, the
+  trainer degrades to exactly the old refresh-to-see behavior.
+
 ## [1.9.2] - 2026-08-18
 
 ### Fixed
@@ -300,7 +320,6 @@
 
 ### Fixed
 - Chrome extension loader failed on neal.fun because inline `script.textContent` injection is blocked by the site's Content Security Policy. Added a tiny extension-origin `page-bridge.js` that loads via `chrome.runtime.getURL` (CSP-exempt) and executes the fetched trainer with `eval` in the page world so IndexedDB access still works.
-
 
 ### Changed
 - Chrome extension is now a thin loader that fetches `trainer.min.js` from GitHub Pages and injects it into the page context, instead of bundling a local copy of `trainer.js`. Trainer updates ship via the hosted bookmarklet without requiring a Chrome Web Store release. Removed `web_accessible_resources` for the bundled trainer; added `host_permissions` for `hacker6284.github.io`. Loader hardening: fetch timeout, bounded retries with backoff, payload validation (size, Content-Type, sentinel), injection error handling, UI init verification, `cache: 'no-store'`. Regenerated `trainer.min.js` from current `trainer.js`; CI test prevents minified artifact drift. Userscript aligned to `trainer.min.js`. Extension manifest version `1.3.0` matches changelog.
