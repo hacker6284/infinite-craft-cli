@@ -153,6 +153,8 @@ Discoveries and recipes are stored in `~/.infinite-craft-cli/`:
 
 The [browser trainers](https://hacker6284.github.io/infinite-craft-cli/) share the same command syntax and query matching as the Python CLI (wildcards, `/regex/`, `!` exclude, `^` first discoveries, `/combine`, `/with`, `/cross`, `/target`, and operator shorthands `+`, `++`, `+|`, `*`). Browser-only additions: `/clear` to clear the output panel, and IndexedDB storage instead of `~/.infinite-craft-cli/`. Rate, job, and queue status live in the sticky panel above the input (visual-only; no `/queue` command). Local commands such as `/search` may interleave output with a running queued command.
 
+**Long runs in a background tab:** the trainer holds a [Web Lock](https://developer.mozilla.org/en-US/docs/Web/API/Web_Locks_API) while a run is active, which keeps Chrome's Memory Saver / Energy Saver from freezing the tab under current heuristics. If a backgrounded run still pauses (the exemption is a heuristic, not a guarantee), add `neal.fun` to `chrome://settings/performance` → "Always keep these sites active", or keep the tab in a partially visible window. Truly long unattended jobs are what the Python CLI is for.
+
 ## Development
 
 After editing `bookmarklet/trainer.src.mjs`, rebuild the bundles:

@@ -38,6 +38,9 @@ import {
   is_confirm_answer as isConfirmAnswer,
   confirm_answer_key as confirmAnswerKey,
   should_bulk_warn as shouldBulkWarn,
+  auto_approve_outcome as autoApproveOutcome,
+  bulk_confirm_required as bulkConfirmRequired,
+  rate_status_note as rateStatusNote,
   fetch_timeout_ms as fetchTimeoutMs,
   pair_should_retry as pairShouldRetry,
   pair_retry_backoff_ms as pairRetryBackoffMs,
@@ -90,6 +93,7 @@ let ibJobTotal = 0;
 // /target: pause batches when this element name is crafted ("" = no target)
 let targetElement = "";
 let targetHitChain = Promise.resolve(); // serialize target acks
+let autoApprove = false; // /auto: skip bulk-size y/n confirms this session
 
 // DOM refs — initialized in initBrowserUI() so module evaluation is Node-safe
 let output, input, body, toggle, stopBtn, queueEl, rateEl, jobEl, promptEl;
@@ -695,6 +699,39 @@ function matchElements(query) {
   return { matches, error };
 }
 
+// ── Background-freeze guard ──────────────────────────────────────────
+// Chrome freezes hidden tabs after ~5 minutes (Memory Saver / Energy
+// Saver), pausing timers, fetch completions — everything — so a bulk run
+// in a background tab simply stops. Its freezing heuristics exempt pages
+// holding Web Locks, so we hold one for exactly as long as a run is
+// active and no longer: we only defeat the battery-saver while there is
+// real work to protect. Best-effort — if the heuristic changes, runs
+// pause in background again but nothing breaks.
+let freezeGuardWanted = false;
+let freezeGuardRelease = null;
+
+function acquireFreezeGuard() {
+  if (freezeGuardWanted) return;
+  freezeGuardWanted = true;
+  if (typeof navigator === "undefined" || !navigator.locks) return;
+  try {
+    navigator.locks.request("ict-active-run", { mode: "shared" }, () => {
+      // Run ended before the grant arrived: return nothing so the lock
+      // releases immediately instead of being held forever.
+      if (!freezeGuardWanted) return undefined;
+      return new Promise((resolve) => { freezeGuardRelease = resolve; });
+    }).catch(() => {});
+  } catch {}
+}
+
+function releaseFreezeGuard() {
+  freezeGuardWanted = false;
+  if (freezeGuardRelease) {
+    freezeGuardRelease();
+    freezeGuardRelease = null;
+  }
+}
+
 // ── Run state helpers (DOM-facing; assigned stopBtn after init) ───────
 // Refcounted so pair work and IB work can run concurrently without one
 // endRun() hiding Stop or clearing the other's cancel/abort mid-flight.
@@ -702,6 +739,7 @@ function beginRun() {
   if (activeRuns === 0) {
     cancelled = false;
     activeAbort = new AbortController();
+    acquireFreezeGuard();
   }
   activeRuns++;
   running = true;
@@ -713,6 +751,7 @@ function endRun() {
   if (activeRuns === 0) {
     running = false;
     activeAbort = null;
+    releaseFreezeGuard();
     try { stopBtn.style.display = "none"; } catch {}
   }
 }
@@ -738,6 +777,24 @@ function doTarget(arg) {
     print(`  Target set: ${bold(yellow(esc(newState)))} — you'll be asked whether to continue the batch when this is crafted.`);
   }
   updateChrome();
+}
+
+function doAuto(arg) {
+  const [kind, newState] = autoApproveOutcome(autoApprove, arg || "");
+  if (kind === "invalid") {
+    print(`  Usage: ${yellow("/auto [on|off]")} (bare /auto toggles)`);
+    return;
+  }
+  autoApprove = newState;
+  if (kind === "on") {
+    print(`  Auto-approve ${green("on")} — bulk y/n confirms are skipped. Target hits still ask.`);
+  } else if (kind === "off") {
+    print(`  Auto-approve ${yellow("off")} — runs over ${BULK_WARN} pairs ask y/n.`);
+  } else if (kind === "show_on") {
+    print(`  Auto-approve is ${green("on")}.`);
+  } else {
+    print(`  Auto-approve is ${yellow("off")}.`);
+  }
 }
 
 /** Pause for y/n after target hit. Returns true if batch should stop. */
@@ -846,11 +903,13 @@ async function runPairsInner(pairs, opts = {}) {
 async function confirmAndRunPairs(pairs) {
   try {
     beginRun();
-    if (shouldBulkWarn(pairs.length, BULK_WARN)) {
+    if (bulkConfirmRequired(pairs.length, BULK_WARN, autoApprove)) {
       if (!(await confirmOrCancel([], { reason: `${pairs.length} pairs` }))) {
         print("  Cancelled.");
         return;
       }
+    } else if (autoApprove && shouldBulkWarn(pairs.length, BULK_WARN)) {
+      print("  " + dim(`Auto-approved ${pairs.length} pairs (/auto is on).`));
     }
     if (cancelled) return;
     print(`  Running ${bold(String(pairs.length))} combinations...`);
@@ -1123,11 +1182,14 @@ async function doPermutate(query) {
       const pairs = pairsFromBoundary(permutePairsBoundary(toTuples(matches)));
       print(`  ${dim(`--- Round ${round}:`)} ${matches.length} elements, ${pairs.length} pairs ---`);
 
-      if (!confirmed && shouldBulkWarn(pairs.length, BULK_WARN)) {
+      if (!confirmed && bulkConfirmRequired(pairs.length, BULK_WARN, autoApprove)) {
         if (!(await confirmOrCancel([], { reason: `${pairs.length} pairs per round` }))) {
           print("  Cancelled.");
           return;
         }
+        confirmed = true;
+      } else if (!confirmed && autoApprove && shouldBulkWarn(pairs.length, BULK_WARN)) {
+        print("  " + dim(`Auto-approved ${pairs.length} pairs per round (/auto is on).`));
         confirmed = true;
       }
 
@@ -1501,6 +1563,7 @@ function doHelp() {
     ${cyan("/export")}                     Download discoveries as .ic save file
     ${cyan("/history")}                    Show combinations this session
     ${cyan("/target [element|clear]")}     Watch for a result; ask y/n to continue on hit
+    ${cyan("/auto [on|off]")}              Auto-approve bulk y/n confirms (bare /auto toggles)
     ${cyan("/clear")}                      Clear output (browser only)
     ${cyan("/help")}                       Show this help`);
 }
@@ -1554,7 +1617,11 @@ function updateChrome() {
 
   // Permanent rate line: segmented bar + optional last pair (pair lane only).
   const { remaining, max, oldestFracMilli } = rateChromeSnapshot();
-  const ratePrefix = `<span class="ict-rate-label">rate</span> ${rateBarHtml(remaining, max, oldestFracMilli)}`;
+  const rateNote = rateStatusNote(remaining);
+  const noteHtml = rateNote
+    ? ` <span class="ict-rate-sep">·</span> <span class="ict-rate-note">${esc(rateNote)}</span>`
+    : "";
+  const ratePrefix = `<span class="ict-rate-label">rate</span> ${rateBarHtml(remaining, max, oldestFracMilli)}` + noteHtml;
   if (currentPairCommand && lastPairA != null && lastPairB != null) {
     // Width-aware: measure leftover cells after painting the rate segment once.
     rateEl.innerHTML = ratePrefix + ` <span class="ict-rate-sep">·</span> <span class="ict-rate-pair"></span>`;
@@ -1566,6 +1633,7 @@ function updateChrome() {
       + ageW + capW
       + (rateEl.querySelector(".ict-rate-num")?.offsetWidth || 0)
       + (rateEl.querySelector(".ict-rate-sep")?.offsetWidth || 0)
+      + (rateEl.querySelector(".ict-rate-note")?.offsetWidth || 0)
       + 16;
     const charPx = 7.2; // monospace ~13px font
     const avail = Math.max(8, Math.floor((totalPx - usedPx) / charPx));
@@ -1804,6 +1872,7 @@ async function executeCommand(line) {
   if ((rest = slashArgs(line, "/list")) !== null) { doList(); return; }
   if ((rest = slashArgs(line, "/history")) !== null) { doHistory(); return; }
   if ((rest = slashArgs(line, "/target")) !== null) { doTarget(rest); return; }
+  if ((rest = slashArgs(line, "/auto")) !== null) { doAuto(rest); return; }
   if ((rest = slashArgs(line, "/clear")) !== null) { output.innerHTML = ""; return; }
   if ((rest = slashArgs(line, "/unfilled")) !== null) { doUnfilled(); return; }
 
@@ -1869,6 +1938,7 @@ function initBrowserUI() {
     #ict-queue .ict-queue-item{margin:1px 0;opacity:.85}
     #ict-queue .ict-queue-tag{color:#888;margin-right:4px;font-size:11px}
     #ict-job .ict-job-row{margin:1px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    #ict-rate .ict-rate-note{color:#e6b450}
     #ict-input-row{display:flex;align-items:center;border-top:1px solid #0f3460;padding:4px 10px;background:#16213e}
     #ict-prompt{color:#00bcd4;margin-right:6px;white-space:nowrap}
     #ict-input{flex:1;background:transparent;border:none;outline:none;color:#e0e0e0;font:inherit;caret-color:#00bcd4}

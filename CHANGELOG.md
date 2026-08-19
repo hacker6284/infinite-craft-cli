@@ -1,5 +1,32 @@
 # Changelog
 
+## [1.11.0] - 2026-08-19
+
+### Added
+- **`/auto` — session auto-approve for bulk confirms** (trainer and CLI).
+  Bare `/auto` toggles; `/auto on|off|status` are explicit. While on, runs
+  over the 200-pair warn threshold print a dim "Auto-approved N pairs"
+  line and start immediately instead of asking y/n. Target hits still ask:
+  `/target` is an explicit opt-in to pausing, so `/auto` never overrides
+  it. The toggle rules and gate live in the kernel
+  (`auto_approve_outcome`, `bulk_confirm_required`), shared by both hosts.
+
+- **"Rate limiting in progress" indicator** (trainer and CLI). When the
+  request window is exhausted (0/60 slots), the note appears beside the
+  rate bar and clears as slots free up. The string comes from the kernel
+  (`rate_status_note`) so both hosts read identically.
+
+- **The trainer holds a Web Lock while a run is active**, which exempts
+  the tab from Chrome's Memory Saver / Energy Saver freezing under
+  current heuristics — so bulk runs keep executing in a background tab.
+  The lock is scoped to exactly the lifetime of active work: acquired
+  when a run starts, released when the last concurrent run ends, so the
+  battery-saver is only defeated while there is real work to protect.
+  Best-effort by design — if Chrome tightens the heuristic, background
+  runs pause again but nothing breaks. For a guarantee, add neal.fun to
+  chrome://settings/performance → "Always keep these sites active" (now
+  documented in the README).
+
 ## [1.10.2] - 2026-08-18
 
 ### Changed

@@ -180,7 +180,7 @@ def _reset_test_state() -> None:
     _discard_queue_after_cancel = False
     global _job_done, _job_total, _ib_job_done, _ib_job_total
     global _last_pair, _active_client, _rate_ticker_task, _target_element
-    global _confirm_reason
+    global _confirm_reason, _auto_approve
     _job_done = 0
     _job_total = 0
     _ib_job_done = 0
@@ -189,6 +189,7 @@ def _reset_test_state() -> None:
     _active_client = None
     _rate_ticker_task = None
     _target_element = ""
+    _auto_approve = False
     _confirm_reason = ""
     _skip_summary_shown = False
     _sigint_previous = None
@@ -668,6 +669,7 @@ _rate_ticker_task: asyncio.Task | None = None
 # /target: pause batch when this element name is produced by a combination.
 # Empty string = no target (kernel is_target_hit/apply_target_state treat "" as idle).
 _target_element: str = ""
+_auto_approve: bool = False  # /auto: skip bulk-size y/n confirms this session
 _target_hit_lock = asyncio.Lock()
 # Confirm chrome reason (e.g. "331 pairs"); keys live only on the prompt.
 _confirm_reason: str = ""
@@ -1952,7 +1954,7 @@ async def _combine_pairs(client, storage, pairs: list[tuple]):
 async def _confirm_and_run_pairs(client, storage, pairs: list[tuple]):
     """Warn if too many pairs, then run them."""
     global _bulk_confirm_resolved
-    if craft.should_bulk_warn(len(pairs), _BULK_WARN_THRESHOLD):
+    if craft.bulk_confirm_required(len(pairs), _BULK_WARN_THRESHOLD, _auto_approve):
         if not await _prompt_continue(
             bulk_pending=True,
             reason=f"{len(pairs)} pairs",
@@ -1960,6 +1962,10 @@ async def _confirm_and_run_pairs(client, storage, pairs: list[tuple]):
             return
         _bulk_confirm_resolved = True
     else:
+        if _auto_approve and craft.should_bulk_warn(len(pairs), _BULK_WARN_THRESHOLD):
+            _repl_print_lines(
+                _color(f"  Auto-approved {len(pairs)} pairs (/auto is on).", DIM)
+            )
         _bulk_confirm_resolved = True
     await _combine_pairs(client, storage, pairs)
 
@@ -2033,7 +2039,9 @@ async def do_permutate(client, storage, query: str):
                 f"  --- Round {round_num}: {n} elements, {len(pairs)} pairs ---"
             )
 
-            if not confirmed and craft.should_bulk_warn(len(pairs), _BULK_WARN_THRESHOLD):
+            if not confirmed and craft.bulk_confirm_required(
+                len(pairs), _BULK_WARN_THRESHOLD, _auto_approve
+            ):
                 if not await _prompt_continue(
                     bulk_pending=True,
                     reason=f"{len(pairs)} pairs per round",
@@ -2042,6 +2050,16 @@ async def do_permutate(client, storage, query: str):
                 confirmed = True
                 _bulk_confirm_resolved = True
             elif not confirmed:
+                if _auto_approve and craft.should_bulk_warn(
+                    len(pairs), _BULK_WARN_THRESHOLD
+                ):
+                    _repl_print_lines(
+                        _color(
+                            f"  Auto-approved {len(pairs)} pairs per round (/auto is on).",
+                            DIM,
+                        )
+                    )
+                    confirmed = True
                 _bulk_confirm_resolved = True
 
             await _combine_pairs(client, storage, pairs)
@@ -2506,6 +2524,7 @@ def do_help() -> str:
     /target <element>             Ask y/n to continue the batch when this is crafted
     /target                       Show current target
     /target clear                 Clear target
+    /auto [on|off]                Auto-approve bulk y/n confirms (bare /auto toggles)
 
   Query syntax (/search, /with, /permute, /permutate, /cross, /exhaust, shorthands):
     substring                     Default: case-insensitive substring
@@ -2578,6 +2597,28 @@ def do_target(arg: str) -> str:
         f"  Target set: {_color(new_state, BOLD + YELLOW)} — "
         "you'll be asked whether to continue the batch when this is crafted."
     )
+
+
+def do_auto(arg: str) -> str:
+    """Toggle, set, or show session auto-approve (rules in kernel)."""
+    global _auto_approve
+    kind, new_state = craft.auto_approve_outcome(_auto_approve, arg)
+    if kind == "invalid":
+        return f"  Usage: {_color('/auto [on|off]', YELLOW)} (bare /auto toggles)"
+    _auto_approve = new_state
+    if kind == "on":
+        return (
+            f"  Auto-approve {_color('on', GREEN)} — bulk y/n confirms are "
+            "skipped. Target hits still ask."
+        )
+    if kind == "off":
+        return (
+            f"  Auto-approve {_color('off', YELLOW)} — runs over "
+            f"{_BULK_WARN_THRESHOLD} pairs ask y/n."
+        )
+    if kind == "show_on":
+        return f"  Auto-approve is {_color('on', GREEN)}."
+    return f"  Auto-approve is {_color('off', YELLOW)}."
 
 
 async def _acknowledge_target_hit(a_name: str, b_name: str, result_name: str) -> bool:
@@ -2677,6 +2718,9 @@ def _format_queue_display() -> str:
         left, maximum, frac_milli = _active_client._rate_limiter.chrome_snapshot()
     bar = _rate_bar_colored(left, maximum, frac_milli)
     rate_prefix = f"  {_color('rate', DIM)} {bar} {left}/{maximum}"
+    note = craft.rate_status_note(left)
+    if note:
+        rate_prefix += f" {_color('·', DIM)} {_color(note, YELLOW)}"
     pair_part = ""
     if _current_command and _last_pair is not None:
         a, b = _last_pair
@@ -2898,6 +2942,8 @@ async def _dispatch_line(client, storage, line: str) -> None:
         _repl_print_lines(do_history(storage))
     elif (rest := craft.slash_args(line, "/target")) is not None:
         _repl_print_lines(do_target(rest))
+    elif (rest := craft.slash_args(line, "/auto")) is not None:
+        _repl_print_lines(do_auto(rest))
     elif line == "/queue":
         _paint_queue_panel(force=True)
         if (

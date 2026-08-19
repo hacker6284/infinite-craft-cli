@@ -764,6 +764,8 @@ export func is_local_command(line: text) -> bool
         return true
     if line == "/target" or strings.starts_with(line, "/target ")
         return true
+    if line == "/auto" or strings.starts_with(line, "/auto ")
+        return true
     return false
 
 // Infinibrowser-backed long commands — independent host queue from pair API.
@@ -876,6 +878,33 @@ export func apply_target_state(current: text, action: text, name: text) -> text
     kind, new_state, detail = target_outcome(current, action, name)
     return new_state
 
+// /auto: session auto-approve for bulk-size y/n confirms. Bare /auto
+// toggles (the impatient path); on/off/status are explicit. Returns
+// (kind, new_state) with kind in {on, off, show_on, show_off, invalid}.
+// Hosts format wording; target-hit confirms are NOT covered — /target is
+// an explicit per-session opt-in to pausing, so it always asks.
+export func auto_approve_outcome(prev: bool, arg: text) -> (text, bool)
+    rest = ascii_lower_text(strip_spaces(arg))
+    if rest.length == 0
+        if prev
+            return ("off", false)
+        return ("on", true)
+    if rest == "on" or rest == "y" or rest == "yes" or rest == "always"
+        return ("on", true)
+    if rest == "off" or rest == "n" or rest == "no" or rest == "never"
+        return ("off", false)
+    if rest == "show" or rest == "status"
+        if prev
+            return ("show_on", true)
+        return ("show_off", false)
+    return ("invalid", prev)
+
+// Bulk confirm gate with session auto-approve folded in.
+export func bulk_confirm_required(n: int, threshold: int, auto_approve: bool) -> bool
+    if auto_approve
+        return false
+    return should_bulk_warn(n, threshold)
+
 // Confirm key normalize: strip + ascii-lower full key.
 export func confirm_answer_key(answer: text) -> text
     return strip_spaces(ascii_lower_text(answer))
@@ -952,6 +981,12 @@ export func ib_should_retry(status: int, attempt: int) -> bool
 // Rate-window chrome math (pure). Hosts own clocks, deques, HTTP, paint.
 // Times are integer milliseconds (or any consistent unit).
 // ---------------------------------------------------------------------------
+
+// Note shown beside the rate bar while the request window is exhausted.
+export func rate_status_note(remaining: int) -> text
+    if remaining <= 0
+        return "Rate limiting in progress"
+    return ""
 
 export func rate_slots_left(used: int, max_requests: int) -> int
     if max_requests <= 0
@@ -1681,6 +1716,40 @@ func match_names(els: List<Element>, query: text) -> (Set<text>, Option<text>)
     for e in matches
         names.add(e.name)
     return (names, err)
+
+test "auto approve and rate note"
+    assert is_local_command("/auto")
+    assert is_local_command("/auto on")
+    assert command_queue_lane("/auto") == "local"
+    kind, state = auto_approve_outcome(false, "")
+    assert kind == "on"
+    assert state
+    kind, state = auto_approve_outcome(true, "")
+    assert kind == "off"
+    assert not state
+    kind, state = auto_approve_outcome(false, "  ON ")
+    assert kind == "on"
+    assert state
+    kind, state = auto_approve_outcome(true, "off")
+    assert kind == "off"
+    assert not state
+    kind, state = auto_approve_outcome(true, "status")
+    assert kind == "show_on"
+    assert state
+    kind, state = auto_approve_outcome(false, "show")
+    assert kind == "show_off"
+    assert not state
+    kind, state = auto_approve_outcome(false, "banana")
+    assert kind == "invalid"
+    assert not state
+    assert bulk_confirm_required(500, 200, false)
+    assert not bulk_confirm_required(500, 200, true)
+    assert not bulk_confirm_required(100, 200, false)
+    assert not bulk_confirm_required(100, 200, true)
+    assert rate_status_note(0) == "Rate limiting in progress"
+    assert rate_status_note(-1) == "Rate limiting in progress"
+    assert rate_status_note(1) == ""
+    assert rate_status_note(60) == ""
 
 test "retry policy parity"
     assert fetch_timeout_ms() == 30000
