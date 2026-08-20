@@ -34,6 +34,15 @@
   takes a path, the trainer opens a file picker, and
   `infinite-craft script "src"` / `script -f path` run non-interactively.
 
+### Fixed
+- **Ctrl-C at an idle REPL prompt now exits cleanly** (`Goodbye!`, exit
+  130) instead of dying with a `KeyboardInterrupt` traceback — or, on
+  Python 3.11+, hanging while asyncio joined a stdin reader thread still
+  blocked in `read()`. Pre-existing since at least 1.9.2; surfaced by
+  release stress-testing. Ctrl-C during a running command still cancels
+  just that command, and SIGINT during a non-interactive `script` run
+  prints `Cancelled.` and exits 130.
+
 ### Changed (breaking)
 - **`+|` is removed.** `A +| B` is a parse error pointing at `*`; with a
   singleton left side they were the same operation. `/with` is unchanged.

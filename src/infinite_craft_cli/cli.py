@@ -3657,6 +3657,7 @@ async def interactive_mode():
     _patch_repl_print(True)
     _chrome_enable()
     _install_winch_handler()
+    ki_exit = False
     try:
         async with InfiniteCraftClient(
             rate_limit=API_RATE_LIMIT,
@@ -3737,6 +3738,15 @@ async def interactive_mode():
 
                 _echo_submitted_command(line)
                 _enqueue_command_line(line, client, storage)
+    except asyncio.CancelledError:
+        # Ctrl-C at an idle prompt: asyncio.run's Runner cancels this task.
+        # If we let the cancellation propagate normally, Runner.close() then
+        # joins the stdin reader thread — which is still blocked in read()
+        # — and the process hangs forever (pre-existing since ≤1.9.2, where
+        # it surfaced as a KeyboardInterrupt traceback). Flag it; the
+        # finally below runs full teardown and exits directly.
+        ki_exit = True
+        raise
     finally:
         # Best-effort cleanup of worker on any exit (including uncaught exceptions or KI
         # during input) to avoid lingering high-memory processes/threads.
@@ -3749,6 +3759,12 @@ async def interactive_mode():
         await _cancel_and_await_worker()
         _teardown_tty_and_chrome()
         _confirm_future = None
+        if ki_exit:
+            # Teardown is done and the save is on disk; skip the Runner's
+            # doomed join of the blocked reader thread.
+            _builtin_print("\n  Goodbye!")
+            sys.stdout.flush()
+            os._exit(130)
 
 
 # ---------------------------------------------------------------------------
@@ -3902,7 +3918,15 @@ def main():
     args = parser.parse_args()
 
     if args.command is None:
-        asyncio.run(interactive_mode())
+        try:
+            asyncio.run(interactive_mode())
+        except KeyboardInterrupt:
+            # Ctrl-C at an idle prompt (or in the race window between a
+            # command finishing and the next prompt) used to escape as a
+            # raw traceback — pre-existing since at least 1.9.2. Exit like
+            # /quit instead; the save is already on disk.
+            print("\n  Goodbye!")
+            raise SystemExit(130) from None
     else:
         try:
             asyncio.run(noninteractive_mode(args))
