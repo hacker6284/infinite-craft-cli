@@ -2573,6 +2573,7 @@ def do_help() -> str:
     a* , b*                       Union    a* - b*  difference    a* & b*  intersect
     a* / b*                       Keep a* having a known recipe with b* (% = lacking)
     (expr)*  (expr)**  (expr)!    Permute / permutate / exhaust the set
+    (expr)100  (expr)100?  (expr)?  First 100 / random 100 / shuffle ((expr)(|x*|) = dynamic)
     [ expr ]  /  []               New elements made by expr / by the last operation
     ^(expr)                       First discoveries only
     set @ body   set @x body      For each element (as _ or x) run body
@@ -2927,15 +2928,26 @@ class ScriptError(Exception):
 
 
 class _ScriptState:
-    __slots__ = ("nodes", "kids", "muts", "frames", "collectors", "loop_depth")
+    __slots__ = ("nodes", "kids", "muts", "frames", "collectors", "loop_depth", "seed_base", "seed_tick")
 
-    def __init__(self, nodes, kids, muts):
+    def __init__(self, nodes, kids, muts, seed_base=None):
         self.nodes = nodes
         self.kids = kids
         self.muts = muts
         self.frames: list[list] = [[]]  # scope frames of (name, set)
         self.collectors: list[list] = []
         self.loop_depth = 0  # >0 inside loop/foreach bodies (ack suppression)
+        # Host-supplied randomness: deterministic kernel, clock-seeded host.
+        # The tick advances per kernel call so loop iterations resample.
+        if seed_base is None:
+            seed_base = int(time.time() * 1000) % 2147483648
+        self.seed_base = seed_base
+        self.seed_tick = 0
+
+
+def _script_seed(S):
+    S.seed_tick += 1
+    return (S.seed_base + S.seed_tick * 7919) % 2147483648
 
 
 def _script_env_flat(S):
@@ -2960,7 +2972,7 @@ def _script_kernel_eval(S, storage, node_id):
     names, values = _script_env_flat(S)
     ok, result, err = craft.script_eval_expr_boundary(
         S.nodes, S.kids, node_id, _elements_to_boundary(storage.get_all()),
-        _load_recipes(), names, values, list(_script_new_reg),
+        _load_recipes(), names, values, list(_script_new_reg), _script_seed(S),
     )
     if not ok:
         raise ScriptError(err)
@@ -2971,11 +2983,22 @@ def _script_kernel_cond(S, storage, node_id):
     names, values = _script_env_flat(S)
     ok, truth, err = craft.script_eval_cond_boundary(
         S.nodes, S.kids, node_id, _elements_to_boundary(storage.get_all()),
-        _load_recipes(), names, values, list(_script_new_reg),
+        _load_recipes(), names, values, list(_script_new_reg), _script_seed(S),
     )
     if not ok:
         raise ScriptError(err)
     return truth
+
+
+def _script_kernel_num(S, storage, node_id):
+    names, values = _script_env_flat(S)
+    ok, value, err = craft.script_eval_num_boundary(
+        S.nodes, S.kids, node_id, _elements_to_boundary(storage.get_all()),
+        _load_recipes(), names, values, list(_script_new_reg), _script_seed(S),
+    )
+    if not ok:
+        raise ScriptError(err)
+    return value
 
 
 def _script_record_news(S, news):
@@ -3100,6 +3123,13 @@ async def _script_eval(S, client, storage, node_id):
     if kind == "first":
         v = await _script_eval_operand(S, client, storage, a)
         return [t for t in v if t[2]]
+    if kind in ("take", "sample", "shuffle"):
+        # Mutating inner: host walks it, then the kernel slices/samples.
+        v = await _script_eval_operand(S, client, storage, a)
+        if kind == "take":
+            return [tuple(t) for t in craft.script_take_tuples(v, _script_kernel_num(S, storage, b))]
+        n = len(v) if kind == "shuffle" else _script_kernel_num(S, storage, b)
+        return [tuple(t) for t in craft.script_sample_tuples(v, n, _script_seed(S))]
     if kind == "newset":
         collector: list = []
         S.collectors.append(collector)

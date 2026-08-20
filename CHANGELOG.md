@@ -1,8 +1,20 @@
 # Changelog
 
-## [2.1.0] - 2026-08-20
+## [2.1.0] - 2026-08-21
 
 ### Added
+- **Query subsetting: take, sample, and shuffle postfixes.** `(fire*)100`
+  takes the first 100 matches in set order; `(fire*)100?` takes 100
+  uniformly random ones; `(fire*)?` shuffles the whole set. Counts may
+  be attached digits or an attached parenthesized numeric expression
+  with full condition-grade arithmetic — `(fire*)(|water*| - 3)` — and
+  count expressions are statically pure, like conditions. All three are
+  non-mutating, compose with the rest of the postfix family
+  (`((fire*)100)!` exhausts the first hundred), and stay eligible for
+  the immediate pure-script path. Randomness follows the kernel
+  determinism doctrine: sudocode has no ambient RNG by design, so hosts
+  supply a clock-derived seed and the kernel's seeded shuffle is exact
+  and parity-tested.
 - **`/lucky [count]` — random untried pairs, in both hosts and as a
   `lucky` subcommand.** When crosses and crawls run dry, the prioritized
   frontier is exhausted — but the prioritizer systematically neglects the

@@ -1093,10 +1093,19 @@ func sl_match_postfix(source: text, i: int) -> (text, int)
         return ("", i)
     if source[i] == '!'
         return ("!", i + 1)
+    if source[i] == '?'
+        return ("?", i + 1)
     if source[i] == '*'
         if i + 1 < n and source[i + 1] == '*'
             return ("**", i + 2)
         return ("*", i + 1)
+    if source[i] >= '0' and source[i] <= '9'
+        j = i
+        digits: text = ""
+        while j < n and source[j] >= '0' and source[j] <= '9'
+            digits.append(source[j])
+            j = j + 1
+        return (digits, j)
     return ("", i)
 
 // Scan one word/pattern token starting at i (first char already known to be
@@ -1190,18 +1199,20 @@ export func script_tokenize(source: text) -> (bool, List<(text, text, int)>, tex
             tokens.append((")", ")", i))
             i = i + 1
             post, pi = sl_match_postfix(source, i)
-            if post.length > 0
+            while post.length > 0
                 tokens.append(("post", post, i))
                 i = pi
+                post, pi = sl_match_postfix(source, i)
             continue
         if c == '['
             if i + 1 < n and source[i + 1] == ']'
                 tokens.append(("[]", "[]", i))
                 i = i + 2
                 post2, pi2 = sl_match_postfix(source, i)
-                if post2.length > 0
+                while post2.length > 0
                     tokens.append(("post", post2, i))
                     i = pi2
+                    post2, pi2 = sl_match_postfix(source, i)
                 continue
             if i + 1 >= n or is_ascii_space(source[i + 1])
                 tokens.append(("[", "[", i))
@@ -1216,9 +1227,10 @@ export func script_tokenize(source: text) -> (bool, List<(text, text, int)>, tex
             tokens.append(("]", "]", i))
             i = i + 1
             post3, pi3 = sl_match_postfix(source, i)
-            if post3.length > 0
+            while post3.length > 0
                 tokens.append(("post", post3, i))
                 i = pi3
+                post3, pi3 = sl_match_postfix(source, i)
             continue
         if c == '@'
             if i + 1 < n and sl_is_ident_char(source[i + 1]) and not (source[i + 1] >= '0' and source[i + 1] <= '9')
@@ -1332,8 +1344,8 @@ func sp_add(nodes: inout List<(text, int, int, int, text)>, muts: inout List<boo
         // pure wrappers: `a - (b* * c*)` is a mutating expression.
         // For script/block/union/and/or, a is a kids index, not a node id —
         // those OR their children at the call site via sp_kids_mut.
-        unary = kind == "first" or kind == "newset" or kind == "size" or kind == "assign" or kind == "permute" or kind == "permutate" or kind == "exhaust"
-        binary = kind == "diff" or kind == "intersect" or kind == "canrec" or kind == "cantrec" or kind == "narith" or kind == "cmp"
+        unary = kind == "first" or kind == "newset" or kind == "size" or kind == "assign" or kind == "permute" or kind == "permutate" or kind == "exhaust" or kind == "shuffle"
+        binary = kind == "diff" or kind == "intersect" or kind == "canrec" or kind == "cantrec" or kind == "narith" or kind == "cmp" or kind == "take" or kind == "sample"
         if (unary or binary) and a >= 0 and a < muts.length and muts[a]
             mut = true
         if binary and b >= 0 and b < muts.length and muts[b]
@@ -1443,17 +1455,82 @@ func sp_parse_postfix(tokens: List<(text, text, int)>, i: int, depth: int, nodes
     node, ni, err, epos, wrapped = sp_parse_primary(tokens, i, depth, nodes, kids, muts, binders)
     if err.length > 0
         return (-1, 0, err, epos, false)
-    while sp_tok_kind(tokens, ni) == "post"
-        op = sp_tok_sval(tokens, ni)
-        if op == "*"
-            node = sp_add(nodes, muts, "permute", node, -1, -1, "")
-        else if op == "**"
-            node = sp_add(nodes, muts, "permutate", node, -1, -1, "")
-        else
-            node = sp_add(nodes, muts, "exhaust", node, -1, -1, "")
-        wrapped = false
-        ni = ni + 1
+    while true
+        kind = sp_tok_kind(tokens, ni)
+        if kind == "post"
+            op = sp_tok_sval(tokens, ni)
+            if op == "*"
+                node = sp_add(nodes, muts, "permute", node, -1, -1, "")
+                ni = ni + 1
+            else if op == "**"
+                node = sp_add(nodes, muts, "permutate", node, -1, -1, "")
+                ni = ni + 1
+            else if op == "!"
+                node = sp_add(nodes, muts, "exhaust", node, -1, -1, "")
+                ni = ni + 1
+            else if op == "?"
+                // bare ?: shuffle the whole set
+                node = sp_add(nodes, muts, "shuffle", node, -1, -1, "")
+                ni = ni + 1
+            else
+                // digit-run: a take count — becomes sample if ? follows
+                v = 0
+                for c in op
+                    v = v * 10 + (c - '0')
+                cnum = sp_add(nodes, muts, "num", v, -1, -1, "")
+                if sp_tok_kind(tokens, ni + 1) == "post" and sp_tok_sval(tokens, ni + 1) == "?"
+                    node = sp_add(nodes, muts, "sample", node, cnum, -1, "")
+                    ni = ni + 2
+                else
+                    node = sp_add(nodes, muts, "take", node, cnum, -1, "")
+                    ni = ni + 1
+            wrapped = false
+            continue
+        if kind == "(" and sp_count_group_attaches(tokens, ni)
+            // dynamic count group: (expr)(num_expr) or (expr)(num_expr)? —
+            // legal only when the "(" is ATTACHED directly after ) ] [] or
+            // a postfix token, mirroring the tokenizer's attachment rule.
+            // A spaced or word-adjacent "(" still errors as juxtaposition.
+            cnode, ci, cerr, cepos = sp_parse_num(tokens, ni + 1, depth + 1, nodes, kids, muts, binders)
+            if cerr.length > 0
+                return (-1, 0, cerr, cepos, false)
+            if sp_tok_kind(tokens, ci) != ")"
+                return (-1, 0, "Expected ) after the count expression", sp_tok_pos(tokens, ci), false)
+            if muts[cnode]
+                return (-1, 0, "Count expressions must be pure - no combines, crosses, or bulk operations inside a count", sp_tok_pos(tokens, ni), false)
+            ci = ci + 1
+            if sp_tok_kind(tokens, ci) == "post" and sp_tok_sval(tokens, ci) == "?"
+                node = sp_add(nodes, muts, "sample", node, cnode, -1, "")
+                ci = ci + 1
+            else
+                node = sp_add(nodes, muts, "take", node, cnode, -1, "")
+            ni = ci
+            wrapped = false
+            continue
+        break
     return (node, ni, "", 0, wrapped)
+
+// Width of a token for adjacency checks (accurate for the closers and
+// postfix tokens a count group may follow).
+func sp_tok_width(kind: text, sval: text) -> int
+    if kind == "[]" or kind == "^("
+        return 2
+    if kind == "post" or kind == "word" or kind == "op"
+        return sval.length
+    if kind == "str"
+        return sval.length + 2
+    if kind == "atid"
+        return sval.length + 1
+    return 1
+
+func sp_count_group_attaches(tokens: List<(text, text, int)>, i: int) -> bool
+    if i == 0
+        return false
+    pk = sp_tok_kind(tokens, i - 1)
+    if not (pk == ")" or pk == "]" or pk == "[]" or pk == "post")
+        return false
+    prev_end = sp_tok_pos(tokens, i - 1) + sp_tok_width(pk, sp_tok_sval(tokens, i - 1))
+    return sp_tok_pos(tokens, i) == prev_end
 
 func sp_parse_crawl(tokens: List<(text, text, int)>, i: int, depth: int, nodes: inout List<(text, int, int, int, text)>, kids: inout List<List<int>>, muts: inout List<bool>, binders: List<text>) -> (int, int, text, int, bool)
     node, ni, err, epos, wrapped = sp_parse_postfix(tokens, i, depth, nodes, kids, muts, binders)
@@ -1944,6 +2021,23 @@ func se_binary_setop(kind: text, lset: List<Element>, rset: List<Element>, recip
 export func script_set_op_boundary(op: text, a: List<(text, text, bool)>, b: List<(text, text, bool)>, recipes: Map<text, List<(text, text)>>) -> List<(text, text, bool)>
     return elements_to_tuples(se_binary_setop(op, elements_from_tuples(a), elements_from_tuples(b), recipes))
 
+func se_shuffle(items: List<Element>, seed: int) -> List<Element>
+    out: List<Element> = []
+    for e in items
+        out.append(e)
+    state = seed
+    if state <= 0
+        state = 1
+    i = out.length - 1
+    while i > 0
+        state = lucky_next(state)
+        j = state - (state / (i + 1)) * (i + 1)
+        tmp = out[i]
+        out[i] = out[j]
+        out[j] = tmp
+        i = i - 1
+    return out
+
 func se_env_lookup(env_names: List<text>, env_values: List<List<Element>>, name: text) -> (bool, List<Element>)
     // Later entries shadow earlier ones (host appends inner scopes last).
     i = env_names.length - 1
@@ -1954,7 +2048,7 @@ func se_env_lookup(env_names: List<text>, env_values: List<List<Element>>, name:
     empty: List<Element> = []
     return (false, empty)
 
-func se_eval(nodes: List<(text, int, int, int, text)>, kids: List<List<int>>, id: int, elements: List<Element>, recipes: Map<text, List<(text, text)>>, env_names: List<text>, env_values: List<List<Element>>, newreg: List<Element>) -> (bool, List<Element>, text)
+func se_eval(nodes: List<(text, int, int, int, text)>, kids: List<List<int>>, id: int, elements: List<Element>, recipes: Map<text, List<(text, text)>>, env_names: List<text>, env_values: List<List<Element>>, newreg: List<Element>, se_seed: int) -> (bool, List<Element>, text)
     empty: List<Element> = []
     kind, a, b, c, sval = nodes[id]
     if kind == "pattern"
@@ -1985,12 +2079,12 @@ func se_eval(nodes: List<(text, int, int, int, text)>, kids: List<List<int>>, id
         // Statically-pure inner: nothing can be newly added, so the value is
         // the empty set (spec §5.4) — but the inner still evaluates so its
         // errors (bad refs, bad regex) surface.
-        nok, nres, nerr = se_eval(nodes, kids, a, elements, recipes, env_names, env_values, newreg)
+        nok, nres, nerr = se_eval(nodes, kids, a, elements, recipes, env_names, env_values, newreg, se_seed)
         if not nok
             return (false, empty, nerr)
         return (true, empty, "")
     if kind == "first"
-        iok, inner, ierr = se_eval(nodes, kids, a, elements, recipes, env_names, env_values, newreg)
+        iok, inner, ierr = se_eval(nodes, kids, a, elements, recipes, env_names, env_values, newreg, se_seed)
         if not iok
             return (false, empty, ierr)
         firsts: List<Element> = []
@@ -1998,40 +2092,69 @@ func se_eval(nodes: List<(text, int, int, int, text)>, kids: List<List<int>>, id
             if e.first
                 firsts.append(e)
         return (true, firsts, "")
+    if kind == "take" or kind == "sample" or kind == "shuffle"
+        tok, tset, terr = se_eval(nodes, kids, a, elements, recipes, env_names, env_values, newreg, se_seed)
+        if not tok
+            return (false, empty, terr)
+        n = tset.length
+        if kind != "shuffle"
+            nok, nv, nerr = se_eval_num(nodes, kids, b, elements, recipes, env_names, env_values, newreg, se_seed)
+            if not nok
+                return (false, empty, nerr)
+            n = nv
+        if n <= 0
+            return (true, empty, "")
+        if kind == "take"
+            out_t: List<Element> = []
+            for idx = 0 to tset.length - 1
+                if idx >= n
+                    break
+                out_t.append(tset[idx])
+            return (true, out_t, "")
+        // shuffle / sample: seeded Fisher-Yates, then take n. The seed is
+        // host-supplied (per-evaluation), mixed with the node id so several
+        // random nodes in one script draw distinct streams.
+        shuffled = se_shuffle(tset, se_seed + id * 7919 + 1)
+        out_s: List<Element> = []
+        for idx2 = 0 to shuffled.length - 1
+            if idx2 >= n
+                break
+            out_s.append(shuffled[idx2])
+        return (true, out_s, "")
     if kind == "union"
         out: List<Element> = []
         seen: Set<text> = Set()
         for kid in kids[a]
-            kok, kset, kerr = se_eval(nodes, kids, kid, elements, recipes, env_names, env_values, newreg)
+            kok, kset, kerr = se_eval(nodes, kids, kid, elements, recipes, env_names, env_values, newreg, se_seed)
             if not kok
                 return (false, empty, kerr)
             for e2 in kset
                 se_append_unique(out, seen, e2)
         return (true, out, "")
     if kind == "diff" or kind == "intersect" or kind == "canrec" or kind == "cantrec"
-        lok, lset, lerr = se_eval(nodes, kids, a, elements, recipes, env_names, env_values, newreg)
+        lok, lset, lerr = se_eval(nodes, kids, a, elements, recipes, env_names, env_values, newreg, se_seed)
         if not lok
             return (false, empty, lerr)
-        rok, rset, rerr = se_eval(nodes, kids, b, elements, recipes, env_names, env_values, newreg)
+        rok, rset, rerr = se_eval(nodes, kids, b, elements, recipes, env_names, env_values, newreg, se_seed)
         if not rok
             return (false, empty, rerr)
         return (true, se_binary_setop(kind, lset, rset, recipes), "")
     return (false, empty, "Not a pure set expression: " + kind)
 
-func se_eval_num(nodes: List<(text, int, int, int, text)>, kids: List<List<int>>, id: int, elements: List<Element>, recipes: Map<text, List<(text, text)>>, env_names: List<text>, env_values: List<List<Element>>, newreg: List<Element>) -> (bool, int, text)
+func se_eval_num(nodes: List<(text, int, int, int, text)>, kids: List<List<int>>, id: int, elements: List<Element>, recipes: Map<text, List<(text, text)>>, env_names: List<text>, env_values: List<List<Element>>, newreg: List<Element>, se_seed: int) -> (bool, int, text)
     kind, a, b, c, sval = nodes[id]
     if kind == "num"
         return (true, a, "")
     if kind == "size"
-        sok, sset, serr = se_eval(nodes, kids, a, elements, recipes, env_names, env_values, newreg)
+        sok, sset, serr = se_eval(nodes, kids, a, elements, recipes, env_names, env_values, newreg, se_seed)
         if not sok
             return (false, 0, serr)
         return (true, sset.length, "")
     if kind == "narith"
-        lok, lv, lerr = se_eval_num(nodes, kids, a, elements, recipes, env_names, env_values, newreg)
+        lok, lv, lerr = se_eval_num(nodes, kids, a, elements, recipes, env_names, env_values, newreg, se_seed)
         if not lok
             return (false, 0, lerr)
-        rok, rv, rerr = se_eval_num(nodes, kids, b, elements, recipes, env_names, env_values, newreg)
+        rok, rv, rerr = se_eval_num(nodes, kids, b, elements, recipes, env_names, env_values, newreg, se_seed)
         if not rok
             return (false, 0, rerr)
         if sval == "+"
@@ -2047,11 +2170,11 @@ func se_eval_num(nodes: List<(text, int, int, int, text)>, kids: List<List<int>>
         return (true, lv - (lv / rv) * rv, "")
     return (false, 0, "Not a numeric expression: " + kind)
 
-func se_eval_cond(nodes: List<(text, int, int, int, text)>, kids: List<List<int>>, id: int, elements: List<Element>, recipes: Map<text, List<(text, text)>>, env_names: List<text>, env_values: List<List<Element>>, newreg: List<Element>) -> (bool, bool, text)
+func se_eval_cond(nodes: List<(text, int, int, int, text)>, kids: List<List<int>>, id: int, elements: List<Element>, recipes: Map<text, List<(text, text)>>, env_names: List<text>, env_values: List<List<Element>>, newreg: List<Element>, se_seed: int) -> (bool, bool, text)
     kind, a, b, c, sval = nodes[id]
     if kind == "or" or kind == "and"
         for kid in kids[a]
-            kok, ktruth, kerr = se_eval_cond(nodes, kids, kid, elements, recipes, env_names, env_values, newreg)
+            kok, ktruth, kerr = se_eval_cond(nodes, kids, kid, elements, recipes, env_names, env_values, newreg, se_seed)
             if not kok
                 return (false, false, kerr)
             if kind == "or" and ktruth
@@ -2060,10 +2183,10 @@ func se_eval_cond(nodes: List<(text, int, int, int, text)>, kids: List<List<int>
                 return (true, false, "")
         return (true, kind == "and", "")
     if kind == "cmp"
-        lok, lv, lerr = se_eval_num(nodes, kids, a, elements, recipes, env_names, env_values, newreg)
+        lok, lv, lerr = se_eval_num(nodes, kids, a, elements, recipes, env_names, env_values, newreg, se_seed)
         if not lok
             return (false, false, lerr)
-        rok, rv, rerr = se_eval_num(nodes, kids, b, elements, recipes, env_names, env_values, newreg)
+        rok, rv, rerr = se_eval_num(nodes, kids, b, elements, recipes, env_names, env_values, newreg, se_seed)
         if not rok
             return (false, false, rerr)
         if sval == ">="
@@ -2078,11 +2201,11 @@ func se_eval_cond(nodes: List<(text, int, int, int, text)>, kids: List<List<int>
             return (true, lv == rv, "")
         return (true, lv != rv, "")
     if kind == "size" or kind == "num" or kind == "narith"
-        nok, nv, nerr = se_eval_num(nodes, kids, id, elements, recipes, env_names, env_values, newreg)
+        nok, nv, nerr = se_eval_num(nodes, kids, id, elements, recipes, env_names, env_values, newreg, se_seed)
         if not nok
             return (false, false, nerr)
         return (true, nv != 0, "")
-    eok, eset, eerr = se_eval(nodes, kids, id, elements, recipes, env_names, env_values, newreg)
+    eok, eset, eerr = se_eval(nodes, kids, id, elements, recipes, env_names, env_values, newreg, se_seed)
     if not eok
         return (false, false, eerr)
     return (true, eset.length > 0, "")
@@ -2095,12 +2218,37 @@ func se_env_from_tuples(env_values: List<List<(text, text, bool)>>) -> List<List
         out.append(elements_from_tuples(tuples))
     return out
 
-export func script_eval_expr_boundary(nodes: List<(text, int, int, int, text)>, kids: List<List<int>>, id: int, elements: List<(text, text, bool)>, recipes: Map<text, List<(text, text)>>, env_names: List<text>, env_values: List<List<(text, text, bool)>>, newreg: List<(text, text, bool)>) -> (bool, List<(text, text, bool)>, text)
-    ok, result, err = se_eval(nodes, kids, id, elements_from_tuples(elements), recipes, env_names, se_env_from_tuples(env_values), elements_from_tuples(newreg))
+export func script_eval_expr_boundary(nodes: List<(text, int, int, int, text)>, kids: List<List<int>>, id: int, elements: List<(text, text, bool)>, recipes: Map<text, List<(text, text)>>, env_names: List<text>, env_values: List<List<(text, text, bool)>>, newreg: List<(text, text, bool)>, seed: int) -> (bool, List<(text, text, bool)>, text)
+    ok, result, err = se_eval(nodes, kids, id, elements_from_tuples(elements), recipes, env_names, se_env_from_tuples(env_values), elements_from_tuples(newreg), seed)
     return (ok, elements_to_tuples(result), err)
 
-export func script_eval_cond_boundary(nodes: List<(text, int, int, int, text)>, kids: List<List<int>>, id: int, elements: List<(text, text, bool)>, recipes: Map<text, List<(text, text)>>, env_names: List<text>, env_values: List<List<(text, text, bool)>>, newreg: List<(text, text, bool)>) -> (bool, bool, text)
-    return se_eval_cond(nodes, kids, id, elements_from_tuples(elements), recipes, env_names, se_env_from_tuples(env_values), elements_from_tuples(newreg))
+export func script_eval_cond_boundary(nodes: List<(text, int, int, int, text)>, kids: List<List<int>>, id: int, elements: List<(text, text, bool)>, recipes: Map<text, List<(text, text)>>, env_names: List<text>, env_values: List<List<(text, text, bool)>>, newreg: List<(text, text, bool)>, seed: int) -> (bool, bool, text)
+    return se_eval_cond(nodes, kids, id, elements_from_tuples(elements), recipes, env_names, se_env_from_tuples(env_values), elements_from_tuples(newreg), seed)
+
+export func script_eval_num_boundary(nodes: List<(text, int, int, int, text)>, kids: List<List<int>>, id: int, elements: List<(text, text, bool)>, recipes: Map<text, List<(text, text)>>, env_names: List<text>, env_values: List<List<(text, text, bool)>>, newreg: List<(text, text, bool)>, seed: int) -> (bool, int, text)
+    return se_eval_num(nodes, kids, id, elements_from_tuples(elements), recipes, env_names, se_env_from_tuples(env_values), elements_from_tuples(newreg), seed)
+
+// Take / shuffle / sample over already-evaluated tuple sets — hosts call
+// these when the inner expression was mutating (host-walked).
+export func script_take_tuples(items: List<(text, text, bool)>, n: int) -> List<(text, text, bool)>
+    out: List<(text, text, bool)> = []
+    if n <= 0
+        return out
+    for t in items
+        if out.length >= n
+            break
+        out.append(t)
+    return out
+
+export func script_sample_tuples(items: List<(text, text, bool)>, n: int, seed: int) -> List<(text, text, bool)>
+    shuffled = se_shuffle(elements_from_tuples(items), seed)
+    out: List<Element> = []
+    if n > 0
+        for e in shuffled
+            if out.length >= n
+                break
+            out.append(e)
+    return elements_to_tuples(out)
 
 // Order-preserving name-deduped union of two tuple sets — hosts use this to
 // fold products and to merge mutating union operands without re-implementing
@@ -2866,15 +3014,94 @@ test "script slash command validates and newset-pure is empty"
     ok, nodes, kids, muts, err, pos = script_parse("[ w* ]")
     assert ok
     kind, a, b, c2, sval = nodes[nodes.length - 1]
-    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg)
+    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg, 1)
     assert eok
     assert eset.length == 0
     // inner errors still surface
     ok, nodes, kids, muts, err, pos = script_parse("[ xyzzy ]")
     assert ok
     kind, a, b, c2, sval = nodes[nodes.length - 1]
-    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg)
+    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg, 1)
     assert not eok
+
+test "take shuffle sample postfixes"
+    els: List<(text, text, bool)> = [("A", "", false), ("B", "", false), ("C", "", false), ("D", "", false), ("E", "", false)]
+    recipes: Map<text, List<(text, text)>> = Map()
+    no_names: List<text> = []
+    no_vals: List<List<(text, text, bool)>> = []
+    no_reg: List<(text, text, bool)> = []
+    // (expr)N literal take: first N in set order
+    ok, nodes, kids, muts, err, pos = script_parse("(?*)3")
+    assert ok
+    kind, a, b, c, sval = nodes[nodes.length - 1]
+    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg, 1)
+    assert eok
+    assert eset.length == 3
+    n0, x0, y0 = eset[0]
+    assert n0 == "A"
+    // (expr)(num_expr) dynamic count with arithmetic and clamping
+    ok, nodes, kids, muts, err, pos = script_parse("(?*)(|?*| - 3)")
+    assert ok
+    kind, a, b, c, sval = nodes[nodes.length - 1]
+    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg, 1)
+    assert eok
+    assert eset.length == 2
+    ok, nodes, kids, muts, err, pos = script_parse("(?*)(|?*| - 99)")
+    kind, a, b, c, sval = nodes[nodes.length - 1]
+    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg, 1)
+    assert eok
+    assert eset.length == 0
+    // (expr)? shuffle: same members, deterministic per seed
+    ok, nodes, kids, muts, err, pos = script_parse("(?*)?")
+    assert ok
+    kind, a, b, c, sval = nodes[nodes.length - 1]
+    s1ok, s1, s1err = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg, 42)
+    s2ok, s2, s2err = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg, 42)
+    assert s1ok
+    assert s1.length == 5
+    for idx = 0 to 4
+        a1, w1, w2 = s1[idx]
+        a2, w3, w4 = s2[idx]
+        assert a1 == a2
+    // (expr)N? sample: n random members, deterministic per seed
+    ok, nodes, kids, muts, err, pos = script_parse("(?*)2?")
+    assert ok
+    kind, a, b, c, sval = nodes[nodes.length - 1]
+    p1ok, p1, p1err = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg, 7)
+    assert p1ok
+    assert p1.length == 2
+    // sample: deterministic per seed, members drawn from the set
+    p1bok, p1b, p1berr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg, 7)
+    assert p1bok
+    m0, q1, q2 = p1[0]
+    m0b, q3, q4 = p1b[0]
+    assert m0 == m0b
+    valid: Set<text> = Set()
+    for e in els
+        en, ee, ef = e
+        valid.add(en)
+    for se in p1
+        sn, se1, se2 = se
+        assert valid.has(sn)
+    // purity: takes of pure sets stay pure; count expressions must be pure
+    ok, nodes, kids, muts, err, pos = script_parse("(a*)5")
+    assert ok
+    assert not muts[nodes.length - 1]
+    assert runs_local("(a*)5 , (b*)3?")
+    ok, nodes, kids, muts, err, pos = script_parse("(a*)(|(b*)!|)")
+    assert not ok
+    // attachment: spaced or bare-word groups stay juxtaposition errors
+    ok, nodes, kids, muts, err, pos = script_parse("(a*) (5)")
+    assert not ok
+    ok, nodes, kids, muts, err, pos = script_parse("a*(5)")
+    assert not ok
+    // AST shapes
+    ok, nodes, kids, muts, err, pos = script_parse("((fire*)10?)!")
+    assert ok
+    assert script_ast_repr(nodes, kids, nodes.length - 1) == "(script (exhaust (sample pattern:fire* num:10)))"
+    ok, nodes, kids, muts, err, pos = script_parse("(fire*)(|water*|)")
+    assert ok
+    assert script_ast_repr(nodes, kids, nodes.length - 1) == "(script (take pattern:fire* (size pattern:water*)))"
 
 test "lucky pairs sampling"
     els: List<(text, text, bool)> = [("Water", "w", false), ("Fire", "f", false), ("Wind", "n", false), ("Earth", "e", false)]
@@ -2954,7 +3181,7 @@ test "script eval v0.6"
     assert ok
     kind, a, b, c, sval = nodes[nodes.length - 1]
     stmt = kids[a][0]
-    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, stmt, els, recipes, no_names, no_vals, no_reg)
+    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, stmt, els, recipes, no_names, no_vals, no_reg, 1)
     assert eok
     assert eset.length == 2
     n0, e0, f0 = eset[0]
@@ -2963,49 +3190,49 @@ test "script eval v0.6"
     ok, nodes, kids, muts, err, pos = script_parse("water")
     assert ok
     kind, a, b, c, sval = nodes[nodes.length - 1]
-    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg)
+    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg, 1)
     assert eok
     assert eset.length == 1
     ok, nodes, kids, muts, err, pos = script_parse("xyzzy")
     assert ok
     kind, a, b, c, sval = nodes[nodes.length - 1]
-    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg)
+    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg, 1)
     assert not eok
     // env shadowing: variable wins over element
     env_names: List<text> = ["water"]
     env_vals: List<List<(text, text, bool)>> = [[("Steam", "s", true), ("Mud", "m", false)]]
     ok, nodes, kids, muts, err, pos = script_parse("water")
     kind, a, b, c, sval = nodes[nodes.length - 1]
-    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, env_names, env_vals, no_reg)
+    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, env_names, env_vals, no_reg, 1)
     assert eok
     assert eset.length == 2
     // union dedup + order, diff, intersect
     ok, nodes, kids, muts, err, pos = script_parse("fire* , steam")
     kind, a, b, c, sval = nodes[nodes.length - 1]
-    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg)
+    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg, 1)
     assert eok
     assert eset.length == 3
     ok, nodes, kids, muts, err, pos = script_parse("fire* - firefly")
     kind, a, b, c, sval = nodes[nodes.length - 1]
-    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg)
+    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg, 1)
     assert eok
     assert eset.length == 1
     ok, nodes, kids, muts, err, pos = script_parse("fire* & firefly")
     kind, a, b, c, sval = nodes[nodes.length - 1]
-    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg)
+    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg, 1)
     assert eok
     assert eset.length == 1
     // canrec / cantrec: Fire has a known recipe with Water; Firefly has none
     ok, nodes, kids, muts, err, pos = script_parse("fire* / water")
     kind, a, b, c, sval = nodes[nodes.length - 1]
-    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg)
+    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg, 1)
     assert eok
     assert eset.length == 1
     n1, e1, f1 = eset[0]
     assert n1 == "Fire"
     ok, nodes, kids, muts, err, pos = script_parse("fire* % water")
     kind, a, b, c, sval = nodes[nodes.length - 1]
-    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg)
+    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg, 1)
     assert eok
     assert eset.length == 1
     n2, e2, f2 = eset[0]
@@ -3013,13 +3240,13 @@ test "script eval v0.6"
     // first filter and newreg
     ok, nodes, kids, muts, err, pos = script_parse("^(fire* , steam)")
     kind, a, b, c, sval = nodes[nodes.length - 1]
-    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg)
+    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg, 1)
     assert eok
     assert eset.length == 1
     reg: List<(text, text, bool)> = [("Mud", "m", false)]
     ok, nodes, kids, muts, err, pos = script_parse("[] , steam")
     kind, a, b, c, sval = nodes[nodes.length - 1]
-    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, reg)
+    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, reg, 1)
     assert eok
     assert eset.length == 2
     // conditions: sizes, arithmetic, modulo, truthiness, short-circuit
@@ -3029,28 +3256,28 @@ test "script eval v0.6"
     tern = kids[a][0]
     tk, ta, tb, tc, ts = nodes[tern]
     assert tk == "ternary"
-    cok, truth, cerr = script_eval_cond_boundary(nodes, kids, ta, els, recipes, no_names, no_vals, no_reg)
+    cok, truth, cerr = script_eval_cond_boundary(nodes, kids, ta, els, recipes, no_names, no_vals, no_reg, 1)
     assert cok
     assert truth
     ok, nodes, kids, muts, err, pos = script_parse("|fire*| % 2 == 0 && |steam*| == 1 ? {a} : {b}")
     kind, a, b, c, sval = nodes[nodes.length - 1]
     tern2 = kids[a][0]
     tk2, ta2, tb2, tc2, ts2 = nodes[tern2]
-    cok, truth, cerr = script_eval_cond_boundary(nodes, kids, ta2, els, recipes, no_names, no_vals, no_reg)
+    cok, truth, cerr = script_eval_cond_boundary(nodes, kids, ta2, els, recipes, no_names, no_vals, no_reg, 1)
     assert cok
     assert truth
     ok, nodes, kids, muts, err, pos = script_parse("nope* || |fire*| > 1 ? {a} : {b}")
     kind, a, b, c, sval = nodes[nodes.length - 1]
     tern3 = kids[a][0]
     tk3, ta3, tb3, tc3, ts3 = nodes[tern3]
-    cok, truth, cerr = script_eval_cond_boundary(nodes, kids, ta3, els, recipes, no_names, no_vals, no_reg)
+    cok, truth, cerr = script_eval_cond_boundary(nodes, kids, ta3, els, recipes, no_names, no_vals, no_reg, 1)
     assert cok
     assert truth
     ok, nodes, kids, muts, err, pos = script_parse("|a| / 0 > 1 ? {a} : {b}")
     kind, a, b, c, sval = nodes[nodes.length - 1]
     tern4 = kids[a][0]
     tk4, ta4, tb4, tc4, ts4 = nodes[tern4]
-    cok, truth, cerr = script_eval_cond_boundary(nodes, kids, ta4, els, recipes, no_names, no_vals, no_reg)
+    cok, truth, cerr = script_eval_cond_boundary(nodes, kids, ta4, els, recipes, no_names, no_vals, no_reg, 1)
     assert not cok
     // union tuple helper preserves order and dedups
     u = script_union_tuples([("A", "", false), ("B", "", false)], [("B", "x", true), ("C", "", false)])

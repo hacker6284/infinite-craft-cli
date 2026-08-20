@@ -272,3 +272,33 @@ class TestLucky:
         out = capsys.readouterr().out
         assert "No untried pairs found" in out
         client.pair.assert_not_called()
+
+
+class TestTakeSampleShuffle:
+    """(expr)N, (expr)(num), (expr)?, (expr)N? — v2.1."""
+
+    def test_take_literal_and_dynamic(self, capsys):
+        _run("(?*)2 ; (?*)(|?*| - 3)")
+        out = capsys.readouterr().out
+        # base save has 4 elements: first 2, then first 1
+        assert out.count("💧") + out.count("🔥") + out.count("🌬️") + out.count("🌍") == 3
+
+    def test_shuffle_and_sample_echo(self, capsys):
+        _run("(?*)? ; (?*)2?")
+        out = capsys.readouterr().out
+        lines = [l for l in out.strip().split("\n") if l.strip().startswith(("💧", "🔥", "🌬️", "🌍"))]
+        assert len(lines) == 6  # 4 shuffled + 2 sampled
+
+    def test_take_of_mutating_inner(self, capsys):
+        client = make_mock_client()
+        client.pair.return_value = MockElement("Steam", "💨")
+        _run("(water + fire)1", client=client)
+        out = capsys.readouterr().out
+        assert "Steam" in out
+
+    def test_count_purity_enforced(self, capsys):
+        client = make_mock_client()
+        _run("(a*)(|(b*)!|)", client=client)
+        out = capsys.readouterr().out
+        assert "Script error" in out
+        client.pair.assert_not_called()

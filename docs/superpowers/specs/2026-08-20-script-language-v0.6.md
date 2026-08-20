@@ -107,8 +107,13 @@ multiplicative ::= crawl (("*" | "/" | "%" | "&") crawl)*
 crawl      ::= postfix ("++" postfix)*
 postfix    ::= primary
              | "(" expr ")" ("*" | "**" | "!")   // permute / permutate / exhaust
+             | postfix count                     // take: (expr)100  (expr)(num_expr)
+             | postfix count "?"                 // sample: (expr)100?  (expr)(num_expr)?
+             | postfix "?"                       // shuffle: (expr)?
              | "[" expr "]"                      // new-elements of expr (standalone brackets)
              | "[]"                              // new-elements register (§5.4)
+count      ::= DIGITS                            // attached, no whitespace
+             | "(" num_expr ")"                  // attached; full cond-grade arithmetic
 primary    ::= pattern                           // shape rule: §4.2
              | string                            // quoted element reference
              | ident                             // variable (then element) §4.3
@@ -184,6 +189,20 @@ snapshot it first (`before := fire*`).
 - `A / B` — elements of A having a **known recipe** with some element of B.
   `A % B` — its complement (A minus `A / B`). Recipe-index-based; no API
   calls, no mutation, deterministic. **[D-13]**
+- **Take / sample / shuffle (v0.6.2)** — postfix forms attached to `)`,
+  `]`, `[]`, or another postfix, mirroring the `*`/`**`/`!` family:
+  `(S)n` = first `min(n, |S|)` elements in set order; `(S)n?` = `n`
+  uniformly random elements (shuffle-then-take, without replacement);
+  `(S)?` = the whole set shuffled. Counts are attached digits or an
+  attached parenthesized numeric expression (`(fire*)(|water*| - 3)`)
+  with the condition sublanguage's grammar; count expressions are
+  statically pure (same check as conditions); `n ≤ 0` yields the empty
+  set. All three are non-mutating (mutation flag inherits from the
+  inner expression). Randomness is host-seeded: the kernel is
+  deterministic given the seed (hosts pass a clock-derived seed that
+  advances per evaluation, so loop iterations resample); under test,
+  fixed seeds pin exact outputs. A spaced `(expr) (5)` or word-adjacent
+  `a*(5)` group remains a juxtaposition error — counts attach.
 - `A + B` with a non-singleton operand is a **runtime error** ("use `,` to
   collect or `*` to cross"). `+` never unions. Self-pairs (`fire + fire`)
   are legal. **[D-14]**

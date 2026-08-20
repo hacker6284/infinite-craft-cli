@@ -45,6 +45,9 @@ import {
   script_parse as scriptParse,
   script_eval_expr_boundary as scriptEvalExprBoundary,
   script_eval_cond_boundary as scriptEvalCondBoundary,
+  script_eval_num_boundary as scriptEvalNumBoundary,
+  script_take_tuples as scriptTakeTuples,
+  script_sample_tuples as scriptSampleTuples,
   script_set_op_boundary as scriptSetOpBoundary,
   script_union_tuples as scriptUnionTuples,
   is_known_slash_command as isKnownSlashCommand,
@@ -1046,10 +1049,15 @@ function scriptBind(S, name, set) {
   top.push({ name, set });
 }
 
+function scriptSeed(S) {
+  S.seedTick += 1;
+  return (S.seedBase + S.seedTick * 7919) % 2147483648;
+}
+
 function scriptKernelEval(S, id) {
   const [names, values] = scriptEnvFlat(S);
   const [ok, set, err] = scriptEvalExprBoundary(
-    S.nodes, S.kids, id, elementTuples(), recipeIndex, names, values, scriptNewReg);
+    S.nodes, S.kids, id, elementTuples(), recipeIndex, names, values, scriptNewReg, scriptSeed(S));
   if (!ok) throw scriptFail(err);
   return set;
 }
@@ -1057,9 +1065,17 @@ function scriptKernelEval(S, id) {
 function scriptKernelCond(S, id) {
   const [names, values] = scriptEnvFlat(S);
   const [ok, truth, err] = scriptEvalCondBoundary(
-    S.nodes, S.kids, id, elementTuples(), recipeIndex, names, values, scriptNewReg);
+    S.nodes, S.kids, id, elementTuples(), recipeIndex, names, values, scriptNewReg, scriptSeed(S));
   if (!ok) throw scriptFail(err);
   return truth;
+}
+
+function scriptKernelNum(S, id) {
+  const [names, values] = scriptEnvFlat(S);
+  const [ok, value, err] = scriptEvalNumBoundary(
+    S.nodes, S.kids, id, elementTuples(), recipeIndex, names, values, scriptNewReg, scriptSeed(S));
+  if (!ok) throw scriptFail(err);
+  return value;
 }
 
 // AST-node granularity: each completed mutating node overwrites the []
@@ -1163,6 +1179,13 @@ async function scriptEval(S, id) {
   if (kind === "first") {
     const v = await scriptEvalOperand(S, a);
     return v.filter((t) => !!t[2]);
+  }
+  if (kind === "take" || kind === "sample" || kind === "shuffle") {
+    // Mutating inner: host walks it, then the kernel slices/samples.
+    const v = await scriptEvalOperand(S, a);
+    if (kind === "take") return scriptTakeTuples(v, scriptKernelNum(S, b));
+    const n = kind === "shuffle" ? v.length : scriptKernelNum(S, b);
+    return scriptSampleTuples(v, n, scriptSeed(S));
   }
   if (kind === "newset") {
     const collector = [];
@@ -1368,7 +1391,12 @@ async function runScript(source) {
     print("  " + red(`Script error: ${esc(err)}`));
     return;
   }
-  const S = { nodes, kids, muts, frames: [[]], collectors: [], loopDepth: 0 };
+  const S = {
+    nodes, kids, muts, frames: [[]], collectors: [], loopDepth: 0,
+    // Host-supplied randomness: deterministic kernel, clock-seeded host.
+    // The tick advances per kernel call so loop iterations resample.
+    seedBase: Date.now() % 2147483648, seedTick: 0,
+  };
   try {
     beginRun();
     const root = nodes.length - 1;
@@ -1946,6 +1974,7 @@ function doHelp() {
     ${cyan("a* , b*")}                     Union   ${cyan("a* - b*")} difference   ${cyan("a* & b*")} intersect
     ${cyan("a* / b*")}                     Keep a* having a known recipe with b* (${cyan("%")} = lacking)
     ${cyan("(expr)*  (expr)**  (expr)!")}  Permute / permutate / exhaust the set
+    ${cyan("(expr)100  (expr)100?  (expr)?")}  First 100 / random 100 / shuffle ((expr)(|x*|) = dynamic)
     ${cyan("[ expr ]")} / ${cyan("[]")}             New elements made by expr / by the last operation
     ${cyan("^(expr)")}                     First discoveries only
     ${cyan("set @ body")} / ${cyan("set @x body")}  For each element (as ${cyan("_")} or ${cyan("x")}) run body
