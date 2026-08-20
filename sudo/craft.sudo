@@ -795,6 +795,30 @@ export func is_known_slash_command(line: text) -> bool
             return true
     return false
 
+// v2.0.1: pure, loop-free scripts run like local commands — a bare query
+// such as `/steam|mist/` or `a* , b*` cannot touch the save and should not
+// wait behind a running bulk command (matching /search's interleaving).
+// Loops (until/while/foreach) always queue: the queue's cancel machinery is
+// the only brake on an unbounded pure loop.
+export func runs_local(line: text) -> bool
+    if is_local_command(line)
+        return true
+    stripped = strip_spaces(line)
+    if stripped.length == 0
+        return false
+    if is_known_slash_command(stripped) or is_ib_command(stripped)
+        return false
+    ok, nodes, kids, muts, err, pos = script_parse(stripped)
+    if not ok or nodes.length == 0
+        return false
+    if muts[nodes.length - 1]
+        return false
+    for node in nodes
+        kind, a, b, c, sval = node
+        if kind == "until" or kind == "while" or kind == "foreach"
+            return false
+    return true
+
 // Host queue routing: "local" | "ib" | "pair".
 // Local runs immediately; ib and pair are independent FIFO workers.
 export func command_queue_lane(line: text) -> text
@@ -1036,8 +1060,10 @@ func sl_is_reserved(c: int) -> bool
 
 // Characters allowed immediately AFTER a standalone operator (besides
 // whitespace/EOF): openers of the constructs an operand can start with.
+// '^' is deliberately NOT here: `/^best /` after a boundary must lex as a
+// regex pattern, not op-slash + junk (write `a / ^(b)` with the space).
 func sl_op_after_ok(c: int) -> bool
-    return c == '(' or c == '{' or c == '[' or c == '|' or c == '^' or c == 34 or c == 39
+    return c == '(' or c == '{' or c == '[' or c == '|' or c == 34 or c == 39
 
 // Longest-first standalone operator match at position i (which must be a
 // token boundary). Returns (spelling, next_index) or ("", i) on no match.
@@ -1448,6 +1474,12 @@ func sp_parse_mul(tokens: List<(text, text, int)>, i: int, depth: int, nodes: in
         return (-1, 0, err, epos, false)
     while sp_is_op(tokens, ni, "*") or sp_is_op(tokens, ni, "/") or sp_is_op(tokens, ni, "%") or sp_is_op(tokens, ni, "&")
         op = sp_tok_sval(tokens, ni)
+        // `Best *` reads as cross-with-nothing: a standalone * is the cross
+        // operator. Point at the two pattern spellings instead.
+        if op == "*"
+            nk = sp_tok_kind(tokens, ni + 1)
+            if nk == ")" or nk == "]" or nk == "}" or nk == ";" or nk == "|" or nk == ""
+                return (-1, 0, "A standalone * is the cross operator - for a pattern like Best * write Best ?* (attached wildcard) or a regex /^best /", sp_tok_pos(tokens, ni), false)
         right, ri, rerr, repos, unusedw = sp_parse_crawl(tokens, ni + 1, depth + 1, nodes, kids, muts, binders)
         if rerr.length > 0
             return (-1, 0, rerr, repos, false)
@@ -2777,6 +2809,24 @@ test "script slash command validates and newset-pure is empty"
     eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg)
     assert not eok
 
+test "runs_local: pure loop-free scripts are immediate"
+    assert runs_local("/search fire*")
+    assert runs_local("/.* .*/")
+    assert runs_local("fire* , water*")
+    assert runs_local("x := a* - b* ; x")
+    assert runs_local("^(steam*)")
+    assert runs_local("[ w* ]")
+    assert runs_local("|a*| > 2 ? {steam} : {mud}")
+    assert not runs_local("fire + water")
+    assert not runs_local("(fire*)*")
+    assert not runs_local("{ x := w* } -> |zzz*| > 0")
+    assert not runs_local("w* @x { x , steam }")
+    assert not runs_local("/exhaust fire*")
+    assert not runs_local("/import Steam")
+    assert not runs_local("/script run.ice")
+    assert not runs_local("/notacommand")
+    assert not runs_local("")
+
 test "known slash command dispatch"
     assert is_known_slash_command("/help")
     assert is_known_slash_command("/exhaust fire*")
@@ -2965,6 +3015,23 @@ test "script parser v0.6"
     ok, nodes, kids, muts, err, pos = script_parse("(w*) !")
     assert not ok
     assert strings.starts_with(err, "Postfix operators attach")
+    // space-star patterns: `(Best *)!` works (star attached to `)` stays
+    // pattern material) but the bare and size-bar forms hit the cross
+    // operator — those get the targeted hint
+    ok, nodes, kids, muts, err, pos = script_parse("(Best *)!")
+    assert ok
+    assert script_ast_repr(nodes, kids, nodes.length - 1) == "(script (exhaust pattern:Best *))"
+    ok, nodes, kids, muts, err, pos = script_parse("Best *")
+    assert not ok
+    assert strings.starts_with(err, "A standalone * is the cross operator")
+    ok, nodes, kids, muts, err, pos = script_parse("|Best *| > 25 ? {a} : {b}")
+    assert not ok
+    assert strings.starts_with(err, "A standalone * is the cross operator")
+    ok, nodes, kids, muts, err, pos = script_parse("(Best ?*)! -> |Best ?*| > 25")
+    assert ok
+    assert script_ast_repr(nodes, kids, nodes.length - 1) == "(script (until (exhaust pattern:Best ?*) (cmp > (size pattern:Best ?*) num:25)))"
+    ok, nodes, kids, muts, err, pos = script_parse("(/^best /)! -> |/^best /| > 25")
+    assert ok
     ok, nodes, kids, muts, err, pos = script_parse("x := ")
     assert not ok
     ok, nodes, kids, muts, err, pos = script_parse("water +| fire*")
@@ -2999,6 +3066,9 @@ test "script tokenizer v0.6"
     ok, toks, err, pos = script_tokenize("\u{22}salt, pepper\u{22} + fire")
     assert ok
     assert script_tokens_repr(toks) == "str:salt, pepper\u{a7}op:+\u{a7}word:fire"
+    ok, toks, err, pos = script_tokenize("(/^best /)! ; a* / ^(b*)")
+    assert ok
+    assert script_tokens_repr(toks) == "(\u{a7}word:/^best /\u{a7})\u{a7}post:!\u{a7};\u{a7}word:a*\u{a7}op:/\u{a7}^(\u{a7}word:b*\u{a7})"
     ok, toks, err, pos = script_tokenize("/steam engine/ + x")
     assert ok
     assert script_tokens_repr(toks) == "word:/steam engine/\u{a7}op:+\u{a7}word:x"

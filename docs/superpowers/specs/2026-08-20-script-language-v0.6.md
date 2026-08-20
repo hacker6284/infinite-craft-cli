@@ -21,7 +21,12 @@ implementation contract for both hosts (Python CLI and browser trainer).
   `/import`). Non-interactive CLI: `infinite-craft script "<source>"` and
   `infinite-craft script -f <path>`.
 - A script executes in the **pair lane** (queued, one at a time, shown in job
-  chrome), like any bulk command.
+  chrome), like any bulk command — **except pure, loop-free scripts**
+  (v0.6.2): a script whose parse shows no mutating operation and no
+  until/while/for-each runs immediately, interleaving with a running
+  command exactly like `/search` always has. Loops always queue, even pure
+  ones: the queue's cancel machinery is the only brake on an unbounded
+  pure loop.
 
 ## 1. Lexical elements
 

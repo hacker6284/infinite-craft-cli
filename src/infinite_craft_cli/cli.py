@@ -3697,7 +3697,14 @@ async def interactive_mode():
                         if line in ("/quit", "/exit"):
                             await _shutdown_interactive()
                             break
-                        if craft.is_local_command(line):
+                        if craft.is_local_command(line) or (
+                            craft.runs_local(line)
+                            and not _waiting_for_confirm()
+                            and not _bulk_confirm_pending
+                        ):
+                            # Pure scripts interleave like locals, but never
+                            # while a confirm waits: "y" parses as a pure
+                            # script and must reach the confirm router.
                             _echo_submitted_command(line)
                             await _dispatch_line(client, storage, line)
                             continue
@@ -3728,7 +3735,11 @@ async def interactive_mode():
                     await _shutdown_interactive()
                     break
 
-                if craft.is_local_command(line):
+                if craft.is_local_command(line) or (
+                    craft.runs_local(line)
+                    and not _waiting_for_confirm()
+                    and not _bulk_confirm_pending
+                ):
                     _echo_submitted_command(line)
                     await _dispatch_line(client, storage, line)
                     continue

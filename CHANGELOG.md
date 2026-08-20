@@ -1,5 +1,18 @@
 # Changelog
 
+## [2.0.1] - 2026-08-20
+
+### Changed
+- **Pure, loop-free scripts now run immediately instead of queueing.**
+  A bare query line (`/steam|mist/`, `fire* , water*`, `x := a* - b*`)
+  cannot touch the save, so it now interleaves with a running bulk
+  command exactly like `/search` always has — previously it waited in
+  the pair queue behind whatever was running. The decision is the
+  kernel's (`runs_local`): statically pure AND no until/while/for-each.
+  Loops always queue, even pure ones — the queue's Stop/Ctrl-C machinery
+  is the only brake on an unbounded pure loop. In the trainer this also
+  applies while a confirm prompt is open, matching local commands.
+
 ## [2.0.0] - 2026-08-20
 
 ### Added

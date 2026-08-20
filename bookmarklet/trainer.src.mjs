@@ -47,6 +47,7 @@ import {
   script_set_op_boundary as scriptSetOpBoundary,
   script_union_tuples as scriptUnionTuples,
   is_known_slash_command as isKnownSlashCommand,
+  runs_local as runsLocal,
   fetch_timeout_ms as fetchTimeoutMs,
   pair_should_retry as pairShouldRetry,
   pair_retry_backoff_ms as pairRetryBackoffMs,
@@ -994,7 +995,7 @@ function waitForConfirmKey() {
           e.stopImmediatePropagation();
           return; // blank Enter ignored
         }
-        if (isLocalCommand(val)) return; // main handler runs locals
+        if (!isConfirmAnswer(val) && runsLocal(val)) return; // main handler runs locals + pure scripts; y/n stays here
         e.preventDefault();
         e.stopImmediatePropagation();
         if (input) input.value = "";
@@ -2273,7 +2274,9 @@ async function executeCommand(line) {
 }
 
 async function dispatch(line) {
-  if (isLocalCommand(line)) {
+  // Pure, loop-free scripts run immediately, like /search — they cannot
+  // touch the save and should not wait behind a running bulk command.
+  if (runsLocal(line)) {
     await executeCommand(line);
     return;
   }
@@ -2408,7 +2411,9 @@ function initBrowserUI() {
     // During confirm the capture handler owns y/n/Esc/API enqueue; allow
     // local commands (e.g. /search, /list) through here on Enter.
     if (waitingForConfirm) {
-      if (e.key !== "Enter" || !isLocalCommand(input.value.trim())) return;
+      if (e.key !== "Enter") return;
+      const confirmVal = input.value.trim();
+      if (!runsLocal(confirmVal) || isConfirmAnswer(confirmVal)) return;
     }
     if (e.key === "Enter") {
       const line = input.value.trim();
