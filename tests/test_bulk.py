@@ -139,7 +139,7 @@ class TestDoCross:
         client.pair.return_value = nothing
         run_async(do_cross(client, storage, "/^fi/", "/^wa/"))
         captured = capsys.readouterr()
-        assert "unique pairs" in captured.out or "pairs" in captured.out.lower()
+        assert "unique pair" in captured.out or "pair" in captured.out.lower()
 
 
 class TestDoPermute:
@@ -159,7 +159,7 @@ class TestDoPermute:
         client.pair.return_value = nothing
         run_async(do_permute(client, storage, "w*"))
         captured = capsys.readouterr()
-        assert "pairs" in captured.out.lower()
+        assert "pair" in captured.out.lower()
 
 
 class TestDoCrawl:

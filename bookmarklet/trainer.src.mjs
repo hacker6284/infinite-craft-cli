@@ -1100,7 +1100,10 @@ async function scriptCombinePair(S, aT, bT) {
 // Bulk pairs through the existing pipeline (confirms, /auto, rate, target,
 // pair-level error resilience) with product/new collection on top.
 async function scriptRunPairs(S, objPairs, reason) {
-  if (!objPairs.length) return { products: [], news: [] };
+  if (!objPairs.length) {
+    print("  " + dim("0 pairs — nothing to combine."));
+    return { products: [], news: [] };
+  }
   if (bulkConfirmRequired(objPairs.length, BULK_WARN, autoApprove)) {
     if (!(await confirmOrCancel([], { reason }))) throw scriptFail("Cancelled");
   } else if (autoApprove && shouldBulkWarn(objPairs.length, BULK_WARN)) {
@@ -1420,7 +1423,7 @@ async function doExhaust(query) {
     print(`  No valid pairs for query: ${esc(query)}`);
     return;
   }
-  print(`  Exhausting ${matches.length} element(s) matching ${yellow(esc(query))} with all discoveries (${pairs.length} pairs)...`);
+  print(`  Exhausting ${matches.length} element${matches.length === 1 ? "" : "s"} matching ${yellow(esc(query))} with all discoveries (${pairs.length} pair${pairs.length === 1 ? "" : "s"})...`);
   if (matches.length <= 10) {
     for (const m of matches) print(`    ${formatElement(m)}`);
   }
@@ -1492,7 +1495,7 @@ async function doPermute(query) {
     return;
   }
   const pairs = pairsFromBoundary(permutePairsBoundary(toTuples(matches)));
-  print(`  ${matches.length} elements match, ${pairs.length} unique pairs:`);
+  print(`  ${matches.length} element${matches.length === 1 ? "" : "s"} match, ${pairs.length} unique pair${pairs.length === 1 ? "" : "s"}:`);
   for (const m of matches) print(`    ${formatElement(m)}`);
   await confirmAndRunPairs(pairs);
 }
@@ -1546,7 +1549,7 @@ async function doPermutate(query) {
       }
     }
     if (stopped) print("  " + yellow("Stopped."));
-    else print(`  Permutate done after ${round} round(s).`);
+    else print(`  Permutate done after ${round} round${round === 1 ? "" : "s"}.`);
   } finally {
     endRun();
   }
@@ -1570,7 +1573,7 @@ async function doCross(leftQ, rightQ) {
   const rightPreview = right.slice(0, 10).map(e => e.text).join(", ");
   print(`  Left (${left.length}): ${esc(leftPreview)}${left.length > 10 ? "..." : ""}`);
   print(`  Right (${right.length}): ${esc(rightPreview)}${right.length > 10 ? "..." : ""}`);
-  print(`  ${pairs.length} unique pairs`);
+  print(`  ${pairs.length} unique pair${pairs.length === 1 ? "" : "s"}`);
   await confirmAndRunPairs(pairs);
 }
 
@@ -1727,7 +1730,7 @@ async function doFill() {
   const stillMissing = new Set(unfilledNamesBoundary(elementTuples(), recipeIndex));
   const missing = elements.filter(e => stillMissing.has(e.text));
   if (!missing.length) { print("  All elements have recipes."); return; }
-  print(`  ${yellow(String(missing.length))} elements missing recipes. Fetching from Infinibrowser...`);
+  print(`  ${yellow(String(missing.length))} element${missing.length === 1 ? "" : "s"} missing recipes. Fetching from Infinibrowser...`);
   let filled = 0, errors = 0, skipped = 0;
   try {
     beginRun();
@@ -1773,7 +1776,7 @@ function doUnfilled() {
   const missingNames = new Set(unfilledNamesBoundary(elementTuples(), recipeIndex));
   const missing = elements.filter(e => missingNames.has(e.text));
   if (!missing.length) { print("  All elements have recipes."); return; }
-  print(`  ${yellow(String(missing.length))} elements without recipes:`);
+  print(`  ${yellow(String(missing.length))} element${missing.length === 1 ? "" : "s"} without recipes:`);
   for (const el of missing) print("  " + formatElement(el));
 }
 

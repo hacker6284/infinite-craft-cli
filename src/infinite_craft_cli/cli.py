@@ -610,7 +610,7 @@ async def do_exhaust(client, storage, query: str):
         return
 
     _repl_print_lines(
-        f"  Exhausting {len(matches)} element(s) matching {_color(query, YELLOW)} "
+        f"  Exhausting {len(matches)} element{'' if len(matches) == 1 else 's'} matching {_color(query, YELLOW)} "
         f"with all discoveries ({len(pairs)} pairs)..."
     )
     if len(matches) <= 10:
@@ -2003,7 +2003,10 @@ async def do_permute(client, storage, query: str):
     pairs = _pairs_from_boundary(
         craft.permute_pairs_boundary(_elements_to_boundary(matches)), matches
     )
-    _repl_print_lines(f"  {n} elements match, {len(pairs)} unique pairs:")
+    _repl_print_lines(
+        f"  {n} element{'' if n == 1 else 's'} match, "
+        f"{len(pairs)} unique pair{'' if len(pairs) == 1 else 's'}:"
+    )
     for m in matches:
         _repl_print_lines(f"    {format_element(m)}")
     await _confirm_and_run_pairs(client, storage, pairs)
@@ -2088,7 +2091,9 @@ async def do_permutate(client, storage, query: str):
                 _repl_print_lines("  Stopped early.")
                 _mark_cancel_notified()
         else:
-            _repl_print_lines(f"  Permutate done after {round_num} round(s).")
+            _repl_print_lines(
+                f"  Permutate done after {round_num} round{'' if round_num == 1 else 's'}."
+            )
     finally:
         _confirm_expected = False
         _confirm_answer_buffer = None
@@ -2132,7 +2137,7 @@ async def do_cross(client, storage, left_query: str, right_query: str):
         f"  Right ({len(right)}): "
         f"{', '.join(format_element(e) for e in right[:10])}{'...' if len(right) > 10 else ''}"
     )
-    _repl_print_lines(f"  {len(pairs)} unique pairs")
+    _repl_print_lines(f"  {len(pairs)} unique pair{'' if len(pairs) == 1 else 's'}")
     await _confirm_and_run_pairs(client, storage, pairs)
 
 
@@ -2293,7 +2298,7 @@ async def _fill_missing_recipes_async(storage):
 
     total = len(missing)
     _repl_print_lines(
-        f"  {total} elements missing recipes. Fetching from Infinibrowser..."
+        f"  {total} element{'' if total == 1 else 's'} missing recipes. Fetching from Infinibrowser..."
     )
     _repl_print_lines("  (Ctrl+C to stop early)")
     fetched = 0
@@ -2370,7 +2375,7 @@ def do_unfilled(storage) -> str:
     missing = [e for e in discoveries if e.name in missing_names]
     if not missing:
         return "  All elements have recipes."
-    lines = [f"  {len(missing)} elements without recipes:"]
+    lines = [f"  {len(missing)} element{'' if len(missing) == 1 else 's'} without recipes:"]
     for e in missing:
         lines.append(f"    {format_element(e)}")
     return "\n".join(lines)
@@ -2978,6 +2983,8 @@ def _script_pairs_from_raw(raw_pairs):
 async def _script_run_pairs(S, client, storage, pairs, reason):
     global _bulk_confirm_resolved
     if not pairs:
+        _bulk_confirm_resolved = True
+        _repl_print_lines("  0 pairs — nothing to combine.")
         return [], []
     if craft.bulk_confirm_required(len(pairs), _BULK_WARN_THRESHOLD, _auto_approve):
         if not _interactive_mode_active:

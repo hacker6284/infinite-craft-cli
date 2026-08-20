@@ -1763,6 +1763,12 @@ func sp_parse_script_nodes(tokens: List<(text, text, int)>, i: int, depth: int, 
             break
         if in_block and sp_tok_kind(tokens, ni) == "}"
             break
+        // A spaced postfix — `(w*) !` — lexes as the all-elements pattern
+        // "!" (or word "**"); point at the attachment rule instead of the
+        // generic separator message.
+        stray = sp_tok_sval(tokens, ni)
+        if sp_tok_kind(tokens, ni) == "word" and (stray == "!" or stray == "**")
+            return sp_err("Postfix operators attach directly to ) or ]: write (expr)" + stray + " with no space", sp_tok_pos(tokens, ni))
         return sp_err("Expected ; between statements", sp_tok_pos(tokens, ni))
     kidx = kids.length
     kids.append(ids)
@@ -2956,6 +2962,9 @@ test "script parser v0.6"
     assert script_ast_repr(nodes, kids, nodes.length - 1) == "(script ref:fire water)"
     ok, nodes, kids, muts, err, pos = script_parse("(a) (b)")
     assert not ok
+    ok, nodes, kids, muts, err, pos = script_parse("(w*) !")
+    assert not ok
+    assert strings.starts_with(err, "Postfix operators attach")
     ok, nodes, kids, muts, err, pos = script_parse("x := ")
     assert not ok
     ok, nodes, kids, muts, err, pos = script_parse("water +| fire*")
