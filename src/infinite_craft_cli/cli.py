@@ -1150,6 +1150,9 @@ def _repl_print(*args, **kwargs):
     """Print into the scroll region without clobbering the pinned prompt."""
     file = kwargs.get("file", sys.stdout)
     if file is not sys.stdout or not _chrome_enabled:
+        # Non-tty stdout is block-buffered; flush so piped/scripted runs see
+        # progress as it happens (stress-test finding S3).
+        kwargs.setdefault("flush", True)
         _builtin_print(*args, **kwargs)
         return
 
@@ -2977,7 +2980,14 @@ async def _script_run_pairs(S, client, storage, pairs, reason):
     if not pairs:
         return [], []
     if craft.bulk_confirm_required(len(pairs), _BULK_WARN_THRESHOLD, _auto_approve):
-        if not await _prompt_continue(bulk_pending=True, reason=reason):
+        if not _interactive_mode_active:
+            # Non-interactive runs have no y/n; announce instead of silently
+            # burning budget (stress-test finding S3).
+            _repl_print_lines(
+                f"  {len(pairs)} pairs (over {_BULK_WARN_THRESHOLD}) — "
+                "non-interactive run proceeds without confirm."
+            )
+        elif not await _prompt_continue(bulk_pending=True, reason=reason):
             raise CommandCancelled()
         _bulk_confirm_resolved = True
     else:
@@ -3153,6 +3163,16 @@ async def _script_exec_stmts(S, client, storage, kids_idx):
         await _script_exec_stmt(S, client, storage, stmt)
 
 
+async def _script_exec_loop_body(S, client, storage, node_id):
+    """Loop bodies run in the loop's own frame: a braced block gets no extra
+    child scope here, so its walrus bindings reach the condition."""
+    kind, a, b, c, sval = S.nodes[node_id]
+    if kind == "block":
+        await _script_exec_stmts(S, client, storage, a)
+        return
+    await _script_exec_stmt(S, client, storage, node_id)
+
+
 async def _script_exec_stmt(S, client, storage, node_id):
     _raise_if_cancelled()
     kind, a, b, c, sval = S.nodes[node_id]
@@ -3179,30 +3199,36 @@ async def _script_exec_stmt(S, client, storage, node_id):
             finally:
                 S.frames.pop()
         return
-    if kind == "until":
-        iters = 0
-        while True:
-            await _script_exec_stmt(S, client, storage, a)
-            iters += 1
-            _raise_if_cancelled()
-            if _script_kernel_cond(S, storage, b):
-                break
-        plural = "" if iters == 1 else "s"
-        _repl_print_lines(_color(f"  loop: condition met after {iters} iteration{plural}", DIM))
-        return
-    if kind == "while":
-        iters = 0
-        while True:
-            _raise_if_cancelled()
-            if not _script_kernel_cond(S, storage, b):
-                break
-            await _script_exec_stmt(S, client, storage, a)
-            iters += 1
-        if iters == 0:
-            _repl_print_lines(_color("  ~ loop: condition false, body skipped", DIM))
-        else:
-            plural = "" if iters == 1 else "s"
-            _repl_print_lines(_color(f"  ~ loop: stopped after {iters} iteration{plural}", DIM))
+    if kind in ("until", "while"):
+        # A loop owns ONE scope shared by its body and condition: bindings
+        # made by the body (braced or not) are visible to the test — the
+        # spec's `{ n := [ ... ] } -> |n| < 2` idiom depends on it.
+        S.frames.append([])
+        try:
+            iters = 0
+            if kind == "until":
+                while True:
+                    await _script_exec_loop_body(S, client, storage, a)
+                    iters += 1
+                    _raise_if_cancelled()
+                    if _script_kernel_cond(S, storage, b):
+                        break
+                plural = "" if iters == 1 else "s"
+                _repl_print_lines(_color(f"  loop: condition met after {iters} iteration{plural}", DIM))
+            else:
+                while True:
+                    _raise_if_cancelled()
+                    if not _script_kernel_cond(S, storage, b):
+                        break
+                    await _script_exec_loop_body(S, client, storage, a)
+                    iters += 1
+                if iters == 0:
+                    _repl_print_lines(_color("  ~ loop: condition false, body skipped", DIM))
+                else:
+                    plural = "" if iters == 1 else "s"
+                    _repl_print_lines(_color(f"  ~ loop: stopped after {iters} iteration{plural}", DIM))
+        finally:
+            S.frames.pop()
         return
     if kind == "ternary":
         truth = _script_kernel_cond(S, storage, a)
@@ -3218,19 +3244,23 @@ async def _script_exec_stmt(S, client, storage, node_id):
             )
 
 
-async def _run_script(client, storage, source: str) -> None:
+async def _run_script(client, storage, source: str) -> bool:
+    """Execute a script. Returns True when it ran to completion."""
     ok, nodes, kids, muts, err, pos = craft.script_parse(source)
     if not ok:
         _repl_print_lines(f"  {_color(f'Script error: {_tty(err)}', RED)}")
-        return
+        return False
     S = _ScriptState(nodes, kids, muts)
     try:
         root = len(nodes) - 1
         await _script_exec_stmts(S, client, storage, nodes[root][1])
     except CommandCancelled:
         _repl_print_lines(f"  {_color('Cancelled.', YELLOW)}")
+        return False
     except ScriptError as e:
         _repl_print_lines(f"  {_color(f'Script aborted: {_tty(str(e))}', RED)}")
+        return False
+    return True
 
 
 async def _dispatch_line(client, storage, line: str) -> None:
@@ -3747,10 +3777,15 @@ async def noninteractive_mode(args):
                 await do_with(client, storage, args.element, args.query)
             elif args.command == "script":
                 if args.file:
-                    source = Path(args.file).expanduser().read_text(encoding="utf-8")
+                    try:
+                        source = Path(args.file).expanduser().read_text(encoding="utf-8")
+                    except OSError as e:
+                        print(f"  Cannot read script: {e}")
+                        raise SystemExit(1) from None
                 else:
                     source = args.source
-                await _run_script(client, storage, source)
+                if not await _run_script(client, storage, source):
+                    raise SystemExit(1)
 
 
 # ---------------------------------------------------------------------------

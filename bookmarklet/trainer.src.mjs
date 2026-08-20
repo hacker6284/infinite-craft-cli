@@ -1244,6 +1244,17 @@ async function scriptExecBody(S, id) {
   await scriptExecStmt(S, id);
 }
 
+// Loop bodies execute in the loop's own frame: a braced block does NOT get
+// an extra child scope here, so its walrus bindings reach the condition.
+async function scriptExecLoopBody(S, id) {
+  const [kind, a] = S.nodes[id];
+  if (kind === "block") {
+    await scriptExecStmts(S, a);
+    return;
+  }
+  await scriptExecStmt(S, id);
+}
+
 async function scriptExecStmts(S, kidsIdx) {
   for (const stmt of S.kids[kidsIdx]) {
     if (cancelled) throw scriptFail("Cancelled");
@@ -1282,27 +1293,34 @@ async function scriptExecStmt(S, id) {
     }
     return;
   }
-  if (kind === "until") {
-    let iters = 0;
-    while (true) {
-      await scriptExecBody(S, a);
-      iters++;
-      if (cancelled) throw scriptFail("Cancelled");
-      if (scriptKernelCond(S, b)) break;
+  if (kind === "until" || kind === "while") {
+    // A loop owns ONE scope shared by its body and condition: bindings made
+    // by the body (braced or not) are visible to the test — the spec's
+    // `{ n := [ ... ] } -> |n| < 2` idiom depends on it. Popped at exit.
+    S.frames.push([]);
+    try {
+      let iters = 0;
+      if (kind === "until") {
+        while (true) {
+          await scriptExecLoopBody(S, a);
+          iters++;
+          if (cancelled) throw scriptFail("Cancelled");
+          if (scriptKernelCond(S, b)) break;
+        }
+        print("  " + dim(`loop: condition met after ${iters} iteration${iters === 1 ? "" : "s"}`));
+      } else {
+        while (true) {
+          if (cancelled) throw scriptFail("Cancelled");
+          if (!scriptKernelCond(S, b)) break;
+          await scriptExecLoopBody(S, a);
+          iters++;
+        }
+        if (iters === 0) print("  " + dim("~ loop: condition false, body skipped"));
+        else print("  " + dim(`~ loop: stopped after ${iters} iteration${iters === 1 ? "" : "s"}`));
+      }
+    } finally {
+      S.frames.pop();
     }
-    print("  " + dim(`loop: condition met after ${iters} iteration${iters === 1 ? "" : "s"}`));
-    return;
-  }
-  if (kind === "while") {
-    let iters = 0;
-    while (true) {
-      if (cancelled) throw scriptFail("Cancelled");
-      if (!scriptKernelCond(S, b)) break;
-      await scriptExecBody(S, a);
-      iters++;
-    }
-    if (iters === 0) print("  " + dim("~ loop: condition false, body skipped"));
-    else print("  " + dim(`~ loop: stopped after ${iters} iteration${iters === 1 ? "" : "s"}`));
     return;
   }
   if (kind === "ternary") {

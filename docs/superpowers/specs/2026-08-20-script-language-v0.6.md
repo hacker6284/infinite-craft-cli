@@ -235,10 +235,20 @@ break/continue**; per-element early exit belongs to an inner `->`/`~` loop.
   both hosts: permutate stops only on a zero-new round.) **[D-19]**
 - Conditions are checked **only between body executions — never inside an
   atomic bulk operation**. Mid-batch stopping remains `/target`'s job.
+- **A loop owns one scope, shared by its body and its condition** (v0.6.1
+  clarification, from stress-testing): bindings made by the body — braced
+  or not — are visible to the test, so `{ n := [ (b*)* ] } -> |n| < 2`
+  works as §6 documents. Bindings persist across iterations (rebound each
+  pass) and are dropped when the loop exits.
 
 ### 7.3 Ternary
 `cond ? body : body`. Else branch required. Value: the executed branch's
 value.
+
+### 7.4 Non-interactive execution (v0.6.1 clarification)
+Without a TTY there is no y/n: bulk operations over the warn threshold
+announce their pair count and proceed; script parse errors and aborts exit
+non-zero.
 
 ## 8. Execution, safety, output
 

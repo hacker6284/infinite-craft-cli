@@ -1943,6 +1943,14 @@ func se_eval(nodes: List<(text, int, int, int, text)>, kids: List<List<int>>, id
         return (true, single2, "")
     if kind == "newreg"
         return (true, newreg, "")
+    if kind == "newset"
+        // Statically-pure inner: nothing can be newly added, so the value is
+        // the empty set (spec §5.4) — but the inner still evaluates so its
+        // errors (bad refs, bad regex) surface.
+        nok, nres, nerr = se_eval(nodes, kids, a, elements, recipes, env_names, env_values, newreg)
+        if not nok
+            return (false, empty, nerr)
+        return (true, empty, "")
     if kind == "first"
         iok, inner, ierr = se_eval(nodes, kids, a, elements, recipes, env_names, env_values, newreg)
         if not iok
@@ -2222,7 +2230,7 @@ export func classify_command_line(line: text) -> Option<(text, text)>
     line = strip_spaces(line)
     if line.length == 0
         return None
-    cmds: List<text> = ["/permute", "/permutate", "/import", "/fill", "/prune", "/export", "/exhaust", "/combine", "/crawl", "/with", "/cross"]
+    cmds: List<text> = ["/permute", "/permutate", "/import", "/fill", "/prune", "/export", "/exhaust", "/combine", "/crawl", "/with", "/cross", "/script"]
     for cmd in cmds
         rest_opt = slash_args(line, cmd)
         if rest_opt.is_some()
@@ -2451,6 +2459,9 @@ export func validate_command_line_segments(line: text) -> Option<List<(text, boo
             return None
         return query_err_segments(validate_query_at_enqueue(strip_spaces(payload)))
     if kind == "export" or kind == "fill" or kind == "prune"
+        return None
+    if kind == "script"
+        // Path (CLI) / picker (trainer) validity is host business at dispatch.
         return None
     if kind == "combine" or kind == "crawl"
         pipe_err = slash_combine_crawl_pipe_error_segments(payload)
@@ -2731,6 +2742,34 @@ func match_names(els: List<Element>, query: text) -> (Set<text>, Option<text>)
     for e in matches
         names.add(e.name)
     return (names, err)
+
+test "script slash command validates and newset-pure is empty"
+    // R1 (stress test): /script must pass enqueue validation in both hosts
+    assert validate_command_line("/script run.ice").is_none()
+    assert validate_command_line("/script").is_none()
+    c = classify_command_line("/script run.ice")
+    assert c.is_some()
+    k, p = c.unwrap()
+    assert k == "script"
+    assert p == "run.ice"
+    // S2 (stress test): [ pure ] is the empty set, not an error
+    els: List<(text, text, bool)> = [("Water", "w", false), ("Fire", "f", false)]
+    recipes: Map<text, List<(text, text)>> = Map()
+    no_names: List<text> = []
+    no_vals: List<List<(text, text, bool)>> = []
+    no_reg: List<(text, text, bool)> = []
+    ok, nodes, kids, muts, err, pos = script_parse("[ w* ]")
+    assert ok
+    kind, a, b, c2, sval = nodes[nodes.length - 1]
+    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg)
+    assert eok
+    assert eset.length == 0
+    // inner errors still surface
+    ok, nodes, kids, muts, err, pos = script_parse("[ xyzzy ]")
+    assert ok
+    kind, a, b, c2, sval = nodes[nodes.length - 1]
+    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg)
+    assert not eok
 
 test "known slash command dispatch"
     assert is_known_slash_command("/help")

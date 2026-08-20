@@ -138,6 +138,43 @@ class TestScriptControlFlow:
         assert "Water" in out
 
 
+class TestStressTestRegressions:
+    """Fixes from the pre-2.0 stress test (R1, S1, S2)."""
+
+    def test_script_command_passes_enqueue_validation(self, capsys):
+        # R1: /script was rejected by kernel validation before dispatch.
+        from infinite_craft_cli.cli import _enqueue_command_line
+
+        storage = make_mock_storage()
+        with patch("infinite_craft_cli.cli._ensure_lane_worker"):
+            assert _enqueue_command_line("/script run.ice", MagicMock(), storage)
+        out = capsys.readouterr().out
+        assert "Unknown" not in out
+
+    def test_braced_loop_body_walrus_visible_to_cond(self, capsys):
+        # S1: the spec's own idiom — bind in a braced body, test in the cond.
+        client = make_mock_client()
+        client.pair.return_value = MockElement("Steam", "💨")
+        _run("{ n := [ water + fire ] } -> |n| == 0", client=client)
+        out = capsys.readouterr().out
+        assert "Element not found: n" not in out
+        assert "condition met after 2 iterations" in out
+
+    def test_newset_around_pure_expr_is_empty(self, capsys):
+        # S2: [ pure ] is the empty set, not an error.
+        _run("[ w* ]")
+        out = capsys.readouterr().out
+        assert "Not a pure set expression" not in out
+        assert "No matches found." in out
+
+    def test_loop_scope_dropped_after_loop(self, capsys):
+        client = make_mock_client()
+        client.pair.return_value = MockElement("Steam", "💨")
+        _run("{ n := [ water + fire ] } -> |n| == 0 ; n", client=client)
+        out = capsys.readouterr().out
+        assert "Element not found: n" in out
+
+
 class TestScriptFile:
     def test_script_slash_command_reads_file(self, tmp_path, capsys):
         from infinite_craft_cli.cli import _dispatch_line
