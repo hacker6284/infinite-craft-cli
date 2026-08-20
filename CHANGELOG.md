@@ -25,6 +25,31 @@
   deterministic per seed (hosts supply the clock seed), so parity tests
   pin exact outputs. Bulk confirms apply above the threshold as usual.
 
+### Fixed (pre-release stress round 4)
+- **`/lucky N` with N near or beyond the untried space answered slowly or
+  not at all** — rejection sampling degenerated (a ~19,000-pair request
+  churned ~1M rejected draws). Large requests now enumerate the untried
+  space, shuffle it, and take N, answering in under a second with an
+  honest "(only M untried found)" clamp.
+- **Piped-REPL bulk confirms auto-approved.** The historical isatty-only
+  rule meant `printf '/lucky 300' | infinite-craft` fired real API calls
+  with no consent. Interactive sessions now always prompt — the answer is
+  the next piped line, and stdin EOF cancels. (The `script`/`lucky`
+  subcommands keep spec §7.4 announce-and-proceed.)
+- **A mid-run Ctrl-C could kill the whole REPL after the run finished.**
+  CPython defers Python-level signal processing while the loop thread is
+  inside long C calls (HTTP transfers), so the cancel handler — installed
+  per-command — could be gone by the time the signal processed, and it
+  detonated as a raw KeyboardInterrupt (exit 130, queued input lost). One
+  session-long SIGINT handler now owns the REPL lifetime: work active →
+  cancel; just-finished (<2s) → stale signal ignored; truly idle → clean
+  exit. A worker exit path also leaked `_cancelled`, making later instant
+  queries die with a spurious "Cancelled." — reset properly now.
+- **`/lucky` is exempt from queue dedup** (identical text means N MORE
+  random pairs); `/lucky 0` is a usage error instead of a misleading
+  "space exhausted"; bulk progress shows the started ordinal instead of
+  lagging behind concurrent fetches.
+
 ## [2.0.1] - 2026-08-20
 
 ### Changed

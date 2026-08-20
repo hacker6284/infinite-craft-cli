@@ -832,12 +832,17 @@ export func command_queue_lane(line: text) -> text
 // append, worker wake, paint, message chrome. Returns "dup" | "full" | "ok".
 // Idle current is "" — hosts store "" (not None/null) for idle worker current.
 export func queue_accept(line: text, current: text, lane_queue: List<text>, total_pending: int, max_depth: int) -> text
-    // Idle current is "" — do not false-dup empty line unless empty is queued.
-    if current.length > 0 and line == current
-        return "dup"
-    for item in lane_queue
-        if item == line
+    // /lucky is exempt from dedup: identical text means N MORE random
+    // pairs, not the same work (stress-test round 4).
+    stripped = strip_spaces(line)
+    lucky = stripped == "/lucky" or strings.starts_with(stripped, "/lucky ")
+    if not lucky
+        // Idle current is "" — do not false-dup empty line unless empty is queued.
+        if current.length > 0 and line == current
             return "dup"
+        for item in lane_queue
+            if item == line
+                return "dup"
     if total_pending >= max_depth
         return "full"
     return "ok"
@@ -2293,10 +2298,37 @@ func lucky_pairs(elements: List<Element>, recipes: Map<text, List<(text, text)>>
     for t in tried
         seen.add(t)
     known = se_recipe_pair_keys(recipes)
-    picked: Set<text> = Set()
     state = seed
     if state <= 0
         state = 1
+    // Large requests: rejection sampling degenerates as the untried space
+    // shrinks relative to n (stress-test round 4: /lucky 19000 churned ~1M
+    // rejected draws). Enumerate the untried space, shuffle it, take n.
+    if n * 4 >= total
+        untried: List<(Element, Element)> = []
+        for i2 = 0 to count - 1
+            for j2 = i2 to count - 1
+                a2 = elements[i2]
+                b2 = elements[j2]
+                ka2, kb2 = pair_key(a2.name, b2.name)
+                key2 = ka2 + "\u{0}" + kb2
+                if not seen.has(key2) and not known.has(key2)
+                    untried.append((a2, b2))
+        // Fisher-Yates over the untried pairs
+        fi = untried.length - 1
+        while fi > 0
+            state = lucky_next(state)
+            fj = state - (state / (fi + 1)) * (fi + 1)
+            tmp = untried[fi]
+            untried[fi] = untried[fj]
+            untried[fj] = tmp
+            fi = fi - 1
+        for p2 in untried
+            if out.length >= n
+                break
+            out.append(p2)
+        return out
+    picked: Set<text> = Set()
     attempts = 0
     max_attempts = n * 50 + 100
     while out.length < n and attempts < max_attempts
@@ -3140,6 +3172,26 @@ test "lucky pairs sampling"
     empty_recipes: Map<text, List<(text, text)>> = Map()
     p4 = lucky_pairs_boundary(two, empty_recipes, all_tried, 5, 99)
     assert p4.length == 0
+    // large-n path: enumerate, never churn — n > space returns everything
+    two2: List<(text, text, bool)> = [("A", "", false), ("B", "", false)]
+    empty_r: Map<text, List<(text, text)>> = Map()
+    no_t: List<text> = []
+    p5 = lucky_pairs_boundary(two2, empty_r, no_t, 19000, 5)
+    assert p5.length == 3
+    p6 = lucky_pairs_boundary(two2, empty_r, no_t, 19000, 5)
+    assert p6.length == 3
+    a5, q5a, q5b, b5, q5c, q5d = p5[0]
+    a6, q6a, q6b, b6, q6c, q6d = p6[0]
+    assert a5 == a6
+    assert b5 == b6
+    // enumeration respects tried/known exclusions
+    one_tried: List<text> = ["A\u{0}B"]
+    p7 = lucky_pairs_boundary(two2, empty_r, one_tried, 100, 9)
+    assert p7.length == 2
+    // /lucky never dups in the queue
+    q: List<text> = ["/lucky 5"]
+    assert queue_accept("/lucky 5", "/lucky 5", q, 1, 50) == "ok"
+    assert queue_accept("/exhaust a*", "/exhaust a*", q, 1, 50) == "dup"
     // /lucky is wired into dispatch/validation
     assert is_known_slash_command("/lucky")
     assert is_known_slash_command("/lucky 25")

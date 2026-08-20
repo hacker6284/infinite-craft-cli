@@ -592,6 +592,9 @@ async def do_crawl(client, storage, first_name: str, second_name: str):
 
 async def do_lucky(client, storage, count: int, seed: int | None = None):
     """Try random untried pairs — entropy from the neglected pair space."""
+    if count <= 0:
+        _repl_print_lines("  Usage: /lucky [count] (count must be positive)")
+        return
     if seed is None:
         seed = int(time.time() * 1000) % 2147483648
     tried = [f"{ka}\0{kb}" for (ka, kb) in _pair_cache.keys()]
@@ -747,30 +750,54 @@ def _on_sigint():
         _discard_queue_after_cancel = True
 
 
+_main_task: asyncio.Task | None = None
+_last_run_finished_at: float = 0.0
+
+
+def _session_sigint():
+    """Session-long SIGINT owner for the interactive REPL.
+
+    The old design installed/removed a handler per command (cancel scope).
+    CPython can defer Python-level signal processing while the loop thread
+    is inside long C calls (curl transfers), so a Ctrl-C pressed mid-run
+    could be PROCESSED after the scope exited — detonating as a raw
+    KeyboardInterrupt that killed the REPL (stress-test round 4). One
+    handler for the whole session means a delayed signal always lands
+    here, never on default_int_handler.
+    """
+    if (
+        _cancel_scope_depth > 0
+        or _current_command
+        or _current_ib_command
+        or _command_queue
+        or _ib_command_queue
+    ):
+        _on_sigint()
+        return
+    # Idle. A signal arriving just after a run finished is almost always a
+    # stale mid-run Ctrl-C whose processing was deferred — ignore it
+    # rather than exiting the REPL out from under the user.
+    if time.monotonic() - _last_run_finished_at < 2.0:
+        return
+    # True idle Ctrl-C: exit like /quit via the ki_exit path.
+    if _main_task is not None and not _main_task.done():
+        _main_task.cancel()
+
+
 def _enter_cancel_scope():
-    """Install SIGINT cancel handler for one top-level queued command."""
-    global _cancel_scope_depth, _sigint_previous
+    """Mark one top-level queued command as cancel-scoped (depth only —
+    the session-long _session_sigint handler owns SIGINT for the whole
+    REPL lifetime, so there is no install/remove window for a deferred
+    signal to fall through)."""
+    global _cancel_scope_depth
     _cancel_scope_depth += 1
-    if _cancel_scope_depth == 1:
-        loop = asyncio.get_running_loop()
-        try:
-            _sigint_previous = loop.add_signal_handler(signal.SIGINT, _on_sigint)
-        except NotImplementedError:
-            _sigint_previous = signal.getsignal(signal.SIGINT)
-            signal.signal(signal.SIGINT, lambda *_: _on_sigint())
 
 
 def _exit_cancel_scope():
-    global _cancel_scope_depth, _sigint_previous
+    global _cancel_scope_depth, _last_run_finished_at
     _cancel_scope_depth -= 1
     if _cancel_scope_depth == 0:
-        loop = asyncio.get_running_loop()
-        try:
-            loop.remove_signal_handler(signal.SIGINT)
-        except (NotImplementedError, ValueError):
-            if _sigint_previous is not None:
-                signal.signal(signal.SIGINT, _sigint_previous)
-        _sigint_previous = None
+        _last_run_finished_at = time.monotonic()
 
 
 def _on_sigwinch():
@@ -1807,11 +1834,12 @@ async def _prompt_continue(
     global _bulk_confirm_pending, _confirm_expected, _confirm_answer_buffer
     global _confirm_reason
 
-    # Bulk path mirrors historical isatty-only prompt; target hit also allows
-    # interactive mode without a TTY (harness / non-TTY interactive).
-    can_prompt = sys.stdin.isatty() if bulk_pending else (
-        sys.stdin.isatty() or _interactive_mode_active
-    )
+    # Interactive mode can always prompt — with piped stdin the answer is
+    # the next piped line, and EOF cancels. The historical isatty-only rule
+    # for bulk confirms silently auto-approved piped /lucky, /permutate,
+    # etc. (stress-test round 4, unbounded API burn). Truly non-interactive
+    # runs (subcommands) still announce-and-proceed per spec §7.4.
+    can_prompt = sys.stdin.isatty() or _interactive_mode_active
 
     _confirm_reason = reason
     if bulk_pending and can_prompt:
@@ -1893,17 +1921,17 @@ async def _combine_pairs(client, storage, pairs: list[tuple], collect: dict | No
     new_count = 0
     nothing_count = 0
     done_count = 0
+    started_count = 0
     known_names = {e.name for e in storage.get_all()}
     _set_lane_progress("pair", 0, total)
 
     async def process(a, b):
-        nonlocal new_count, nothing_count, done_count
+        nonlocal new_count, nothing_count, done_count, started_count
         _set_last_pair(a.name, b.name)
-        # In-flight ordinal so a fresh generation never sits at 0/N with a live
-        # last-pair while the first fetch/rate-wait is outstanding.
-        in_flight = min(total, done_count + 1)
-        if in_flight > 0:
-            _set_lane_progress("pair", in_flight, total)
+        # Show the STARTED ordinal: with concurrent fetches, done+1 lagged
+        # far behind the real API spend (stress-test round 4 amplifier).
+        started_count += 1
+        _set_lane_progress("pair", min(total, started_count), total)
         try:
             result = await _cached_pair(client, storage, a, b)
         except CommandCancelled:
@@ -3546,6 +3574,13 @@ async def _lane_worker(cfg: _LaneCfg, client, storage):
                         msg = f"  {_color(f'Cancelled. Discarded {discarded} queued command(s).', DIM)}"
                         _repl_print_lines(msg)
                     _mark_cancel_notified()
+                    # The break skips the loop-top reset: clear the shared
+                    # cancel here (peer-aware) or every later runs_local
+                    # dispatch dies with a spurious "Cancelled."
+                    # (stress-test round 4 session wedge).
+                    if cfg.cancel_reset():
+                        _reset_cancelled()
+                    _paint_queue_panel(force=True)
                     break
                 if not _skip_summary_shown:
                     msg = f"  {_color('Skipped.', YELLOW)}"
@@ -3712,6 +3747,14 @@ async def interactive_mode():
     _chrome_enable()
     _install_winch_handler()
     ki_exit = False
+    global _main_task
+    _main_task = asyncio.current_task()
+    _sigint_installed = False
+    try:
+        asyncio.get_running_loop().add_signal_handler(signal.SIGINT, _session_sigint)
+        _sigint_installed = True
+    except NotImplementedError:
+        signal.signal(signal.SIGINT, lambda *_: _session_sigint())
     try:
         async with InfiniteCraftClient(
             rate_limit=API_RATE_LIMIT,
@@ -3759,6 +3802,8 @@ async def interactive_mode():
                             # Pure scripts interleave like locals, but never
                             # while a confirm waits: "y" parses as a pure
                             # script and must reach the confirm router.
+                            if _cancelled and not _current_command and not _current_ib_command:
+                                _reset_cancelled()
                             _echo_submitted_command(line)
                             await _dispatch_line(client, storage, line)
                             continue
@@ -3794,6 +3839,8 @@ async def interactive_mode():
                     and not _waiting_for_confirm()
                     and not _bulk_confirm_pending
                 ):
+                    if _cancelled and not _current_command and not _current_ib_command:
+                        _reset_cancelled()
                     _echo_submitted_command(line)
                     await _dispatch_line(client, storage, line)
                     continue
@@ -3824,6 +3871,10 @@ async def interactive_mode():
         await _cancel_and_await_worker()
         _teardown_tty_and_chrome()
         _confirm_future = None
+        _main_task = None
+        if _sigint_installed:
+            with contextlib.suppress(Exception):
+                asyncio.get_running_loop().remove_signal_handler(signal.SIGINT)
         if ki_exit:
             # Teardown is done and the save is on disk; skip the Runner's
             # doomed join of the blocked reader thread.

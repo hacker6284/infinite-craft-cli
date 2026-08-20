@@ -93,7 +93,7 @@ infinite-craft --version
 | | `/permute <query>` | Combine all matching elements with each other |
 | | `/permutate <query>` | Permute repeatedly until no new discoveries |
 | | `/exhaust <query>` | Each match combined with all discoveries |
-| | `/lucky [count]` | Try random untried pairs — entropy mining (default 10) |
+| | `/lucky [count]` | Try random untried pairs — entropy mining (default 10). Pairs that produced Nothing aren't persisted, so later sessions may re-draw them |
 
 ### Query syntax
 

@@ -1463,6 +1463,10 @@ function doRecipe(name) {
 }
 
 async function doLucky(count) {
+  if (!Number.isFinite(count) || count <= 0) {
+    print(`  Usage: ${yellow("/lucky [count]")} (count must be positive)`);
+    return;
+  }
   const tried = [...pairCache.keys()];
   const seed = Date.now() % 2147483648;
   const rawPairs = luckyPairsBoundary(elementTuples(), recipeIndex, tried, count, seed);
