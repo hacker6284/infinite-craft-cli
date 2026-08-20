@@ -12,6 +12,19 @@
   Loops always queue, even pure ones — the queue's Stop/Ctrl-C machinery
   is the only brake on an unbounded pure loop. In the trainer this also
   applies while a confirm prompt is open, matching local commands.
+  Confirm answers take precedence: `y` parses as a valid pure script, so
+  the y/n router always sees it first.
+
+### Fixed
+- **Anchored regex patterns after `(` or `|` lexed as the division
+  operator.** `(/^best /)!` and `|/^best /|` tokenized as op-slash plus
+  junk because `^` was in the operator after-set; it no longer is
+  (spaced `a / ^(b)` is unaffected).
+- **`Best *`-style patterns get a pointed error.** An fnmatch pattern
+  whose `*` stands alone (bare line, size bars) collides with the cross
+  operator and used to fail with "Unexpected token"; the parser now
+  explains the collision and both escapes: `Best ?*` (attached wildcard)
+  or a regex `/^best /`.
 
 ## [2.0.0] - 2026-08-20
 
