@@ -590,6 +590,24 @@ async def do_crawl(client, storage, first_name: str, second_name: str):
         _repl_print_lines(f"    {format_element(pool[name])}")
 
 
+async def do_lucky(client, storage, count: int, seed: int | None = None):
+    """Try random untried pairs — entropy from the neglected pair space."""
+    if seed is None:
+        seed = int(time.time() * 1000) % 2147483648
+    tried = [f"{ka}\0{kb}" for (ka, kb) in _pair_cache.keys()]
+    raw = craft.lucky_pairs_boundary(
+        _elements_to_boundary(storage.get_all()), _load_recipes(), tried, count, seed
+    )
+    pairs = _script_pairs_from_raw(raw)
+    if not pairs:
+        _repl_print_lines("  No untried pairs found — the space may be exhausted.")
+        return
+    note = "" if len(pairs) >= count else f" (only {len(pairs)} untried found)"
+    plural = "" if len(pairs) == 1 else "s"
+    _repl_print_lines(f"  Feeling lucky: {len(pairs)} random untried pair{plural}...{note}")
+    await _confirm_and_run_pairs(client, storage, pairs)
+
+
 async def do_exhaust(client, storage, query: str):
     """For each element matching query, combine with every discovered element."""
     matches, err = _match_elements(storage, query)
@@ -2532,6 +2550,7 @@ def do_help() -> str:
     /permute <query>              Combine all matching elements with each other
     /permutate <query>            Permute repeatedly until no new discoveries
     /exhaust <query>              Each match combined with all discoveries
+    /lucky [count]                Try random untried pairs (default 10)
 
   Target:
     /target <element>             Ask y/n to continue the batch when this is crafted
@@ -3334,6 +3353,11 @@ async def _dispatch_line(client, storage, line: str) -> None:
         await _prune_orphans_async(storage)
     elif (rest := craft.slash_args(line, "/export")) is not None:
         _repl_print_lines(do_export(storage, rest or EXPORT_PATH))
+    elif (rest := craft.slash_args(line, "/lucky")) is not None:
+        if (err := _validate_command_line(line)) is not None:
+            _repl_print_lines(err)
+        else:
+            await do_lucky(client, storage, int(rest) if rest.strip() else 10)
     elif (rest := craft.slash_args(line, "/exhaust")) is not None:
         if (err := _validate_command_line(line)) is not None:
             _repl_print_lines(err)
@@ -3831,6 +3855,8 @@ async def noninteractive_mode(args):
                 await do_cross(client, storage, args.left, args.right)
             elif args.command == "with":
                 await do_with(client, storage, args.element, args.query)
+            elif args.command == "lucky":
+                await do_lucky(client, storage, args.count)
             elif args.command == "script":
                 if args.file:
                     try:
@@ -3919,6 +3945,11 @@ def main():
     )
     with_p.add_argument("element", help="Element name")
     with_p.add_argument("query", help=_QUERY_HELP)
+
+    lucky_p = subparsers.add_parser(
+        "lucky", help="Try random untried pairs (entropy mining)"
+    )
+    lucky_p.add_argument("count", nargs="?", type=int, default=10, help="Pairs to try (default 10)")
 
     script_p = subparsers.add_parser(
         "script", help="Run an Infinite Craft script (spec v0.6)"

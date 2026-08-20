@@ -14,6 +14,7 @@ import {
   trace_recipe_boundary as traceRecipeBoundary,
   orphan_candidates_boundary as orphanCandidatesBoundary,
   exhaust_pairs_boundary as exhaustPairsBoundary,
+  lucky_pairs_boundary as luckyPairsBoundary,
   permute_pairs_boundary as permutePairsBoundary,
   cross_pairs_boundary as crossPairsBoundary,
   with_pairs_boundary as withPairsBoundary,
@@ -1433,6 +1434,21 @@ function doRecipe(name) {
   }
 }
 
+async function doLucky(count) {
+  const tried = [...pairCache.keys()];
+  const seed = Date.now() % 2147483648;
+  const rawPairs = luckyPairsBoundary(elementTuples(), recipeIndex, tried, count, seed);
+  const pairs = pairsFromBoundary(rawPairs);
+  if (!pairs.length) {
+    print("  " + yellow("No untried pairs found — the space may be exhausted."));
+    return;
+  }
+  let note = "";
+  if (pairs.length < count) note = dim(` (only ${pairs.length} untried found)`);
+  print(`  Feeling lucky: ${bold(String(pairs.length))} random untried pair${pairs.length === 1 ? "" : "s"}...${note}`);
+  await confirmAndRunPairs(pairs);
+}
+
 async function doExhaust(query) {
   const { matches, error } = matchElements(query);
   if (error) { print("  " + red(error)); return; }
@@ -1913,6 +1929,7 @@ function doHelp() {
     ${cyan("/permute <query>")}            Combine all matching elements with each other
     ${cyan("/permutate <query>")}          Permute repeatedly until no new discoveries
     ${cyan("/exhaust <query>")}            Each match combined with all discoveries
+    ${cyan("/lucky [count]")}              Try random untried pairs (default 10)
 
   ${bold("Query syntax (/search, /with, /permute, /permutate, /cross, /exhaust, shorthands):")}
     substring                   Default: case-insensitive substring
@@ -2217,6 +2234,11 @@ async function executeClassified(kind, payload, line) {
   if (kind === "permute") { await doPermute(payload.trim()); return; }
   if (kind === "permutate") { await doPermutate(payload.trim()); return; }
   if (kind === "fill") { await doFill(); return; }
+  if (kind === "lucky") {
+    const arg = payload.trim();
+    await doLucky(arg ? parseInt(arg, 10) : 10);
+    return;
+  }
   if (kind === "prune") { await doPrune(); return; }
   if (kind === "export") { await doExport(); return; }
   if (kind === "exhaust") { await doExhaust(payload.trim()); return; }

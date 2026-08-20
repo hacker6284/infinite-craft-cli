@@ -222,3 +222,53 @@ class TestScriptFile:
             run_async(_dispatch_line(client, storage, "/fire/"))
         out = capsys.readouterr().out
         assert "Fire" in out
+
+
+class TestLucky:
+    """/lucky — random untried pairs (v2.1)."""
+
+    def test_lucky_runs_requested_pairs_deterministically(self, capsys):
+        from infinite_craft_cli.cli import do_lucky
+
+        client = make_mock_client()
+        client.pair.return_value = MockElement("Something", "✨")
+        storage = _growing_storage()
+        with patch("infinite_craft_cli.cli._load_recipes", return_value={}), patch(
+            "infinite_craft_cli.cli._record_recipes_batch"
+        ):
+            run_async(do_lucky(client, storage, 3, seed=42))
+        out = capsys.readouterr().out
+        assert "Feeling lucky: 3 random untried pairs" in out
+        assert client.pair.await_count == 3
+
+    def test_lucky_excludes_known_recipe_pairs(self, capsys):
+        from infinite_craft_cli.cli import do_lucky
+
+        client = make_mock_client()
+        client.pair.return_value = MockElement("Something", "✨")
+        storage = _growing_storage()
+        # all pairs of the 4 base elements incl self-pairs = 10; mark one known
+        recipes = {"Steam": [["Fire", "Water"]]}
+        with patch("infinite_craft_cli.cli._load_recipes", return_value=recipes), patch(
+            "infinite_craft_cli.cli._record_recipes_batch"
+        ):
+            run_async(do_lucky(client, storage, 9, seed=7))
+        out = capsys.readouterr().out
+        # 10 total minus 1 known = 9 available; all 9 runnable
+        assert "Feeling lucky: 9 random untried pairs" in out
+
+    def test_lucky_exhausted_space(self, capsys):
+        from infinite_craft_cli.cli import do_lucky
+        import infinite_craft_cli.cli as cli
+        from infinite_craft_cli._sudo import craft as k
+
+        client = make_mock_client()
+        storage = _growing_storage([MockElement("Water", "💧"), MockElement("Fire", "🔥")])
+        # mark all 3 pairs (incl self-pairs) as tried via the session cache
+        for a, b in [("Water", "Water"), ("Fire", "Water"), ("Fire", "Fire")]:
+            cli._pair_cache[k.pair_key(a, b)] = MockElement("X", "")
+        with patch("infinite_craft_cli.cli._load_recipes", return_value={}):
+            run_async(do_lucky(client, storage, 5, seed=3))
+        out = capsys.readouterr().out
+        assert "No untried pairs found" in out
+        client.pair.assert_not_called()

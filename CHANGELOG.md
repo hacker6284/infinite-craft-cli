@@ -1,5 +1,18 @@
 # Changelog
 
+## [2.1.0] - 2026-08-20
+
+### Added
+- **`/lucky [count]` — random untried pairs, in both hosts and as a
+  `lucky` subcommand.** When crosses and crawls run dry, the prioritized
+  frontier is exhausted — but the prioritizer systematically neglects the
+  uniform pair space (1,800 elements ≈ 1.6M pairs, mostly untried).
+  `/lucky` samples uniformly random pairs that are neither in the session
+  pair cache nor ingredients of any known recipe (self-pairs included)
+  and runs them through the normal pipeline. Sampling is kernel-owned and
+  deterministic per seed (hosts supply the clock seed), so parity tests
+  pin exact outputs. Bulk confirms apply above the threshold as usual.
+
 ## [2.0.1] - 2026-08-20
 
 ### Changed

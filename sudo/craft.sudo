@@ -789,7 +789,7 @@ export func is_known_slash_command(line: text) -> bool
     while end < stripped.length and not is_ascii_space(stripped[end])
         end = end + 1
     head = text_slice(stripped, 0, end)
-    known: List<text> = ["/help", "/search", "/recipe", "/list", "/history", "/target", "/auto", "/clear", "/unfilled", "/queue", "/import", "/fill", "/prune", "/export", "/combine", "/crawl", "/with", "/cross", "/permute", "/permutate", "/exhaust", "/script"]
+    known: List<text> = ["/help", "/search", "/recipe", "/list", "/history", "/target", "/auto", "/clear", "/unfilled", "/queue", "/import", "/fill", "/prune", "/export", "/combine", "/crawl", "/with", "/cross", "/permute", "/permutate", "/exhaust", "/script", "/lucky"]
     for k in known
         if head == k
             return true
@@ -872,7 +872,7 @@ export func may_bulk_confirm(line: text) -> bool
     while end < s.length and not is_ascii_space(s[end])
         end = end + 1
     head = text_slice(s, 0, end)
-    if head == "/permutate" or head == "/permute" or head == "/exhaust" or head == "/cross" or head == "/with"
+    if head == "/permutate" or head == "/permute" or head == "/exhaust" or head == "/cross" or head == "/with" or head == "/lucky"
         return true
     if is_known_slash_command(s) or is_local_command(s) or is_ib_command(s)
         return false
@@ -2120,6 +2120,65 @@ export func script_union_tuples(a: List<(text, text, bool)>, b: List<(text, text
             out.append(t2)
     return out
 
+
+// ---------------------------------------------------------------------------
+// /lucky — uniform random untried pairs (entropy from within: the untried
+// pair space the proven-combiner prioritization systematically neglects).
+// The kernel stays deterministic for parity: hosts supply the seed; a given
+// (elements, recipes, tried, n, seed) always yields the same pairs.
+// ---------------------------------------------------------------------------
+
+func lucky_next(state: int) -> int
+    // LCG, arbitrary-precision arithmetic modulo 2^31.
+    m = 2147483648
+    s = state * 1103515245 + 12345
+    return s - (s / m) * m
+
+func lucky_pairs(elements: List<Element>, recipes: Map<text, List<(text, text)>>, tried: List<text>, n: int, seed: int) -> List<(Element, Element)>
+    out: List<(Element, Element)> = []
+    count = elements.length
+    if count == 0 or n <= 0
+        return out
+    // Unordered pairs including self-pairs: row i holds (count - i) pairs.
+    total = count * (count + 1) / 2
+    seen: Set<text> = Set()
+    for t in tried
+        seen.add(t)
+    known = se_recipe_pair_keys(recipes)
+    picked: Set<text> = Set()
+    state = seed
+    if state <= 0
+        state = 1
+    attempts = 0
+    max_attempts = n * 50 + 100
+    while out.length < n and attempts < max_attempts
+        attempts = attempts + 1
+        state = lucky_next(state)
+        k = state - (state / total) * total
+        i = 0
+        kk = k
+        while kk >= count - i
+            kk = kk - (count - i)
+            i = i + 1
+        j = i + kk
+        a = elements[i]
+        b = elements[j]
+        ka, kb = pair_key(a.name, b.name)
+        key = ka + "\u{0}" + kb
+        if seen.has(key) or known.has(key) or picked.has(key)
+            continue
+        picked.add(key)
+        out.append((a, b))
+    return out
+
+export func lucky_pairs_boundary(elements: List<(text, text, bool)>, recipes: Map<text, List<(text, text)>>, tried: List<text>, n: int, seed: int) -> List<(text, text, bool, text, text, bool)>
+    pairs = lucky_pairs(elements_from_tuples(elements), recipes, tried, n, seed)
+    out: List<(text, text, bool, text, text, bool)> = []
+    for p in pairs
+        a, b = p
+        out.append((a.name, a.emoji, a.first, b.name, b.emoji, b.first))
+    return out
+
 // ---------------------------------------------------------------------------
 // Rate-window chrome math (pure). Hosts own clocks, deques, HTTP, paint.
 // Times are integer milliseconds (or any consistent unit).
@@ -2268,7 +2327,7 @@ export func classify_command_line(line: text) -> Option<(text, text)>
     line = strip_spaces(line)
     if line.length == 0
         return None
-    cmds: List<text> = ["/permute", "/permutate", "/import", "/fill", "/prune", "/export", "/exhaust", "/combine", "/crawl", "/with", "/cross", "/script"]
+    cmds: List<text> = ["/permute", "/permutate", "/import", "/fill", "/prune", "/export", "/exhaust", "/combine", "/crawl", "/with", "/cross", "/script", "/lucky"]
     for cmd in cmds
         rest_opt = slash_args(line, cmd)
         if rest_opt.is_some()
@@ -2500,6 +2559,14 @@ export func validate_command_line_segments(line: text) -> Option<List<(text, boo
         return None
     if kind == "script"
         // Path (CLI) / picker (trainer) validity is host business at dispatch.
+        return None
+    if kind == "lucky"
+        arg = strip_spaces(payload)
+        if arg.length == 0
+            return None
+        for ch in arg
+            if ch < '0' or ch > '9'
+                return Some(plain_segment("  Usage: /lucky [count]"))
         return None
     if kind == "combine" or kind == "crawl"
         pipe_err = slash_combine_crawl_pipe_error_segments(payload)
@@ -2808,6 +2875,42 @@ test "script slash command validates and newset-pure is empty"
     kind, a, b, c2, sval = nodes[nodes.length - 1]
     eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg)
     assert not eok
+
+test "lucky pairs sampling"
+    els: List<(text, text, bool)> = [("Water", "w", false), ("Fire", "f", false), ("Wind", "n", false), ("Earth", "e", false)]
+    recipes: Map<text, List<(text, text)>> = Map()
+    no_tried: List<text> = []
+    p1 = lucky_pairs_boundary(els, recipes, no_tried, 3, 42)
+    p2 = lucky_pairs_boundary(els, recipes, no_tried, 3, 42)
+    assert p1.length == 3
+    assert p2.length == 3
+    for idx = 0 to 2
+        a1, e1, f1, b1, e2, f2 = p1[idx]
+        a2, x1, x2, b2, x3, x4 = p2[idx]
+        assert a1 == a2
+        assert b1 == b2
+    // known recipes are excluded from the untried space
+    steam_pairs: List<(text, text)> = [("Fire", "Water")]
+    recipes["Steam"] = steam_pairs
+    p3 = lucky_pairs_boundary(els, recipes, no_tried, 10, 7)
+    for p in p3
+        a3, y1, y2, b3, y3, y4 = p
+        ka, kb = pair_key(a3, b3)
+        assert not (ka == "Fire" and kb == "Water")
+    // exhausted space returns fewer (or zero) pairs, never loops forever
+    two: List<(text, text, bool)> = [("A", "", false), ("B", "", false)]
+    all_tried: List<text> = ["A\u{0}A", "A\u{0}B", "B\u{0}B"]
+    empty_recipes: Map<text, List<(text, text)>> = Map()
+    p4 = lucky_pairs_boundary(two, empty_recipes, all_tried, 5, 99)
+    assert p4.length == 0
+    // /lucky is wired into dispatch/validation
+    assert is_known_slash_command("/lucky")
+    assert is_known_slash_command("/lucky 25")
+    assert may_bulk_confirm("/lucky 500")
+    assert validate_command_line("/lucky").is_none()
+    assert validate_command_line("/lucky 25").is_none()
+    assert validate_command_line("/lucky banana").is_some()
+    assert not runs_local("/lucky 5")
 
 test "runs_local: pure loop-free scripts are immediate"
     assert runs_local("/search fire*")

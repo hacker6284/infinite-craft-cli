@@ -72,6 +72,7 @@ infinite-craft crawl "Water" "Fire"
 infinite-craft permute "w*"
 infinite-craft with "Water" "fire*"
 infinite-craft cross "fire*" "water*"
+infinite-craft lucky 25
 infinite-craft --version
 ```
 
@@ -92,6 +93,7 @@ infinite-craft --version
 | | `/permute <query>` | Combine all matching elements with each other |
 | | `/permutate <query>` | Permute repeatedly until no new discoveries |
 | | `/exhaust <query>` | Each match combined with all discoveries |
+| | `/lucky [count]` | Try random untried pairs — entropy mining (default 10) |
 
 ### Query syntax
 
