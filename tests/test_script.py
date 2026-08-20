@@ -175,6 +175,31 @@ class TestStressTestRegressions:
         assert "Element not found: n" in out
 
 
+class TestRound2Regressions:
+    """Fixes from stress-test round two (BUG-1, BUG-2)."""
+
+    def test_walrus_ack_suppressed_inside_loops(self, capsys):
+        client = make_mock_client()
+        client.pair.return_value = MockElement("Steam", "💨")
+        _run("{ n := [ water + fire ] } -> |n| == 0", client=client)
+        out = capsys.readouterr().out
+        assert "n = " not in out  # no per-iteration ack flood
+        assert "condition met" in out
+
+    def test_walrus_ack_still_prints_at_top_level(self, capsys):
+        _run("x := f*")
+        out = capsys.readouterr().out
+        assert "x = 1 element" in out
+
+    def test_script_crawl_prints_generation_telemetry(self, capsys):
+        client = make_mock_client()
+        client.pair.return_value = MockElement("Steam", "💨")
+        _run("water ++ fire", client=client)
+        out = capsys.readouterr().out
+        assert "Gen 1:" in out
+        assert "joined the pool" in out
+
+
 class TestScriptFile:
     def test_script_slash_command_reads_file(self, tmp_path, capsys):
         from infinite_craft_cli.cli import _dispatch_line

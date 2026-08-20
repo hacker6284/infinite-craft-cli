@@ -2908,7 +2908,7 @@ class ScriptError(Exception):
 
 
 class _ScriptState:
-    __slots__ = ("nodes", "kids", "muts", "frames", "collectors")
+    __slots__ = ("nodes", "kids", "muts", "frames", "collectors", "loop_depth")
 
     def __init__(self, nodes, kids, muts):
         self.nodes = nodes
@@ -2916,6 +2916,7 @@ class _ScriptState:
         self.muts = muts
         self.frames: list[list] = [[]]  # scope frames of (name, set)
         self.collectors: list[list] = []
+        self.loop_depth = 0  # >0 inside loop/foreach bodies (ack suppression)
 
 
 def _script_env_flat(S):
@@ -3144,6 +3145,7 @@ async def _script_eval(S, client, storage, node_id):
     tried: list = []
     products = []
     news_all = []
+    gen = 0
     while True:
         _raise_if_cancelled()
         raw_pairs, new_keys = craft.crawl_generation_pairs_boundary(pool, tried)
@@ -3151,6 +3153,8 @@ async def _script_eval(S, client, storage, node_id):
         pairs = _script_pairs_from_raw(raw_pairs)
         if not pairs:
             break
+        gen += 1
+        _repl_print_lines(_color(f"  Gen {gen}: {len(pairs)} pairs to try...", DIM))
         gen_products, gen_news = await _script_run_pairs(
             S, client, storage, pairs, f"{len(pairs)} pairs this generation"
         )
@@ -3158,7 +3162,12 @@ async def _script_eval(S, client, storage, node_id):
         news_all = _script_union(news_all, gen_news)
         before = len(pool)
         pool = _script_union(pool, gen_products)
-        if len(pool) == before:
+        grew = len(pool) - before
+        plural = "" if grew == 1 else "s"
+        _repl_print_lines(
+            _color(f"  Gen {gen} done: {grew} element{plural} joined the pool.", DIM)
+        )
+        if grew == 0:
             break
     _script_record_news(S, news_all)
     return products
@@ -3193,30 +3202,41 @@ async def _script_exec_stmt(S, client, storage, node_id):
     if kind == "assign":
         v = await _script_eval_operand(S, client, storage, a)
         _script_bind(S, sval, v)
-        plural = "" if len(v) == 1 else "s"
-        _repl_print_lines(_color(f"  {sval} = {len(v)} element{plural}", DIM))
+        if S.loop_depth == 0:
+            # Inside loops the ack would flood one line per iteration.
+            plural = "" if len(v) == 1 else "s"
+            _repl_print_lines(_color(f"  {sval} = {len(v)} element{plural}", DIM))
         return
     if kind == "foreach":
         vals = await _script_eval_operand(S, client, storage, a)
-        for el in vals:
-            _raise_if_cancelled()
-            S.frames.append([(sval, [el])])
-            try:
-                await _script_exec_stmt(S, client, storage, b)
-            finally:
-                S.frames.pop()
+        S.loop_depth += 1
+        try:
+            for el in vals:
+                await asyncio.sleep(0)  # yield so cancellation/input can run
+                _raise_if_cancelled()
+                S.frames.append([(sval, [el])])
+                try:
+                    await _script_exec_stmt(S, client, storage, b)
+                finally:
+                    S.frames.pop()
+        finally:
+            S.loop_depth -= 1
         return
     if kind in ("until", "while"):
         # A loop owns ONE scope shared by its body and condition: bindings
         # made by the body (braced or not) are visible to the test — the
         # spec's `{ n := [ ... ] } -> |n| < 2` idiom depends on it.
         S.frames.append([])
+        S.loop_depth += 1
         try:
             iters = 0
             if kind == "until":
                 while True:
                     await _script_exec_loop_body(S, client, storage, a)
                     iters += 1
+                    # Pure bodies never await: yield so SIGINT handling and
+                    # the input thread are not starved (stress-test BUG-1).
+                    await asyncio.sleep(0)
                     _raise_if_cancelled()
                     if _script_kernel_cond(S, storage, b):
                         break
@@ -3224,6 +3244,7 @@ async def _script_exec_stmt(S, client, storage, node_id):
                 _repl_print_lines(_color(f"  loop: condition met after {iters} iteration{plural}", DIM))
             else:
                 while True:
+                    await asyncio.sleep(0)
                     _raise_if_cancelled()
                     if not _script_kernel_cond(S, storage, b):
                         break
@@ -3236,6 +3257,7 @@ async def _script_exec_stmt(S, client, storage, node_id):
                     _repl_print_lines(_color(f"  ~ loop: stopped after {iters} iteration{plural}", DIM))
         finally:
             S.frames.pop()
+            S.loop_depth -= 1
         return
     if kind == "ternary":
         truth = _script_kernel_cond(S, storage, a)
@@ -3882,7 +3904,13 @@ def main():
     if args.command is None:
         asyncio.run(interactive_mode())
     else:
-        asyncio.run(noninteractive_mode(args))
+        try:
+            asyncio.run(noninteractive_mode(args))
+        except KeyboardInterrupt:
+            # Clean cancel instead of a traceback; partial progress is
+            # already saved (storage writes land as they happen).
+            print("\n  Cancelled.")
+            raise SystemExit(130) from None
 
 
 if __name__ == "__main__":

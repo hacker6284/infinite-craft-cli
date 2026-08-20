@@ -82,7 +82,7 @@ infinite-craft --version
 | Shorthand | Slash command | Description |
 |-----------|---------------|-------------|
 | `<element> + <element>` | `/combine <element> <element>` | Combine two elements |
-| `<element> ++ <element>` | `/crawl <element> <element>` | Combine & crawl until no new discoveries |
+| `<element> ++ <element>` | `/crawl <element> <element>` | Crawl: generations over a growing pool until one adds nothing to it |
 
 ### Bulk combine
 

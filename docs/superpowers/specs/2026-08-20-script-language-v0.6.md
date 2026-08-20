@@ -162,7 +162,7 @@ non-Nothing combine outputs, whether or not new to the discovery set):
 |---|---|---|
 | `A + B` | combine (singletons only) | result singleton, or empty on Nothing |
 | `A * B` | cross (A×B, same-name pairs skipped, symmetric dedup) | products |
-| `A ++ B` | crawl seeded from A×B | all products across generations |
+| `A ++ B` | crawl: pool seeded with A ∪ B; each generation tries every untried unordered pool pair INCLUDING self-pairs (legacy `/crawl` semantics); a generation that adds no element to the pool ends the crawl (v0.6.1 correction — the earlier "seeded from A×B" wording was wrong) | all products across generations |
 | `(S)*` | permute (upper triangle of S) | products |
 | `(S)**` | permutate (permute rounds until a round adds nothing) | products across rounds |
 | `(S)!` | exhaust (each of S × all discoveries) | products |
@@ -248,7 +248,10 @@ value.
 ### 7.4 Non-interactive execution (v0.6.1 clarification)
 Without a TTY there is no y/n: bulk operations over the warn threshold
 announce their pair count and proceed; script parse errors and aborts exit
-non-zero.
+non-zero. Exception: a `/target` hit still reads its y/n from stdin (a
+piped line may be consumed as the answer); at stdin EOF the run resolves
+as stopped rather than hanging. SIGINT cancels cleanly (exit 130) with
+partial progress kept.
 
 ## 8. Execution, safety, output
 
@@ -280,7 +283,9 @@ not a separate trust domain.
    uncapped.
 2. A mutating statement's operation output (combine echoes, bulk summaries)
    stands alone; no additional value echo.
-3. `name := expr` prints a dim `name = N elements` acknowledgment.
+3. `name := expr` prints a dim `name = N elements` acknowledgment —
+   suppressed inside loop and for-each bodies, where it would emit one
+   line per iteration (v0.6.1).
 4. Loops close with a dim status: `loop: condition met after N iterations` /
    `~ loop: condition false, body skipped`.
 5. `@` adds no output of its own.

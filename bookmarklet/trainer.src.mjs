@@ -1226,18 +1226,23 @@ async function scriptEval(S, id) {
   let pool = scriptUnionTuples(L, R);
   const triedKeys = [];
   let products = [], news = [];
+  let genNum = 0;
   while (true) {
     if (cancelled) throw scriptFail("Cancelled");
     const [rawPairs, newKeys] = crawlGenerationPairsBoundary(pool, triedKeys);
     for (const k of newKeys) triedKeys.push(k);
     const pairs = scriptObjPairs(rawPairs);
     if (!pairs.length) break;
+    genNum++;
+    print("  " + dim(`Gen ${genNum}: ${pairs.length} pairs to try...`));
     const gen = await scriptRunPairs(S, pairs, `${pairs.length} pairs this generation`);
     products = scriptUnionTuples(products, gen.products);
     news = scriptUnionTuples(news, gen.news);
     const before = pool.length;
     pool = scriptUnionTuples(pool, gen.products);
-    if (pool.length === before) break;
+    const grew = pool.length - before;
+    print("  " + dim(`Gen ${genNum} done: ${grew} element${grew === 1 ? "" : "s"} joined the pool.`));
+    if (grew === 0) break;
   }
   scriptRecordNews(S, news);
   return products;
@@ -1280,19 +1285,29 @@ async function scriptExecStmt(S, id) {
   if (kind === "assign") {
     const v = await scriptEvalOperand(S, a);
     scriptBind(S, sval, v);
-    print("  " + dim(`${esc(sval)} = ${v.length} element${v.length === 1 ? "" : "s"}`));
+    if (S.loopDepth === 0) {
+      // Inside loops the ack would flood one line per iteration.
+      print("  " + dim(`${esc(sval)} = ${v.length} element${v.length === 1 ? "" : "s"}`));
+    }
     return;
   }
   if (kind === "foreach") {
     const set = await scriptEvalOperand(S, a);
-    for (const el of set) {
-      if (cancelled) throw scriptFail("Cancelled");
-      S.frames.push([{ name: sval, set: [el] }]);
-      try {
-        await scriptExecBody(S, b);
-      } finally {
-        S.frames.pop();
+    S.loopDepth++;
+    try {
+      for (const el of set) {
+        // Yield so Stop clicks and UI events run even for pure bodies.
+        await new Promise((r) => setTimeout(r, 0));
+        if (cancelled) throw scriptFail("Cancelled");
+        S.frames.push([{ name: sval, set: [el] }]);
+        try {
+          await scriptExecBody(S, b);
+        } finally {
+          S.frames.pop();
+        }
       }
+    } finally {
+      S.loopDepth--;
     }
     return;
   }
@@ -1301,18 +1316,23 @@ async function scriptExecStmt(S, id) {
     // by the body (braced or not) are visible to the test — the spec's
     // `{ n := [ ... ] } -> |n| < 2` idiom depends on it. Popped at exit.
     S.frames.push([]);
+    S.loopDepth++;
     try {
       let iters = 0;
       if (kind === "until") {
         while (true) {
           await scriptExecLoopBody(S, a);
           iters++;
+          // Pure bodies never await the network: yield so the Stop button
+          // and UI events are not starved (stress-test BUG-1).
+          await new Promise((r) => setTimeout(r, 0));
           if (cancelled) throw scriptFail("Cancelled");
           if (scriptKernelCond(S, b)) break;
         }
         print("  " + dim(`loop: condition met after ${iters} iteration${iters === 1 ? "" : "s"}`));
       } else {
         while (true) {
+          await new Promise((r) => setTimeout(r, 0));
           if (cancelled) throw scriptFail("Cancelled");
           if (!scriptKernelCond(S, b)) break;
           await scriptExecLoopBody(S, a);
@@ -1323,6 +1343,7 @@ async function scriptExecStmt(S, id) {
       }
     } finally {
       S.frames.pop();
+      S.loopDepth--;
     }
     return;
   }
@@ -1345,7 +1366,7 @@ async function runScript(source) {
     print("  " + red(`Script error: ${esc(err)}`));
     return;
   }
-  const S = { nodes, kids, muts, frames: [[]], collectors: [] };
+  const S = { nodes, kids, muts, frames: [[]], collectors: [], loopDepth: 0 };
   try {
     beginRun();
     const root = nodes.length - 1;
