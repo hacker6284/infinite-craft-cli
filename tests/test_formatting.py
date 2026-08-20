@@ -70,6 +70,6 @@ class TestDoHelp:
             "/exhaust",
             "/permutate",
             "++",
-            "+|",
+            ":=",  # v2.0: +| removed; walrus marks the script section
         ):
             assert marker in result, f"missing {marker!r} in help"

@@ -119,9 +119,12 @@ def _run_scenario(scenario: dict, fixtures: dict, scratch_root: str):
         if op == "validate":
             return cli._validate_command_line(scenario["line"])
 
-        if op == "operands":
-            result = cli.craft.parse_operands(scenario["kind"], scenario["payload"])
-            return list(result) if result is not None else None
+        if op == "script_parse":
+            ok, nodes, kids, muts, err, pos = cli.craft.script_parse(scenario["source"])
+            if not ok:
+                return ["err", err]
+            repr_text = cli.craft.script_ast_repr(nodes, kids, len(nodes) - 1)
+            return ["ok", repr_text, [bool(m) for m in muts]]
 
         if op == "permute_pairs":
             raw = cli.craft.permute_pairs_boundary(scenario["matches"])

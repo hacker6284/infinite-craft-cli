@@ -79,7 +79,8 @@ class TestHostDispatch:
                 ):
                     run_async(interactive_mode())
         out = capsys.readouterr().out
-        assert "no space between + and |" in out
+        # v2.0: spaced `+ |` is a script parse error (size bar after combine)
+        assert "Script error" in out
 
     def test_unknown_slash_rejected(self, capsys):
         from infinite_craft_cli.cli import interactive_mode
@@ -108,11 +109,14 @@ class TestEnqueueRejection:
         "bad_line,expected_substr",
         [
             ("/combine Water + Fire", "positional args"),
-            ("Water + | Fire", "no space between + and |"),
-            ("Water +", "Usage: <element> + <element>"),
+            # v2.0 always-script: shorthand lines are scripts; parse errors
+            # come from the kernel script parser.
+            ("Water + | Fire", "Script error"),
+            ("Water +", "Script error"),
             ("/permutate", "Usage: /permutate <query>"),
             ("/notacommand", "Unknown command"),
-            ("Water Fire", "Unknown input"),
+            ("Water +| Fire", "+| was removed"),
+            ("x := a* , b* * c*", "Script error"),
         ],
     )
     def test_invalid_commands_rejected_at_enqueue(
@@ -126,6 +130,15 @@ class TestEnqueueRejection:
         out = capsys.readouterr().out
         assert expected_substr in out
         assert cli._command_queue == []
+
+    def test_multiword_element_reference_enqueues(self, capsys):
+        # v2.0: "Water Fire" is a (single) element reference script — it
+        # parses and enqueues; resolution failures surface at runtime.
+        from infinite_craft_cli.cli import _enqueue_command_line
+
+        storage = make_mock_storage()
+        with patch("infinite_craft_cli.cli._ensure_lane_worker"):
+            assert _enqueue_command_line("Water Fire", MagicMock(), storage)
 
     def test_duplicate_rejection(self, capsys):
         from infinite_craft_cli.cli import _enqueue_command_line

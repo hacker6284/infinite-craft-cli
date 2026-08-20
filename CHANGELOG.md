@@ -1,5 +1,59 @@
 # Changelog
 
+## [2.0.0] - 2026-08-20
+
+### Added
+- **The Infinite Craft script language (spec v0.6).** Every non-slash line
+  in the REPL — CLI and browser trainer — is now a script; the old
+  shorthands (`A + B`, `A ++ B`, `Q * Q`) are one-statement scripts and
+  behave as before. The language adds: `;` sequencing, `name := expr`
+  bindings (scoped to one script run), `,` union / `-` difference / `&`
+  intersection, `/` and `%` known-recipe filters, postfix `(S)*` `(S)**`
+  `(S)!` (permute / permutate / exhaust), `A * B` cross, `A ++ B` crawl,
+  `[ expr ]` and the session-global `[]` new-elements register, `^(expr)`
+  first-discoveries filter, quoted exact element references, `set @ body`
+  and `set @x body` for-each, `body -> cond` do-until, `body ~ cond`
+  while, and `cond ? a : b` ternary with size arithmetic (`|expr|`,
+  comparisons, `&&`, `||`).
+
+  Design guarantees: conditions are statically pure (mutations inside a
+  condition are parse errors); every mutating operation's value is the set
+  it produced, so pipelines chain; sets are ordered snapshots and pattern
+  evaluation is deterministic across hosts; scripts inherit bulk confirms,
+  `/auto`, `/target`, rate limiting, and cancellation unchanged. The
+  tokenizer generalizes the old convention — whitespace-delimited
+  operators are structure, attached characters belong to patterns — so
+  multi-word names (`mountain range + ship`) and fnmatch classes
+  (`mu[dg]`, leading `[bc]at`) keep working unquoted.
+
+  The parser, static checks, and all pure evaluation live in the kernel
+  (`craft.sudo`, lockstep-tested on both backends); hosts drive effects
+  through the existing bulk machinery.
+
+- **`/script` runs saved scripts** (recommended extension `.ice`): CLI
+  takes a path, the trainer opens a file picker, and
+  `infinite-craft script "src"` / `script -f path` run non-interactively.
+
+### Changed (breaking)
+- **`+|` is removed.** `A +| B` is a parse error pointing at `*`; with a
+  singleton left side they were the same operation. `/with` is unchanged.
+- **Bare words are element references everywhere.** In the old `Q * Q` and
+  `A +| Q` forms, bare operands were substring queries; now `fire` means
+  the element Fire (error if unknown) and substring matching is explicit:
+  `*fire*`. Queries with metacharacters are unchanged.
+- **A bare pattern line now prints its matches** (it used to be a usage
+  error); `A + B + C` chains combines left-to-right (it used to error).
+- **`/permutate` no longer stops at 50 rounds** — it runs until a round
+  adds nothing new. Caps are gone everywhere by design; Stop/Ctrl-C and
+  script loop conditions are the brakes.
+- **The kernel's shorthand machinery is retired, not shadowed.**
+  `classify_command_line` recognizes slash commands only, `parse_operands`
+  is deleted, the shorthand branches of line validation are gone, and
+  `may_bulk_confirm` now answers for scripts by parsing them (a script may
+  bulk-confirm iff it contains a mutating statement). Parity fixtures
+  exercise the script parser on both generated backends, including exact
+  error-message parity.
+
 ## [1.11.0] - 2026-08-19
 
 ### Added

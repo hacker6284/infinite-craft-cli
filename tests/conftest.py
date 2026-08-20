@@ -485,9 +485,6 @@ class REPLTestHarness:
     def set_bulk_warn_threshold(self, threshold: int):
         self.install_cli_patch("_BULK_WARN_THRESHOLD", threshold)
 
-    def set_max_permutate_rounds(self, rounds: int):
-        self.install_cli_patch("_MAX_PERMUTATE_ROUNDS", rounds)
-
     def set_tty_size(self, height: int = 24, width: int = 80):
         """Dims only (no winch); for isatty+chrome tests."""
         self.install_cli_patch("_tty_height", return_value=max(1, height))

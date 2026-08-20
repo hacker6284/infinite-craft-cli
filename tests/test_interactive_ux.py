@@ -1176,7 +1176,6 @@ class TestREPLHarnessEdges:
             await t
 
         repl_harness.set_bulk_warn_threshold(100)
-        repl_harness.set_max_permutate_rounds(1)
         repl_harness.set_load_recipes({})
         repl_harness.install_repl_lines_wrapper(instrument_repl_lines)
         run_async(drive())
@@ -1411,7 +1410,6 @@ class TestREPLHarnessEdges:
             await t
 
         repl_harness.set_bulk_warn_threshold(100)
-        repl_harness.set_max_permutate_rounds(1)
         repl_harness.set_load_recipes({})
         repl_harness.set_tty_size(24, 80)
         with (
@@ -1541,7 +1539,8 @@ class TestREPLHarnessEdges:
         def instrument_repl_lines(text):
             try:
                 t = str(text) if text else ""
-                if "Unknown input" in t:
+                # v2.0 always-script: a lone "[" is a script parse error.
+                if "Script error" in t:
                     try:
                         loop = asyncio.get_running_loop()
                         loop.call_soon_threadsafe(unknown_ready.set)
@@ -1571,13 +1570,13 @@ class TestREPLHarnessEdges:
         out = capsys.readouterr().out
 
         # Event proves [ line via tty editor
-        assert "Unknown input" in out
+        assert "Script error" in out
         assert "Goodbye" in out
 
         # rfind + craft> (chrome draws it; prompt may be empty w/o hook)
         assert (
-            out.rfind("Unknown") < out.rfind("Goodbye")
-            or out.rfind("input") < out.rfind("Goodbye")
+            out.rfind("Script") < out.rfind("Goodbye")
+            or out.rfind("error") < out.rfind("Goodbye")
             or out.rfind("craft>") < out.rfind("Goodbye")
         )
         assert "craft>" in out or (

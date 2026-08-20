@@ -41,6 +41,12 @@ import {
   auto_approve_outcome as autoApproveOutcome,
   bulk_confirm_required as bulkConfirmRequired,
   rate_status_note as rateStatusNote,
+  script_parse as scriptParse,
+  script_eval_expr_boundary as scriptEvalExprBoundary,
+  script_eval_cond_boundary as scriptEvalCondBoundary,
+  script_set_op_boundary as scriptSetOpBoundary,
+  script_union_tuples as scriptUnionTuples,
+  is_known_slash_command as isKnownSlashCommand,
   fetch_timeout_ms as fetchTimeoutMs,
   pair_should_retry as pairShouldRetry,
   pair_retry_backoff_ms as pairRetryBackoffMs,
@@ -55,7 +61,6 @@ import {
   validate_command_line_segments as validateCommandLineSegments,
   slash_args as slashArgs,
   parse_two_elements as parseTwoElements,
-  parse_operands as parseOperands,
   parse_with_args as parseWithArgs,
   parse_cross_queries as parseCrossQueries,
 } from "./_sudo/craft.mjs";
@@ -66,7 +71,6 @@ const RATE_LIMIT = 60;
 const RATE_WINDOW = 60000;
 const BULK_WARN = 200;
 const MAX_QUEUE_DEPTH = 50;
-const MAX_PERMUTATE_ROUNDS = 50;
 
 // ── State ────────────────────────────────────────────────────────────
 const history = []; // [{a, b, result}]
@@ -1013,6 +1017,326 @@ function waitForConfirmKey() {
   });
 }
 
+
+// ── Script driver (spec v0.6) ────────────────────────────────────────
+// The kernel owns parse, static checks, and every pure evaluation; this
+// driver walks only mutating spines and control flow, performing effects
+// through the existing bulk machinery. Sets are tuples [name, emoji, first].
+let scriptNewReg = []; // the [] register — session-global by design
+
+function scriptFail(msg) {
+  return new Error(msg);
+}
+
+function scriptEnvFlat(S) {
+  const names = [], values = [];
+  for (const frame of S.frames) {
+    for (const bind of frame) { names.push(bind.name); values.push(bind.set); }
+  }
+  return [names, values];
+}
+
+function scriptBind(S, name, set) {
+  const top = S.frames[S.frames.length - 1];
+  for (const bind of top) {
+    if (bind.name === name) { bind.set = set; return; }
+  }
+  top.push({ name, set });
+}
+
+function scriptKernelEval(S, id) {
+  const [names, values] = scriptEnvFlat(S);
+  const [ok, set, err] = scriptEvalExprBoundary(
+    S.nodes, S.kids, id, elementTuples(), recipeIndex, names, values, scriptNewReg);
+  if (!ok) throw scriptFail(err);
+  return set;
+}
+
+function scriptKernelCond(S, id) {
+  const [names, values] = scriptEnvFlat(S);
+  const [ok, truth, err] = scriptEvalCondBoundary(
+    S.nodes, S.kids, id, elementTuples(), recipeIndex, names, values, scriptNewReg);
+  if (!ok) throw scriptFail(err);
+  return truth;
+}
+
+// AST-node granularity: each completed mutating node overwrites the []
+// register; active [ expr ] collectors accumulate.
+function scriptRecordNews(S, news) {
+  scriptNewReg = news;
+  for (const collector of S.collectors) {
+    for (const t of news) collector.push(t);
+  }
+}
+
+function scriptTupleToEl(t) {
+  return { text: t[0], emoji: t[1] || "", discovered: !!t[2] };
+}
+
+async function scriptCombinePair(S, aT, bT) {
+  const result = await apiPair(aT[0], bT[0]);
+  addElement(aT[0], aT[1], false);
+  addElement(bT[0], bT[1], false);
+  let products = [], news = [];
+  if (result) {
+    const isNew = addElement(result.text, result.emoji, result.discovered);
+    recordRecipe(result.text, aT[0], bT[0]);
+    history.push({ a: aT[0], b: bT[0], result: result.text });
+    let extra = isNew ? " " + green("(new)") : "";
+    const hit = isTargetHitKernel(targetElement, result.text || "");
+    if (hit) extra += " " + bold(yellow("★ TARGET ★"));
+    print(formatResult(scriptTupleToEl(aT), scriptTupleToEl(bT), result) + extra);
+    products = [[result.text, result.emoji || "", !!result.discovered]];
+    if (isNew) news = products.slice();
+    if (hit) await acknowledgeTargetHit(aT[0], bT[0], result.text || "");
+  } else {
+    history.push({ a: aT[0], b: bT[0], result: "Nothing" });
+    print(formatResult(scriptTupleToEl(aT), scriptTupleToEl(bT), null));
+  }
+  scriptRecordNews(S, news);
+  return products;
+}
+
+// Bulk pairs through the existing pipeline (confirms, /auto, rate, target,
+// pair-level error resilience) with product/new collection on top.
+async function scriptRunPairs(S, objPairs, reason) {
+  if (!objPairs.length) return { products: [], news: [] };
+  if (bulkConfirmRequired(objPairs.length, BULK_WARN, autoApprove)) {
+    if (!(await confirmOrCancel([], { reason }))) throw scriptFail("Cancelled");
+  } else if (autoApprove && shouldBulkWarn(objPairs.length, BULK_WARN)) {
+    print("  " + dim(`Auto-approved ${objPairs.length} pairs (/auto is on).`));
+  }
+  if (cancelled) throw scriptFail("Cancelled");
+  const products = [], news = [];
+  const seenP = new Set(), seenN = new Set();
+  await runPairsInner(objPairs, {
+    onResult: ({ result, isNew }) => {
+      if (!result) return;
+      if (!seenP.has(result.text)) {
+        seenP.add(result.text);
+        products.push([result.text, result.emoji || "", !!result.discovered]);
+      }
+      if (isNew && !seenN.has(result.text)) {
+        seenN.add(result.text);
+        news.push([result.text, result.emoji || "", !!result.discovered]);
+      }
+    },
+  });
+  if (cancelled) throw scriptFail("Cancelled");
+  return { products, news };
+}
+
+function scriptObjPairs(rawPairs) {
+  return pairsFromBoundary(rawPairs);
+}
+
+async function scriptEvalOperand(S, id) {
+  return S.muts[id] ? await scriptEval(S, id) : scriptKernelEval(S, id);
+}
+
+async function scriptEval(S, id) {
+  if (cancelled) throw scriptFail("Cancelled");
+  if (!S.muts[id]) return scriptKernelEval(S, id);
+  const [kind, a, b, c, sval] = S.nodes[id];
+  if (kind === "assign") {
+    const v = await scriptEvalOperand(S, a);
+    scriptBind(S, sval, v);
+    return v;
+  }
+  if (kind === "union") {
+    let acc = [];
+    for (const kid of S.kids[a]) {
+      acc = scriptUnionTuples(acc, await scriptEvalOperand(S, kid));
+    }
+    return acc;
+  }
+  if (kind === "diff" || kind === "intersect" || kind === "canrec" || kind === "cantrec") {
+    const L = await scriptEvalOperand(S, a);
+    const R = await scriptEvalOperand(S, b);
+    return scriptSetOpBoundary(kind, L, R, recipeIndex);
+  }
+  if (kind === "first") {
+    const v = await scriptEvalOperand(S, a);
+    return v.filter((t) => !!t[2]);
+  }
+  if (kind === "newset") {
+    const collector = [];
+    S.collectors.push(collector);
+    try {
+      await scriptEvalOperand(S, a);
+    } finally {
+      S.collectors.pop();
+    }
+    return scriptUnionTuples(collector, []);
+  }
+  if (kind === "combine") {
+    const L = await scriptEvalOperand(S, a);
+    const R = await scriptEvalOperand(S, b);
+    if (L.length !== 1 || R.length !== 1) {
+      throw scriptFail(`+ combines single elements (left matched ${L.length}, right matched ${R.length}) — use , to collect or * to cross`);
+    }
+    return await scriptCombinePair(S, L[0], R[0]);
+  }
+  if (kind === "cross") {
+    const L = await scriptEvalOperand(S, a);
+    const R = await scriptEvalOperand(S, b);
+    const pairs = scriptObjPairs(crossPairsBoundary(L, R));
+    const { products, news } = await scriptRunPairs(S, pairs, `${pairs.length} pairs`);
+    scriptRecordNews(S, news);
+    return products;
+  }
+  if (kind === "permute") {
+    const v = await scriptEvalOperand(S, a);
+    const pairs = scriptObjPairs(permutePairsBoundary(v));
+    const { products, news } = await scriptRunPairs(S, pairs, `${pairs.length} pairs`);
+    scriptRecordNews(S, news);
+    return products;
+  }
+  if (kind === "exhaust") {
+    const v = await scriptEvalOperand(S, a);
+    const pairs = scriptObjPairs(exhaustPairsBoundary(v, elementTuples()));
+    const { products, news } = await scriptRunPairs(S, pairs, `${pairs.length} pairs`);
+    scriptRecordNews(S, news);
+    return products;
+  }
+  if (kind === "permutate") {
+    // Permute rounds over a growing pool until a round adds nothing new.
+    let pool = await scriptEvalOperand(S, a);
+    let products = [], news = [];
+    while (true) {
+      if (cancelled) throw scriptFail("Cancelled");
+      const pairs = scriptObjPairs(permutePairsBoundary(pool));
+      if (!pairs.length) break;
+      const round = await scriptRunPairs(S, pairs, `${pairs.length} pairs per round`);
+      products = scriptUnionTuples(products, round.products);
+      news = scriptUnionTuples(news, round.news);
+      if (!round.news.length) break;
+      pool = scriptUnionTuples(pool, round.news);
+    }
+    scriptRecordNews(S, news);
+    return products;
+  }
+  // crawl: pool = L ∪ R, generations of untried pairs until a generation
+  // adds nothing (mirrors doCrawl's kernel-driven loop).
+  const L = await scriptEvalOperand(S, a);
+  const R = await scriptEvalOperand(S, b);
+  let pool = scriptUnionTuples(L, R);
+  const triedKeys = [];
+  let products = [], news = [];
+  while (true) {
+    if (cancelled) throw scriptFail("Cancelled");
+    const [rawPairs, newKeys] = crawlGenerationPairsBoundary(pool, triedKeys);
+    for (const k of newKeys) triedKeys.push(k);
+    const pairs = scriptObjPairs(rawPairs);
+    if (!pairs.length) break;
+    const gen = await scriptRunPairs(S, pairs, `${pairs.length} pairs this generation`);
+    products = scriptUnionTuples(products, gen.products);
+    news = scriptUnionTuples(news, gen.news);
+    const before = pool.length;
+    pool = scriptUnionTuples(pool, gen.products);
+    if (pool.length === before) break;
+  }
+  scriptRecordNews(S, news);
+  return products;
+}
+
+async function scriptExecBody(S, id) {
+  await scriptExecStmt(S, id);
+}
+
+async function scriptExecStmts(S, kidsIdx) {
+  for (const stmt of S.kids[kidsIdx]) {
+    if (cancelled) throw scriptFail("Cancelled");
+    await scriptExecStmt(S, stmt);
+  }
+}
+
+async function scriptExecStmt(S, id) {
+  if (cancelled) throw scriptFail("Cancelled");
+  const [kind, a, b, c, sval] = S.nodes[id];
+  if (kind === "block") {
+    S.frames.push([]);
+    try {
+      await scriptExecStmts(S, a);
+    } finally {
+      S.frames.pop();
+    }
+    return;
+  }
+  if (kind === "assign") {
+    const v = await scriptEvalOperand(S, a);
+    scriptBind(S, sval, v);
+    print("  " + dim(`${esc(sval)} = ${v.length} element${v.length === 1 ? "" : "s"}`));
+    return;
+  }
+  if (kind === "foreach") {
+    const set = await scriptEvalOperand(S, a);
+    for (const el of set) {
+      if (cancelled) throw scriptFail("Cancelled");
+      S.frames.push([{ name: sval, set: [el] }]);
+      try {
+        await scriptExecBody(S, b);
+      } finally {
+        S.frames.pop();
+      }
+    }
+    return;
+  }
+  if (kind === "until") {
+    let iters = 0;
+    while (true) {
+      await scriptExecBody(S, a);
+      iters++;
+      if (cancelled) throw scriptFail("Cancelled");
+      if (scriptKernelCond(S, b)) break;
+    }
+    print("  " + dim(`loop: condition met after ${iters} iteration${iters === 1 ? "" : "s"}`));
+    return;
+  }
+  if (kind === "while") {
+    let iters = 0;
+    while (true) {
+      if (cancelled) throw scriptFail("Cancelled");
+      if (!scriptKernelCond(S, b)) break;
+      await scriptExecBody(S, a);
+      iters++;
+    }
+    if (iters === 0) print("  " + dim("~ loop: condition false, body skipped"));
+    else print("  " + dim(`~ loop: stopped after ${iters} iteration${iters === 1 ? "" : "s"}`));
+    return;
+  }
+  if (kind === "ternary") {
+    const truth = scriptKernelCond(S, a);
+    await scriptExecBody(S, truth ? b : c);
+    return;
+  }
+  // Expression statement: pure ones echo their value /search-style.
+  const v = await scriptEval(S, id);
+  if (!S.muts[id]) {
+    if (!v.length) print("  No matches found.");
+    else for (const t of v) print("  " + formatElement(scriptTupleToEl(t)));
+  }
+}
+
+async function runScript(source) {
+  const [ok, nodes, kids, muts, err, pos] = scriptParse(source);
+  if (!ok) {
+    print("  " + red(`Script error: ${esc(err)}`));
+    return;
+  }
+  const S = { nodes, kids, muts, frames: [[]], collectors: [] };
+  try {
+    beginRun();
+    const root = nodes.length - 1;
+    await scriptExecStmts(S, nodes[root][1]);
+  } catch (e) {
+    if (!cancelled) print("  " + red("Script aborted: " + esc((e && e.message) || String(e))));
+    else print("  " + yellow("Cancelled."));
+  } finally {
+    endRun();
+  }
+}
+
 // ── Commands ─────────────────────────────────────────────────────────
 
 function doSearch(query) {
@@ -1165,10 +1489,6 @@ async function doPermutate(query) {
     beginRun();
     while (true) {
       if (cancelled) { stopped = true; break; }
-      if (round >= MAX_PERMUTATE_ROUNDS) {
-        print(`  Reached max rounds (${MAX_PERMUTATE_ROUNDS}). Stopping.`);
-        break;
-      }
       round++;
       const knownBefore = new Set(getAllElements().map(e => e.text));
       const { matches, error } = matchElements(query);
@@ -1348,6 +1668,15 @@ async function doImportFile() {
   } finally {
     endRun();
   }
+}
+
+async function doScriptFile() {
+  print("  Select a .ice script file...");
+  const file = await pickFile(".ice");
+  if (!file || cancelled) { print("  " + yellow("Cancelled.")); return; }
+  print(`  Running ${bold(esc(file.name))}...`);
+  const source = await file.text();
+  await runScript(source);
 }
 
 async function doImport(name) {
@@ -1535,7 +1864,6 @@ function doHelp() {
     ${cyan("/crawl <element> <element>")}  Combine & crawl until no new discoveries
 
   ${bold("Bulk combine (query syntax below):")}
-    ${cyan("<element> +| <query>")}        Combine element with all matching discoveries
     ${cyan("/with <element> <query>")}     Combine element with all matching discoveries
     ${cyan("<query> * <query>")}           Cross-combine matches from both queries
     ${cyan("/cross <query> <query>")}    Cross-combine matches from both queries
@@ -1551,6 +1879,21 @@ function doHelp() {
     !                           All elements (exclude nothing)
     ^<query>                    First discoveries only (e.g. ^fire* = new fire* matches)
     ^                           All first discoveries
+
+  ${bold("Scripting (every non-slash line is a script):")}
+    ${cyan("stmt ; stmt")}                 Run statements in sequence
+    ${cyan("name := expr")}                Bind a set for this script run
+    ${cyan("a* , b*")}                     Union   ${cyan("a* - b*")} difference   ${cyan("a* & b*")} intersect
+    ${cyan("a* / b*")}                     Keep a* having a known recipe with b* (${cyan("%")} = lacking)
+    ${cyan("(expr)*  (expr)**  (expr)!")}  Permute / permutate / exhaust the set
+    ${cyan("[ expr ]")} / ${cyan("[]")}             New elements made by expr / by the last operation
+    ${cyan("^(expr)")}                     First discoveries only
+    ${cyan("set @ body")} / ${cyan("set @x body")}  For each element (as ${cyan("_")} or ${cyan("x")}) run body
+    ${cyan("body -> cond")}                Run body, repeat until cond is true
+    ${cyan("body ~ cond")}                 While cond is true, run body
+    ${cyan("cond ? body : body")}          Conds: ${cyan("|expr|")} sizes, comparisons, ${cyan("&&")} ${cyan("||")}
+    ${cyan('"exact name"')}              Quoted = exact element (spaces, commas, shadows)
+    ${cyan("/script")}                     Run a saved .ice script file
 
   ${bold("Discoveries & recipes:")}
     ${cyan("/search <query>")}             Search discoveries
@@ -1706,10 +2049,25 @@ function enqueueCommand(line) {
 }
 
 function tryEnqueue(line) {
-  const errorSegments = validateCommandLineSegments(line);
-  if (errorSegments) {
-    print(renderErrorSegments(errorSegments));
-    return false;
+  if (isKnownSlashCommand(line)) {
+    const errorSegments = validateCommandLineSegments(line);
+    if (errorSegments) {
+      print(renderErrorSegments(errorSegments));
+      return false;
+    }
+  } else if (!isLocalCommand(line)) {
+    // Always-script REPL: parse (and static-check) before queueing so
+    // errors surface immediately, and nothing runs on a broken script.
+    const [ok, , , , err] = scriptParse(line);
+    if (!ok) {
+      if (line.trimStart().startsWith("/")) {
+        // Slash-shaped but neither a known command nor a parseable script.
+        print(`  Unknown command. Type ${yellow("/help")} for commands.`);
+      } else {
+        print("  " + red(`Script error: ${esc(err)}`));
+      }
+      return false;
+    }
   }
   const lane = commandQueueLane(line);
   const ib = lane === "ib";
@@ -1835,25 +2193,7 @@ async function executeClassified(kind, payload, line) {
     await doCross(parsed[0], parsed[1]);
     return;
   }
-  if (kind === "++") {
-    const parsed = parseOperands(kind, payload);
-    await doCrawl(parsed[0], parsed[1]);
-    return;
-  }
-  if (kind === "+|") {
-    const parsed = parseOperands(kind, payload);
-    await doCombineWithQuery(parsed[0], parsed[1]);
-    return;
-  }
-  if (kind === "*") {
-    const parsed = parseOperands(kind, payload);
-    await doCross(parsed[0], parsed[1]);
-    return;
-  }
-  if (kind === "+") {
-    const parsed = parseOperands(kind, payload);
-    await doCombine(parsed[0], parsed[1]);
-  }
+
 }
 
 async function executeCommand(line) {
@@ -1873,9 +2213,14 @@ async function executeCommand(line) {
   if ((rest = slashArgs(line, "/history")) !== null) { doHistory(); return; }
   if ((rest = slashArgs(line, "/target")) !== null) { doTarget(rest); return; }
   if ((rest = slashArgs(line, "/auto")) !== null) { doAuto(rest); return; }
+  if ((rest = slashArgs(line, "/script")) !== null) { await doScriptFile(); return; }
   if ((rest = slashArgs(line, "/clear")) !== null) { output.innerHTML = ""; return; }
   if ((rest = slashArgs(line, "/unfilled")) !== null) { doUnfilled(); return; }
 
+  if (!isKnownSlashCommand(line)) {
+    await runScript(line);
+    return;
+  }
   const classified = classifyCommandLine(line);
   if (!classified) {
     const errorSegments = validateCommandLineSegments(line);

@@ -3,6 +3,7 @@
 
 import asyncio
 import argparse
+from pathlib import Path
 import builtins
 import contextlib
 import gzip
@@ -77,7 +78,6 @@ _current_ib_command: str = ""  # IB lane; "" = idle
 _api_worker_task: asyncio.Task | None = None  # pair worker
 _ib_worker_task: asyncio.Task | None = None
 _MAX_QUEUE_DEPTH = 50
-_MAX_PERMUTATE_ROUNDS = 50
 _stdin_lock = asyncio.Lock()
 _cancel_scope_depth = 0
 _sigint_previous: object | None = None
@@ -180,7 +180,7 @@ def _reset_test_state() -> None:
     _discard_queue_after_cancel = False
     global _job_done, _job_total, _ib_job_done, _ib_job_total
     global _last_pair, _active_client, _rate_ticker_task, _target_element
-    global _confirm_reason, _auto_approve
+    global _confirm_reason, _auto_approve, _script_new_reg
     _job_done = 0
     _job_total = 0
     _ib_job_done = 0
@@ -190,6 +190,7 @@ def _reset_test_state() -> None:
     _rate_ticker_task = None
     _target_element = ""
     _auto_approve = False
+    _script_new_reg = []
     _confirm_reason = ""
     _skip_summary_shown = False
     _sigint_previous = None
@@ -670,6 +671,7 @@ _rate_ticker_task: asyncio.Task | None = None
 # Empty string = no target (kernel is_target_hit/apply_target_state treat "" as idle).
 _target_element: str = ""
 _auto_approve: bool = False  # /auto: skip bulk-size y/n confirms this session
+_script_new_reg: list[tuple[str, str, bool]] = []  # the [] register (session-global)
 _target_hit_lock = asyncio.Lock()
 # Confirm chrome reason (e.g. "331 pairs"); keys live only on the prompt.
 _confirm_reason: str = ""
@@ -1842,7 +1844,7 @@ async def _sleep_cancellable_async(seconds: float, step: float = 0.1) -> bool:
     return _cancelled
 
 
-async def _combine_pairs(client, storage, pairs: list[tuple]):
+async def _combine_pairs(client, storage, pairs: list[tuple], collect: dict | None = None):
     """Combine a list of (element, element) pairs with light parallelism.
 
     Pairs execute in kernel priority order — proven combiners first
@@ -1913,10 +1915,19 @@ async def _combine_pairs(client, storage, pairs: list[tuple]):
             nothing_count += 1
         else:
             tag = ""
+            if collect is not None and result.name not in collect["_seen_products"]:
+                collect["_seen_products"].add(result.name)
+                collect["products"].append(
+                    (result.name, result.emoji or "", bool(result.is_first_discovery))
+                )
             if result.name not in known_names:
                 tag = " " + _color("[NEW]", BOLD + GREEN)
                 new_count += 1
                 known_names.add(result.name)
+                if collect is not None:
+                    collect["news"].append(
+                        (result.name, result.emoji or "", bool(result.is_first_discovery))
+                    )
             hit = craft.is_target_hit(_target_element, result.name or "")
             if hit:
                 tag += " " + _color("★ TARGET ★", BOLD + YELLOW + MAGENTA)
@@ -2010,11 +2021,6 @@ async def do_permutate(client, storage, query: str):
         while True:
             if _cancelled:
                 stopped = True
-                break
-            if round_num >= _MAX_PERMUTATE_ROUNDS:
-                _repl_print_lines(
-                    f"  Reached max rounds ({_MAX_PERMUTATE_ROUNDS}). Stopping."
-                )
                 break
             round_num += 1
             known_before = {e.name for e in storage.get_all()}
@@ -2512,7 +2518,6 @@ def do_help() -> str:
     /crawl <element> <element>    Combine & crawl until no new discoveries
 
   Bulk combine (query syntax below):
-    <element> +| <query>          Combine element with all matching discoveries
     /with <element> <query>       Combine element with all matching discoveries
     <query> * <query>             Cross-combine matches from both queries
     /cross <query> <query>        Cross-combine matches from both queries
@@ -2534,6 +2539,21 @@ def do_help() -> str:
     !                             All elements (exclude nothing)
     ^<query>                      First discoveries only (e.g. ^fire* = new fire* matches)
     ^                             All first discoveries
+
+  Scripting (every non-slash line is a script):
+    stmt ; stmt                   Run statements in sequence
+    name := expr                  Bind a set for this script run
+    a* , b*                       Union    a* - b*  difference    a* & b*  intersect
+    a* / b*                       Keep a* having a known recipe with b* (% = lacking)
+    (expr)*  (expr)**  (expr)!    Permute / permutate / exhaust the set
+    [ expr ]  /  []               New elements made by expr / by the last operation
+    ^(expr)                       First discoveries only
+    set @ body   set @x body      For each element (as _ or x) run body
+    body -> cond                  Run body, repeat until cond is true
+    body ~ cond                   While cond is true, run body
+    cond ? body : body            Conds: |expr| sizes, comparisons, && ||
+    "exact name"                  Quoted = exact element (spaces, commas, shadows)
+    /script <path.ice>            Run a saved script file
 
   Discoveries & recipes:
     /search <query>               Search discoveries
@@ -2866,6 +2886,353 @@ def _craft_prompt() -> str:
     return base + hint
 
 
+
+# ---------------------------------------------------------------------------
+# Script driver (spec v0.6)
+# The kernel owns parse, static checks, and pure evaluation; this driver
+# walks mutating spines and control flow, performing effects through the
+# existing machinery. Sets are tuples (name, emoji, first).
+# ---------------------------------------------------------------------------
+
+
+class ScriptError(Exception):
+    pass
+
+
+class _ScriptState:
+    __slots__ = ("nodes", "kids", "muts", "frames", "collectors")
+
+    def __init__(self, nodes, kids, muts):
+        self.nodes = nodes
+        self.kids = kids
+        self.muts = muts
+        self.frames: list[list] = [[]]  # scope frames of (name, set)
+        self.collectors: list[list] = []
+
+
+def _script_env_flat(S):
+    names, values = [], []
+    for frame in S.frames:
+        for name, val in frame:
+            names.append(name)
+            values.append(val)
+    return names, values
+
+
+def _script_bind(S, name, val):
+    top = S.frames[-1]
+    for i, (n, _v) in enumerate(top):
+        if n == name:
+            top[i] = (name, val)
+            return
+    top.append((name, val))
+
+
+def _script_kernel_eval(S, storage, node_id):
+    names, values = _script_env_flat(S)
+    ok, result, err = craft.script_eval_expr_boundary(
+        S.nodes, S.kids, node_id, _elements_to_boundary(storage.get_all()),
+        _load_recipes(), names, values, list(_script_new_reg),
+    )
+    if not ok:
+        raise ScriptError(err)
+    return [tuple(t) for t in result]
+
+
+def _script_kernel_cond(S, storage, node_id):
+    names, values = _script_env_flat(S)
+    ok, truth, err = craft.script_eval_cond_boundary(
+        S.nodes, S.kids, node_id, _elements_to_boundary(storage.get_all()),
+        _load_recipes(), names, values, list(_script_new_reg),
+    )
+    if not ok:
+        raise ScriptError(err)
+    return truth
+
+
+def _script_record_news(S, news):
+    # AST-node granularity: the last completed mutating node owns [].
+    global _script_new_reg
+    _script_new_reg = list(news)
+    for collector in S.collectors:
+        collector.extend(news)
+
+
+def _script_tuple_el(t):
+    return Element(name=t[0], emoji=t[1] or "", is_first_discovery=bool(t[2]))
+
+
+def _script_pairs_from_raw(raw_pairs):
+    pairs = []
+    for at, ae, af, bt, be, bf in raw_pairs:
+        pairs.append((
+            Element(name=at, emoji=ae, is_first_discovery=bool(af)),
+            Element(name=bt, emoji=be, is_first_discovery=bool(bf)),
+        ))
+    return pairs
+
+
+async def _script_run_pairs(S, client, storage, pairs, reason):
+    global _bulk_confirm_resolved
+    if not pairs:
+        return [], []
+    if craft.bulk_confirm_required(len(pairs), _BULK_WARN_THRESHOLD, _auto_approve):
+        if not await _prompt_continue(bulk_pending=True, reason=reason):
+            raise CommandCancelled()
+        _bulk_confirm_resolved = True
+    else:
+        if _auto_approve and craft.should_bulk_warn(len(pairs), _BULK_WARN_THRESHOLD):
+            _repl_print_lines(
+                _color(f"  Auto-approved {len(pairs)} pairs (/auto is on).", DIM)
+            )
+        _bulk_confirm_resolved = True
+    collect = {"products": [], "news": [], "_seen_products": set()}
+    await _combine_pairs(client, storage, pairs, collect=collect)
+    if _cancelled:
+        raise CommandCancelled()
+    return collect["products"], collect["news"]
+
+
+async def _script_combine_pair(S, client, storage, a_t, b_t):
+    global _bulk_confirm_resolved
+    _bulk_confirm_resolved = True  # single combines never bulk-confirm
+    a = _script_tuple_el(a_t)
+    b = _script_tuple_el(b_t)
+    result = await _cached_pair(client, storage, a, b)
+    products, news = [], []
+    if result.name is not None:
+        for elem in (a, b):
+            storage.add(
+                name=craft.sanitize_element_name(elem.name),
+                emoji=elem.emoji,
+                is_first_discovery=False,
+            )
+        known = storage.get_by_name(result.name) is not None
+        storage.add(
+            name=craft.sanitize_element_name(result.name),
+            emoji=result.emoji,
+            is_first_discovery=result.is_first_discovery,
+        )
+        tag = "" if known else " " + _color("[NEW]", BOLD + GREEN)
+        hit = craft.is_target_hit(_target_element, result.name or "")
+        if hit:
+            tag += " " + _color("★ TARGET ★", BOLD + YELLOW + MAGENTA)
+        _repl_print_lines(
+            f"  {format_element(a)} + {format_element(b)} = {format_element(result)}{tag}"
+        )
+        products = [(result.name, result.emoji or "", bool(result.is_first_discovery))]
+        if not known:
+            news = list(products)
+        if hit:
+            await _acknowledge_target_hit(a.name, b.name, result.name or "")
+    else:
+        _repl_print_lines(f"  {format_element(a)} + {format_element(b)} = Nothing")
+    _history.append((a.name, b.name, result.name if result.name else "Nothing"))
+    _script_record_news(S, news)
+    return products
+
+
+def _script_union(a, b):
+    return [tuple(t) for t in craft.script_union_tuples(list(a), list(b))]
+
+
+async def _script_eval_operand(S, client, storage, node_id):
+    if S.muts[node_id]:
+        return await _script_eval(S, client, storage, node_id)
+    return _script_kernel_eval(S, storage, node_id)
+
+
+async def _script_eval(S, client, storage, node_id):
+    _raise_if_cancelled()
+    if not S.muts[node_id]:
+        return _script_kernel_eval(S, storage, node_id)
+    kind, a, b, c, sval = S.nodes[node_id]
+    if kind == "assign":
+        v = await _script_eval_operand(S, client, storage, a)
+        _script_bind(S, sval, v)
+        return v
+    if kind == "union":
+        acc = []
+        for kid in S.kids[a]:
+            acc = _script_union(acc, await _script_eval_operand(S, client, storage, kid))
+        return acc
+    if kind in ("diff", "intersect", "canrec", "cantrec"):
+        left = await _script_eval_operand(S, client, storage, a)
+        right = await _script_eval_operand(S, client, storage, b)
+        return [tuple(t) for t in craft.script_set_op_boundary(kind, left, right, _load_recipes())]
+    if kind == "first":
+        v = await _script_eval_operand(S, client, storage, a)
+        return [t for t in v if t[2]]
+    if kind == "newset":
+        collector: list = []
+        S.collectors.append(collector)
+        try:
+            await _script_eval_operand(S, client, storage, a)
+        finally:
+            S.collectors.pop()
+        return _script_union(collector, [])
+    if kind == "combine":
+        left = await _script_eval_operand(S, client, storage, a)
+        right = await _script_eval_operand(S, client, storage, b)
+        if len(left) != 1 or len(right) != 1:
+            raise ScriptError(
+                f"+ combines single elements (left matched {len(left)}, "
+                f"right matched {len(right)}) — use , to collect or * to cross"
+            )
+        return await _script_combine_pair(S, client, storage, left[0], right[0])
+    if kind == "cross":
+        left = await _script_eval_operand(S, client, storage, a)
+        right = await _script_eval_operand(S, client, storage, b)
+        pairs = _script_pairs_from_raw(craft.cross_pairs_boundary(left, right))
+        products, news = await _script_run_pairs(S, client, storage, pairs, f"{len(pairs)} pairs")
+        _script_record_news(S, news)
+        return products
+    if kind == "permute":
+        v = await _script_eval_operand(S, client, storage, a)
+        pairs = _script_pairs_from_raw(craft.permute_pairs_boundary(v))
+        products, news = await _script_run_pairs(S, client, storage, pairs, f"{len(pairs)} pairs")
+        _script_record_news(S, news)
+        return products
+    if kind == "exhaust":
+        v = await _script_eval_operand(S, client, storage, a)
+        pairs = _script_pairs_from_raw(
+            craft.exhaust_pairs_boundary(v, _elements_to_boundary(storage.get_all()))
+        )
+        products, news = await _script_run_pairs(S, client, storage, pairs, f"{len(pairs)} pairs")
+        _script_record_news(S, news)
+        return products
+    if kind == "permutate":
+        pool = await _script_eval_operand(S, client, storage, a)
+        products: list = []
+        news_all: list = []
+        while True:
+            _raise_if_cancelled()
+            pairs = _script_pairs_from_raw(craft.permute_pairs_boundary(pool))
+            if not pairs:
+                break
+            round_products, round_news = await _script_run_pairs(
+                S, client, storage, pairs, f"{len(pairs)} pairs per round"
+            )
+            products = _script_union(products, round_products)
+            news_all = _script_union(news_all, round_news)
+            if not round_news:
+                break
+            pool = _script_union(pool, round_news)
+        _script_record_news(S, news_all)
+        return products
+    # crawl
+    left = await _script_eval_operand(S, client, storage, a)
+    right = await _script_eval_operand(S, client, storage, b)
+    pool = _script_union(left, right)
+    tried: list = []
+    products = []
+    news_all = []
+    while True:
+        _raise_if_cancelled()
+        raw_pairs, new_keys = craft.crawl_generation_pairs_boundary(pool, tried)
+        tried.extend(new_keys)
+        pairs = _script_pairs_from_raw(raw_pairs)
+        if not pairs:
+            break
+        gen_products, gen_news = await _script_run_pairs(
+            S, client, storage, pairs, f"{len(pairs)} pairs this generation"
+        )
+        products = _script_union(products, gen_products)
+        news_all = _script_union(news_all, gen_news)
+        before = len(pool)
+        pool = _script_union(pool, gen_products)
+        if len(pool) == before:
+            break
+    _script_record_news(S, news_all)
+    return products
+
+
+async def _script_exec_stmts(S, client, storage, kids_idx):
+    for stmt in S.kids[kids_idx]:
+        _raise_if_cancelled()
+        await _script_exec_stmt(S, client, storage, stmt)
+
+
+async def _script_exec_stmt(S, client, storage, node_id):
+    _raise_if_cancelled()
+    kind, a, b, c, sval = S.nodes[node_id]
+    if kind == "block":
+        S.frames.append([])
+        try:
+            await _script_exec_stmts(S, client, storage, a)
+        finally:
+            S.frames.pop()
+        return
+    if kind == "assign":
+        v = await _script_eval_operand(S, client, storage, a)
+        _script_bind(S, sval, v)
+        plural = "" if len(v) == 1 else "s"
+        _repl_print_lines(_color(f"  {sval} = {len(v)} element{plural}", DIM))
+        return
+    if kind == "foreach":
+        vals = await _script_eval_operand(S, client, storage, a)
+        for el in vals:
+            _raise_if_cancelled()
+            S.frames.append([(sval, [el])])
+            try:
+                await _script_exec_stmt(S, client, storage, b)
+            finally:
+                S.frames.pop()
+        return
+    if kind == "until":
+        iters = 0
+        while True:
+            await _script_exec_stmt(S, client, storage, a)
+            iters += 1
+            _raise_if_cancelled()
+            if _script_kernel_cond(S, storage, b):
+                break
+        plural = "" if iters == 1 else "s"
+        _repl_print_lines(_color(f"  loop: condition met after {iters} iteration{plural}", DIM))
+        return
+    if kind == "while":
+        iters = 0
+        while True:
+            _raise_if_cancelled()
+            if not _script_kernel_cond(S, storage, b):
+                break
+            await _script_exec_stmt(S, client, storage, a)
+            iters += 1
+        if iters == 0:
+            _repl_print_lines(_color("  ~ loop: condition false, body skipped", DIM))
+        else:
+            plural = "" if iters == 1 else "s"
+            _repl_print_lines(_color(f"  ~ loop: stopped after {iters} iteration{plural}", DIM))
+        return
+    if kind == "ternary":
+        truth = _script_kernel_cond(S, storage, a)
+        await _script_exec_stmt(S, client, storage, b if truth else c)
+        return
+    v = await _script_eval(S, client, storage, node_id)
+    if not S.muts[node_id]:
+        if not v:
+            _repl_print_lines("  No matches found.")
+        else:
+            _repl_print_lines(
+                "\n".join("  " + format_element(_script_tuple_el(t)) for t in v)
+            )
+
+
+async def _run_script(client, storage, source: str) -> None:
+    ok, nodes, kids, muts, err, pos = craft.script_parse(source)
+    if not ok:
+        _repl_print_lines(f"  {_color(f'Script error: {_tty(err)}', RED)}")
+        return
+    S = _ScriptState(nodes, kids, muts)
+    try:
+        root = len(nodes) - 1
+        await _script_exec_stmts(S, client, storage, nodes[root][1])
+    except CommandCancelled:
+        _repl_print_lines(f"  {_color('Cancelled.', YELLOW)}")
+    except ScriptError as e:
+        _repl_print_lines(f"  {_color(f'Script aborted: {_tty(str(e))}', RED)}")
+
+
 async def _dispatch_line(client, storage, line: str) -> None:
     """Execute one input line from the API worker or immediate local commands."""
     if line == "/help":
@@ -2959,23 +3326,22 @@ async def _dispatch_line(client, storage, line: str) -> None:
             print(f"  {_color('(terminal has no output buffer to clear)', DIM)}")
         else:
             _chrome_sync()
-    elif (classified := craft.classify_command_line(line)) is not None and classified[
-        0
-    ] in ("bad+|", "++", "+|", "*", "+"):
-        kind, payload = classified
-        if kind == "bad+|" or (parsed := craft.parse_operands(kind, payload)) is None:
-            # Same kernel path validation would take; renders the same
-            # bad-pipe or usage message.
-            _repl_print_lines(_validate_command_line(line))
-        elif kind == "++":
-            await do_crawl(client, storage, parsed[0], parsed[1])
-        elif kind == "+|":
-            await do_with(client, storage, parsed[0], parsed[1])
-        elif kind == "*":
-            await do_cross(client, storage, parsed[0], parsed[1])
-        else:  # "+"
-            res = await do_combine(client, storage, parsed[0], parsed[1])
-            _repl_print_lines(res)
+    elif (rest := craft.slash_args(line, "/script")) is not None:
+        if not rest:
+            _repl_print_lines("  Usage: /script <path.ice>")
+        else:
+            try:
+                source = Path(rest).expanduser().read_text(encoding="utf-8")
+            except OSError as e:
+                _repl_print_lines(f"  {_color(f'Cannot read script: {_tty(str(e))}', RED)}")
+            else:
+                await _run_script(client, storage, source)
+    elif not craft.is_known_slash_command(line) and not line.startswith("/"):
+        # Always-script REPL (v2): every non-slash line is a script.
+        await _run_script(client, storage, line)
+    elif not craft.is_known_slash_command(line) and craft.script_parse(line)[0]:
+        # Lines like `/steam/ , fire*` start with "/" but are scripts.
+        await _run_script(client, storage, line)
     else:
         _repl_print_lines(
             f"  Unknown input. Type {_color('/help', YELLOW)} for commands."
@@ -3087,10 +3453,25 @@ def _ensure_lane_worker(cfg: _LaneCfg, client, storage):
 
 def _enqueue_command_line(line: str, client, storage) -> bool:
     """Append a line to the pair or IB queue. Returns True if enqueued."""
-    error = _validate_command_line(line)
-    if error:
-        _repl_print_lines(error)
-        return False
+    if craft.is_known_slash_command(line):
+        error = _validate_command_line(line)
+        if error:
+            _repl_print_lines(error)
+            return False
+    elif not craft.is_local_command(line):
+        # Always-script REPL: parse (and static-check) before queueing so
+        # errors surface immediately and broken scripts never run.
+        ok, _nodes, _kids, _muts, err, _pos = craft.script_parse(line)
+        if not ok:
+            if line.lstrip().startswith("/"):
+                # A slash-shaped line that is neither a known command nor a
+                # parseable script is a typo'd command, not a script.
+                _repl_print_lines(
+                    f"  Unknown command. Type {_color('/help', YELLOW)} for commands."
+                )
+            else:
+                _repl_print_lines(f"  {_color(f'Script error: {_tty(err)}', RED)}")
+            return False
     lane = craft.command_queue_lane(line)
     ib = lane == "ib"
     if ib:
@@ -3364,6 +3745,12 @@ async def noninteractive_mode(args):
                 await do_cross(client, storage, args.left, args.right)
             elif args.command == "with":
                 await do_with(client, storage, args.element, args.query)
+            elif args.command == "script":
+                if args.file:
+                    source = Path(args.file).expanduser().read_text(encoding="utf-8")
+                else:
+                    source = args.source
+                await _run_script(client, storage, source)
 
 
 # ---------------------------------------------------------------------------
@@ -3441,6 +3828,12 @@ def main():
     )
     with_p.add_argument("element", help="Element name")
     with_p.add_argument("query", help=_QUERY_HELP)
+
+    script_p = subparsers.add_parser(
+        "script", help="Run an Infinite Craft script (spec v0.6)"
+    )
+    script_p.add_argument("source", nargs="?", default="", help="Script source text")
+    script_p.add_argument("-f", "--file", help="Path to a .ice script file")
 
     args = parser.parse_args()
 

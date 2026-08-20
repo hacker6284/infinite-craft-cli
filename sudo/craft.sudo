@@ -778,6 +778,23 @@ export func is_ib_command(line: text) -> bool
         return true
     return false
 
+// Always-script dispatch (v2): a line starting with "/" is a slash command
+// only when its first token names a known command; anything else (e.g. a
+// /regex/ statement) is a script. First token = up to first whitespace.
+export func is_known_slash_command(line: text) -> bool
+    stripped = strip_spaces(line)
+    if stripped.length == 0 or stripped[0] != '/'
+        return false
+    end = 0
+    while end < stripped.length and not is_ascii_space(stripped[end])
+        end = end + 1
+    head = text_slice(stripped, 0, end)
+    known: List<text> = ["/help", "/search", "/recipe", "/list", "/history", "/target", "/auto", "/clear", "/unfilled", "/queue", "/import", "/fill", "/prune", "/export", "/combine", "/crawl", "/with", "/cross", "/permute", "/permutate", "/exhaust", "/script"]
+    for k in known
+        if head == k
+            return true
+    return false
+
 // Host queue routing: "local" | "ib" | "pair".
 // Local runs immediately; ib and pair are independent FIFO workers.
 export func command_queue_lane(line: text) -> text
@@ -831,7 +848,15 @@ export func may_bulk_confirm(line: text) -> bool
     while end < s.length and not is_ascii_space(s[end])
         end = end + 1
     head = text_slice(s, 0, end)
-    return head == "/permutate" or head == "/permute" or head == "/exhaust" or head == "/cross" or head == "/with"
+    if head == "/permutate" or head == "/permute" or head == "/exhaust" or head == "/cross" or head == "/with"
+        return true
+    if is_known_slash_command(s) or is_local_command(s) or is_ib_command(s)
+        return false
+    // v2.0: a script may bulk-confirm iff it contains a mutating statement.
+    ok, nodes, kids, muts, err, pos = script_parse(s)
+    if not ok or nodes.length == 0
+        return false
+    return muts[nodes.length - 1]
 
 // Pair-count bulk-warn predicate (strict greater-than). Hosts keep threshold constants.
 export func should_bulk_warn(n: int, threshold: int) -> bool
@@ -977,6 +1002,1078 @@ export func ib_should_retry(status: int, attempt: int) -> bool
         return false
     return attempt + 1 < ib_retry_max_attempts()
 
+
+// ---------------------------------------------------------------------------
+// Script language v0.6 — tokenizer
+// (docs/superpowers/specs/2026-08-20-script-language-v0.6.md §1)
+//
+// Token kinds: "word" (pattern/ident/number material; may contain single
+// spaces), "str" (quoted element reference, quotes stripped), "op"
+// (standalone operator), "post" (postfix * ** ! attached after ) ] []),
+// "atid" (@ident binder), and structural: "(" ")" "{" "}" ";" "," "@"
+// "[" "]" "[]" "|" "^(".
+// The standalone/attached rule: attached characters belong to the pattern;
+// operator spellings are operators only when whitespace-delimited.
+// ---------------------------------------------------------------------------
+
+func sl_is_ident_char(c: int) -> bool
+    if c >= 'a' and c <= 'z'
+        return true
+    if c >= 'A' and c <= 'Z'
+        return true
+    if c >= '0' and c <= '9'
+        return true
+    return c == '_'
+
+// Reserved everywhere: seeing one always ends/blocks a pattern token.
+// 34 = double quote, 39 = single quote, 35 = '#'.
+func sl_is_reserved(c: int) -> bool
+    if c == '(' or c == ')' or c == '{' or c == '}' or c == ';' or c == ','
+        return true
+    if c == '@' or c == '|' or c == 34 or c == 39 or c == 35
+        return true
+    return false
+
+// Characters allowed immediately AFTER a standalone operator (besides
+// whitespace/EOF): openers of the constructs an operand can start with.
+func sl_op_after_ok(c: int) -> bool
+    return c == '(' or c == '{' or c == '[' or c == '|' or c == '^' or c == 34 or c == 39
+
+// Longest-first standalone operator match at position i (which must be a
+// token boundary). Returns (spelling, next_index) or ("", i) on no match.
+func sl_match_op(source: text, i: int) -> (text, int)
+    n = source.length
+    two: List<text> = [":=", "->", "&&", "||", "==", "!=", ">=", "<=", "++"]
+    for op in two
+        if i + 1 < n and source[i] == op[0] and source[i + 1] == op[1]
+            j = i + 2
+            if j >= n or is_ascii_space(source[j]) or sl_op_after_ok(source[j])
+                return (op, j)
+    singles: List<int> = ['+', '-', '*', '/', '%', '&', '~', '?', ':', '>', '<']
+    for s in singles
+        if source[i] == s
+            j = i + 1
+            if j >= n or is_ascii_space(source[j]) or sl_op_after_ok(source[j])
+                out: text = ""
+                out.append(s)
+                return (out, j)
+    return ("", i)
+
+// Postfix scan directly after a ")" "]" or "[]" token (no whitespace).
+// Returns (spelling, next_index) or ("", i).
+func sl_match_postfix(source: text, i: int) -> (text, int)
+    n = source.length
+    if i >= n
+        return ("", i)
+    if source[i] == '!'
+        return ("!", i + 1)
+    if source[i] == '*'
+        if i + 1 < n and source[i + 1] == '*'
+            return ("**", i + 2)
+        return ("*", i + 1)
+    return ("", i)
+
+// Scan one word/pattern token starting at i (first char already known to be
+// non-space, non-reserved, not an op/structural start). Greedy across single
+// spaces; stops at newline, reserved chars, or a space followed by a
+// standalone operator / quote / newline. A token whose FIRST char is '/'
+// consumes a /regex/ span raw (spaces and reserved chars inside belong to
+// the regex body).
+func sl_scan_word(source: text, start: int) -> (text, int)
+    n = source.length
+    buf: text = ""
+    i = start
+    if source[i] == '/'
+        buf.append('/')
+        i = i + 1
+        while i < n and source[i] != '/' and source[i] != 10
+            buf.append(source[i])
+            i = i + 1
+        if i < n and source[i] == '/'
+            buf.append('/')
+            i = i + 1
+    while i < n
+        c = source[i]
+        if c == 10
+            break
+        if sl_is_reserved(c)
+            break
+        if is_ascii_space(c)
+            j = i
+            while j < n and is_ascii_space(source[j]) and source[j] != 10
+                j = j + 1
+            if j >= n or source[j] == 10
+                break
+            c2 = source[j]
+            if sl_is_reserved(c2)
+                break
+            // Standalone brackets after a space end the word: `[ expr ]`
+            // closers/openers are structure. Attached `[dg]` classes reach
+            // here only when the space is followed by `[x` (x not space/]),
+            // which stays pattern material.
+            if c2 == ']'
+                break
+            if c2 == '[' and (j + 1 >= n or is_ascii_space(source[j + 1]) or source[j + 1] == ']')
+                break
+            op, unused = sl_match_op(source, j)
+            if op.length > 0
+                break
+            if c2 == '^' and j + 1 < n and source[j + 1] == '('
+                break
+            buf.append(' ')
+            i = j
+            continue
+        buf.append(c)
+        i = i + 1
+    return (buf, i)
+
+// Tokenize a script. Returns (ok, tokens, err, err_pos); tokens are
+// (kind, sval, pos).
+export func script_tokenize(source: text) -> (bool, List<(text, text, int)>, text, int)
+    tokens: List<(text, text, int)> = []
+    n = source.length
+    i = 0
+    while i < n
+        c = source[i]
+        if is_ascii_space(c)
+            i = i + 1
+            continue
+        if c == 35
+            while i < n and source[i] != 10
+                i = i + 1
+            continue
+        if c == 34 or c == 39
+            q = c
+            j = i + 1
+            buf: text = ""
+            while j < n and source[j] != q
+                buf.append(source[j])
+                j = j + 1
+            if j >= n
+                return (false, tokens, "Unterminated string", i)
+            tokens.append(("str", buf, i))
+            i = j + 1
+            continue
+        if c == '(' or c == '{' or c == '}' or c == ';' or c == ','
+            kind: text = ""
+            kind.append(c)
+            tokens.append((kind, kind, i))
+            i = i + 1
+            continue
+        if c == ')'
+            tokens.append((")", ")", i))
+            i = i + 1
+            post, pi = sl_match_postfix(source, i)
+            if post.length > 0
+                tokens.append(("post", post, i))
+                i = pi
+            continue
+        if c == '['
+            if i + 1 < n and source[i + 1] == ']'
+                tokens.append(("[]", "[]", i))
+                i = i + 2
+                post2, pi2 = sl_match_postfix(source, i)
+                if post2.length > 0
+                    tokens.append(("post", post2, i))
+                    i = pi2
+                continue
+            if i + 1 >= n or is_ascii_space(source[i + 1])
+                tokens.append(("[", "[", i))
+                i = i + 1
+                continue
+            // attached: leading character class — pattern material
+            word, wi = sl_scan_word(source, i)
+            tokens.append(("word", word, i))
+            i = wi
+            continue
+        if c == ']'
+            tokens.append(("]", "]", i))
+            i = i + 1
+            post3, pi3 = sl_match_postfix(source, i)
+            if post3.length > 0
+                tokens.append(("post", post3, i))
+                i = pi3
+            continue
+        if c == '@'
+            if i + 1 < n and sl_is_ident_char(source[i + 1]) and not (source[i + 1] >= '0' and source[i + 1] <= '9')
+                j2 = i + 1
+                name: text = ""
+                while j2 < n and sl_is_ident_char(source[j2])
+                    name.append(source[j2])
+                    j2 = j2 + 1
+                tokens.append(("atid", name, i))
+                i = j2
+                continue
+            tokens.append(("@", "@", i))
+            i = i + 1
+            continue
+        if c == '^' and i + 1 < n and source[i + 1] == '('
+            tokens.append(("^(", "^(", i))
+            i = i + 2
+            continue
+        if c == '|'
+            op2, oi = sl_match_op(source, i)
+            if op2 == "||"
+                tokens.append(("op", "||", i))
+                i = oi
+                continue
+            tokens.append(("|", "|", i))
+            i = i + 1
+            continue
+        op3, oi3 = sl_match_op(source, i)
+        if op3.length > 0
+            tokens.append(("op", op3, i))
+            i = oi3
+            continue
+        word2, wi2 = sl_scan_word(source, i)
+        if word2.length == 0
+            return (false, tokens, "Unexpected character", i)
+        tokens.append(("word", word2, i))
+        i = wi2
+    return (true, tokens, "", 0)
+
+// Compact repr for tests: kind:sval joined by section signs.
+export func script_tokens_repr(tokens: List<(text, text, int)>) -> text
+    out: text = ""
+    first = true
+    for tok in tokens
+        kind, sval, pos = tok
+        if not first
+            out = out + "\u{a7}"
+        first = false
+        if kind == "word" or kind == "str" or kind == "op" or kind == "post" or kind == "atid"
+            out = out + kind + ":" + sval
+        else
+            out = out + kind
+    return out
+
+
+// ---------------------------------------------------------------------------
+// Script language v0.6 — parser
+//
+// AST is a flat node table (boundary-safe primitives). Node fields:
+//   (kind, a, b, c, sval)
+// Kinds and field use:
+//   script/block  a = kids index (statement list)
+//   assign        sval = name, a = value node
+//   union         a = kids index (operands)
+//   combine/diff/cross/intersect/canrec/cantrec/crawl   a = left, b = right
+//   permute/permutate/exhaust/first/newset/size         a = inner
+//   newreg        ([])
+//   pattern/ref/strref                                  sval = text
+//   foreach       a = set expr, b = body, sval = binder ("_" anonymous)
+//   until/while   a = body, b = cond
+//   ternary       a = cond, b = then, c = else
+//   or/and        a = kids index
+//   cmp           a = left num, b = right num, sval = operator
+//   num           a = integer value
+//   narith        a = left, b = right, sval = operator
+// Root node is the last appended (nodes.length - 1).
+// muts[i] = true when evaluating node i can mutate the discovery set.
+// ---------------------------------------------------------------------------
+
+func sp_word_is_number(s: text) -> bool
+    if s.length == 0
+        return false
+    for c in s
+        if c < '0' or c > '9'
+            return false
+    return true
+
+func sp_word_is_ident(s: text) -> bool
+    if s.length == 0
+        return false
+    if s[0] >= '0' and s[0] <= '9'
+        return false
+    for c in s
+        if not sl_is_ident_char(c)
+            return false
+    return true
+
+func sp_word_has_meta(s: text) -> bool
+    for c in s
+        if c == '*' or c == '?' or c == '[' or c == ']' or c == '/' or c == '!' or c == '^'
+            return true
+    return false
+
+func sp_node_is_mutating_kind(kind: text) -> bool
+    return kind == "combine" or kind == "cross" or kind == "crawl" or kind == "permute" or kind == "permutate" or kind == "exhaust"
+
+func sp_add(nodes: inout List<(text, int, int, int, text)>, muts: inout List<bool>, kind: text, a: int, b: int, c: int, sval: text) -> int
+    mut = sp_node_is_mutating_kind(kind)
+    if not mut
+        // Containers inherit child mutation so the purity checks see through
+        // pure wrappers: `a - (b* * c*)` is a mutating expression.
+        // For script/block/union/and/or, a is a kids index, not a node id —
+        // those OR their children at the call site via sp_kids_mut.
+        unary = kind == "first" or kind == "newset" or kind == "size" or kind == "assign" or kind == "permute" or kind == "permutate" or kind == "exhaust"
+        binary = kind == "diff" or kind == "intersect" or kind == "canrec" or kind == "cantrec" or kind == "narith" or kind == "cmp"
+        if (unary or binary) and a >= 0 and a < muts.length and muts[a]
+            mut = true
+        if binary and b >= 0 and b < muts.length and muts[b]
+            mut = true
+    nodes.append((kind, a, b, c, sval))
+    muts.append(mut)
+    return nodes.length - 1
+
+func sp_kids_mut(muts: List<bool>, ids: List<int>) -> bool
+    for id in ids
+        if muts[id]
+            return true
+    return false
+
+func sp_tok_kind(tokens: List<(text, text, int)>, i: int) -> text
+    if i >= tokens.length
+        return ""
+    kind, sval, pos = tokens[i]
+    return kind
+
+func sp_tok_sval(tokens: List<(text, text, int)>, i: int) -> text
+    if i >= tokens.length
+        return ""
+    kind, sval, pos = tokens[i]
+    return sval
+
+func sp_tok_pos(tokens: List<(text, text, int)>, i: int) -> int
+    if i >= tokens.length
+        return -1
+    kind, sval, pos = tokens[i]
+    return pos
+
+func sp_is_op(tokens: List<(text, text, int)>, i: int, spelling: text) -> bool
+    return sp_tok_kind(tokens, i) == "op" and sp_tok_sval(tokens, i) == spelling
+
+// Parser state threading: every parse function returns
+// (node_id, next_index, err, err_pos); node_id = -1 and err non-empty on
+// failure. Binders is the lexical stack of @ binder names in scope.
+
+func sp_err(msg: text, pos: int) -> (int, int, text, int)
+    return (-1, 0, msg, pos)
+
+// Primary: pattern / ref / strref / number(error at expr level) / (expr) /
+// ^( expr ) / [ expr ] / [] / postfix chains.
+// Returns an extra "wrapped" flag via c-slot convention: instead, the
+// wrapped flag is returned by sp_parse_postfix through its tuple.
+
+func sp_parse_primary(tokens: List<(text, text, int)>, i: int, depth: int, nodes: inout List<(text, int, int, int, text)>, kids: inout List<List<int>>, muts: inout List<bool>, binders: List<text>) -> (int, int, text, int, bool)
+    if depth > 64
+        return (-1, 0, "Script too deeply nested", sp_tok_pos(tokens, i), false)
+    kind = sp_tok_kind(tokens, i)
+    pos = sp_tok_pos(tokens, i)
+    if kind == "("
+        node, ni, err, epos = sp_parse_expr(tokens, i + 1, depth + 1, nodes, kids, muts, binders)
+        if err.length > 0
+            return (-1, 0, err, epos, false)
+        if sp_tok_kind(tokens, ni) != ")"
+            return (-1, 0, "Expected )", sp_tok_pos(tokens, ni), false)
+        return (node, ni + 1, "", 0, true)
+    if kind == "^("
+        node2, ni2, err2, epos2 = sp_parse_expr(tokens, i + 1, depth + 1, nodes, kids, muts, binders)
+        if err2.length > 0
+            return (-1, 0, err2, epos2, false)
+        if sp_tok_kind(tokens, ni2) != ")"
+            return (-1, 0, "Expected )", sp_tok_pos(tokens, ni2), false)
+        f = sp_add(nodes, muts, "first", node2, -1, -1, "")
+        return (f, ni2 + 1, "", 0, false)
+    if kind == "["
+        node3, ni3, err3, epos3 = sp_parse_expr(tokens, i + 1, depth + 1, nodes, kids, muts, binders)
+        if err3.length > 0
+            return (-1, 0, err3, epos3, false)
+        if sp_tok_kind(tokens, ni3) != "]"
+            return (-1, 0, "Expected ]", sp_tok_pos(tokens, ni3), false)
+        ns = sp_add(nodes, muts, "newset", node3, -1, -1, "")
+        return (ns, ni3 + 1, "", 0, false)
+    if kind == "[]"
+        nr = sp_add(nodes, muts, "newreg", -1, -1, -1, "")
+        return (nr, i + 1, "", 0, false)
+    if kind == "str"
+        sr = sp_add(nodes, muts, "strref", -1, -1, -1, sp_tok_sval(tokens, i))
+        return (sr, i + 1, "", 0, false)
+    if kind == "word"
+        w = sp_tok_sval(tokens, i)
+        if sp_word_is_number(w)
+            return (-1, 0, "Numbers are only legal inside conditions (quote an element named like a number)", pos, false)
+        if w[0] == '/' and not is_delimited_regex(w)
+            return (-1, 0, "Slash commands cannot appear inside scripts (a /regex/ pattern needs a closing /)", pos, false)
+        if w == "_"
+            found = false
+            for b in binders
+                if b == "_"
+                    found = true
+            if not found
+                return (-1, 0, "_ only means something inside an anonymous @ body", pos, false)
+            r0 = sp_add(nodes, muts, "ref", -1, -1, -1, "_")
+            return (r0, i + 1, "", 0, false)
+        if sp_word_has_meta(w)
+            p = sp_add(nodes, muts, "pattern", -1, -1, -1, w)
+            return (p, i + 1, "", 0, false)
+        r = sp_add(nodes, muts, "ref", -1, -1, -1, w)
+        return (r, i + 1, "", 0, false)
+    if kind == ""
+        return (-1, 0, "Unexpected end of script", pos, false)
+    return (-1, 0, "Unexpected token: " + sp_tok_sval(tokens, i), pos, false)
+
+func sp_parse_postfix(tokens: List<(text, text, int)>, i: int, depth: int, nodes: inout List<(text, int, int, int, text)>, kids: inout List<List<int>>, muts: inout List<bool>, binders: List<text>) -> (int, int, text, int, bool)
+    node, ni, err, epos, wrapped = sp_parse_primary(tokens, i, depth, nodes, kids, muts, binders)
+    if err.length > 0
+        return (-1, 0, err, epos, false)
+    while sp_tok_kind(tokens, ni) == "post"
+        op = sp_tok_sval(tokens, ni)
+        if op == "*"
+            node = sp_add(nodes, muts, "permute", node, -1, -1, "")
+        else if op == "**"
+            node = sp_add(nodes, muts, "permutate", node, -1, -1, "")
+        else
+            node = sp_add(nodes, muts, "exhaust", node, -1, -1, "")
+        wrapped = false
+        ni = ni + 1
+    return (node, ni, "", 0, wrapped)
+
+func sp_parse_crawl(tokens: List<(text, text, int)>, i: int, depth: int, nodes: inout List<(text, int, int, int, text)>, kids: inout List<List<int>>, muts: inout List<bool>, binders: List<text>) -> (int, int, text, int, bool)
+    node, ni, err, epos, wrapped = sp_parse_postfix(tokens, i, depth, nodes, kids, muts, binders)
+    if err.length > 0
+        return (-1, 0, err, epos, false)
+    while sp_is_op(tokens, ni, "++")
+        right, ri, rerr, repos, unusedw = sp_parse_postfix(tokens, ni + 1, depth + 1, nodes, kids, muts, binders)
+        if rerr.length > 0
+            return (-1, 0, rerr, repos, false)
+        node = sp_add(nodes, muts, "crawl", node, right, -1, "")
+        wrapped = false
+        ni = ri
+    return (node, ni, "", 0, wrapped)
+
+func sp_parse_mul(tokens: List<(text, text, int)>, i: int, depth: int, nodes: inout List<(text, int, int, int, text)>, kids: inout List<List<int>>, muts: inout List<bool>, binders: List<text>) -> (int, int, text, int, bool)
+    node, ni, err, epos, wrapped = sp_parse_crawl(tokens, i, depth, nodes, kids, muts, binders)
+    if err.length > 0
+        return (-1, 0, err, epos, false)
+    while sp_is_op(tokens, ni, "*") or sp_is_op(tokens, ni, "/") or sp_is_op(tokens, ni, "%") or sp_is_op(tokens, ni, "&")
+        op = sp_tok_sval(tokens, ni)
+        right, ri, rerr, repos, unusedw = sp_parse_crawl(tokens, ni + 1, depth + 1, nodes, kids, muts, binders)
+        if rerr.length > 0
+            return (-1, 0, rerr, repos, false)
+        kindname = "cross"
+        if op == "/"
+            kindname = "canrec"
+        if op == "%"
+            kindname = "cantrec"
+        if op == "&"
+            kindname = "intersect"
+        node = sp_add(nodes, muts, kindname, node, right, -1, "")
+        wrapped = false
+        ni = ri
+    return (node, ni, "", 0, wrapped)
+
+func sp_parse_add(tokens: List<(text, text, int)>, i: int, depth: int, nodes: inout List<(text, int, int, int, text)>, kids: inout List<List<int>>, muts: inout List<bool>, binders: List<text>) -> (int, int, text, int, bool)
+    node, ni, err, epos, wrapped = sp_parse_mul(tokens, i, depth, nodes, kids, muts, binders)
+    if err.length > 0
+        return (-1, 0, err, epos, false)
+    while sp_is_op(tokens, ni, "+") or sp_is_op(tokens, ni, "-")
+        op = sp_tok_sval(tokens, ni)
+        // Targeted migration error: `A +| B` (adjacent +|) was removed in 2.0.
+        if op == "+" and sp_tok_kind(tokens, ni + 1) == "|" and sp_tok_pos(tokens, ni + 1) == sp_tok_pos(tokens, ni) + 1
+            return (-1, 0, "+| was removed in 2.0 — use * (cross): A * B combines each of A with each of B", sp_tok_pos(tokens, ni), false)
+        right, ri, rerr, repos, unusedw = sp_parse_mul(tokens, ni + 1, depth + 1, nodes, kids, muts, binders)
+        if rerr.length > 0
+            return (-1, 0, rerr, repos, false)
+        kindname = "combine"
+        if op == "-"
+            kindname = "diff"
+        node = sp_add(nodes, muts, kindname, node, right, -1, "")
+        wrapped = false
+        ni = ri
+    return (node, ni, "", 0, wrapped)
+
+func sp_parse_union(tokens: List<(text, text, int)>, i: int, depth: int, nodes: inout List<(text, int, int, int, text)>, kids: inout List<List<int>>, muts: inout List<bool>, binders: List<text>) -> (int, int, text, int)
+    first_pos = sp_tok_pos(tokens, i)
+    node, ni, err, epos, wrapped = sp_parse_add(tokens, i, depth, nodes, kids, muts, binders)
+    if err.length > 0
+        return (-1, 0, err, epos)
+    if sp_tok_kind(tokens, ni) != ","
+        return (node, ni, "", 0)
+    ids: List<int> = [node]
+    wraps: List<bool> = [wrapped]
+    while sp_tok_kind(tokens, ni) == ","
+        right, ri, rerr, repos, rwrapped = sp_parse_add(tokens, ni + 1, depth + 1, nodes, kids, muts, binders)
+        if rerr.length > 0
+            return (-1, 0, rerr, repos)
+        ids.append(right)
+        wraps.append(rwrapped)
+        ni = ri
+    for k = 0 to ids.length - 1
+        id = ids[k]
+        nkind, na, nb, nc, nsval = nodes[id]
+        if muts[id] and not wraps[k] and not (nkind == "permute" or nkind == "permutate" or nkind == "exhaust" or nkind == "newset")
+            return (-1, 0, "Mutating expression inside a union list — wrap it in parentheses", first_pos)
+    kidx = kids.length
+    kids.append(ids)
+    u = sp_add(nodes, muts, "union", kidx, -1, -1, "")
+    if sp_kids_mut(muts, ids)
+        muts[u] = true
+    return (u, ni, "", 0)
+
+func sp_parse_expr(tokens: List<(text, text, int)>, i: int, depth: int, nodes: inout List<(text, int, int, int, text)>, kids: inout List<List<int>>, muts: inout List<bool>, binders: List<text>) -> (int, int, text, int)
+    if depth > 64
+        return sp_err("Script too deeply nested", sp_tok_pos(tokens, i))
+    // Walrus: ident := expr (right-associative).
+    if sp_tok_kind(tokens, i) == "word" and sp_is_op(tokens, i + 1, ":=")
+        name = sp_tok_sval(tokens, i)
+        if not sp_word_is_ident(name) or sp_word_is_number(name) or name == "_"
+            return sp_err("Invalid variable name: " + name, sp_tok_pos(tokens, i))
+        value, ni, err, epos = sp_parse_expr(tokens, i + 2, depth + 1, nodes, kids, muts, binders)
+        if err.length > 0
+            return (-1, 0, err, epos)
+        a = sp_add(nodes, muts, "assign", value, -1, -1, name)
+        return (a, ni, "", 0)
+    return sp_parse_union(tokens, i, depth, nodes, kids, muts, binders)
+
+// ── Conditions ──────────────────────────────────────────────────────
+
+func sp_parse_natom(tokens: List<(text, text, int)>, i: int, depth: int, nodes: inout List<(text, int, int, int, text)>, kids: inout List<List<int>>, muts: inout List<bool>, binders: List<text>) -> (int, int, text, int)
+    kind = sp_tok_kind(tokens, i)
+    if kind == "|"
+        inner, ni, err, epos = sp_parse_expr(tokens, i + 1, depth + 1, nodes, kids, muts, binders)
+        if err.length > 0
+            return (-1, 0, err, epos)
+        if sp_tok_kind(tokens, ni) != "|"
+            return sp_err("Expected closing |", sp_tok_pos(tokens, ni))
+        s = sp_add(nodes, muts, "size", inner, -1, -1, "")
+        return (s, ni + 1, "", 0)
+    if kind == "word" and sp_word_is_number(sp_tok_sval(tokens, i))
+        w = sp_tok_sval(tokens, i)
+        v = 0
+        for c in w
+            v = v * 10 + (c - '0')
+        n = sp_add(nodes, muts, "num", v, -1, -1, "")
+        return (n, i + 1, "", 0)
+    if kind == "("
+        inner2, ni2, err2, epos2 = sp_parse_num(tokens, i + 1, depth + 1, nodes, kids, muts, binders)
+        if err2.length > 0
+            return (-1, 0, err2, epos2)
+        if sp_tok_kind(tokens, ni2) != ")"
+            return sp_err("Expected )", sp_tok_pos(tokens, ni2))
+        return (inner2, ni2 + 1, "", 0)
+    return sp_err("Expected a size |...|, a number, or (arithmetic)", sp_tok_pos(tokens, i))
+
+func sp_parse_nterm(tokens: List<(text, text, int)>, i: int, depth: int, nodes: inout List<(text, int, int, int, text)>, kids: inout List<List<int>>, muts: inout List<bool>, binders: List<text>) -> (int, int, text, int)
+    node, ni, err, epos = sp_parse_natom(tokens, i, depth, nodes, kids, muts, binders)
+    if err.length > 0
+        return (-1, 0, err, epos)
+    while sp_is_op(tokens, ni, "*") or sp_is_op(tokens, ni, "/") or sp_is_op(tokens, ni, "%")
+        op = sp_tok_sval(tokens, ni)
+        right, ri, rerr, repos = sp_parse_natom(tokens, ni + 1, depth + 1, nodes, kids, muts, binders)
+        if rerr.length > 0
+            return (-1, 0, rerr, repos)
+        node = sp_add(nodes, muts, "narith", node, right, -1, op)
+        ni = ri
+    return (node, ni, "", 0)
+
+func sp_parse_num(tokens: List<(text, text, int)>, i: int, depth: int, nodes: inout List<(text, int, int, int, text)>, kids: inout List<List<int>>, muts: inout List<bool>, binders: List<text>) -> (int, int, text, int)
+    node, ni, err, epos = sp_parse_nterm(tokens, i, depth, nodes, kids, muts, binders)
+    if err.length > 0
+        return (-1, 0, err, epos)
+    while sp_is_op(tokens, ni, "+") or sp_is_op(tokens, ni, "-")
+        op = sp_tok_sval(tokens, ni)
+        right, ri, rerr, repos = sp_parse_nterm(tokens, ni + 1, depth + 1, nodes, kids, muts, binders)
+        if rerr.length > 0
+            return (-1, 0, rerr, repos)
+        node = sp_add(nodes, muts, "narith", node, right, -1, op)
+        ni = ri
+    return (node, ni, "", 0)
+
+func sp_is_cmp_op(tokens: List<(text, text, int)>, i: int) -> bool
+    if sp_tok_kind(tokens, i) != "op"
+        return false
+    s = sp_tok_sval(tokens, i)
+    return s == ">=" or s == "<=" or s == ">" or s == "<" or s == "==" or s == "!="
+
+// cond atom: comparison | set expr (truthy when non-empty) | bare numeric |
+// parenthesized cond. Distinguishing "(cond)" from "(expr)" needs
+// backtrack-free lookahead: a leading | or digit means numeric-side.
+func sp_parse_catom(tokens: List<(text, text, int)>, i: int, depth: int, nodes: inout List<(text, int, int, int, text)>, kids: inout List<List<int>>, muts: inout List<bool>, binders: List<text>) -> (int, int, text, int)
+    if depth > 64
+        return sp_err("Script too deeply nested", sp_tok_pos(tokens, i))
+    kind = sp_tok_kind(tokens, i)
+    if kind == "|" or (kind == "word" and sp_word_is_number(sp_tok_sval(tokens, i)))
+        left, ni, err, epos = sp_parse_num(tokens, i, depth + 1, nodes, kids, muts, binders)
+        if err.length > 0
+            return (-1, 0, err, epos)
+        if sp_is_cmp_op(tokens, ni)
+            op = sp_tok_sval(tokens, ni)
+            right, ri, rerr, repos = sp_parse_num(tokens, ni + 1, depth + 1, nodes, kids, muts, binders)
+            if rerr.length > 0
+                return (-1, 0, rerr, repos)
+            cnode = sp_add(nodes, muts, "cmp", left, right, -1, op)
+            return (cnode, ri, "", 0)
+        return (left, ni, "", 0)
+    // Set expression as condition (true when non-empty).
+    node, ni2, err2, epos2 = sp_parse_expr(tokens, i, depth + 1, nodes, kids, muts, binders)
+    if err2.length > 0
+        return (-1, 0, err2, epos2)
+    return (node, ni2, "", 0)
+
+func sp_parse_cand(tokens: List<(text, text, int)>, i: int, depth: int, nodes: inout List<(text, int, int, int, text)>, kids: inout List<List<int>>, muts: inout List<bool>, binders: List<text>) -> (int, int, text, int)
+    node, ni, err, epos = sp_parse_catom(tokens, i, depth, nodes, kids, muts, binders)
+    if err.length > 0
+        return (-1, 0, err, epos)
+    if not sp_is_op(tokens, ni, "&&")
+        return (node, ni, "", 0)
+    ids: List<int> = [node]
+    while sp_is_op(tokens, ni, "&&")
+        right, ri, rerr, repos = sp_parse_catom(tokens, ni + 1, depth + 1, nodes, kids, muts, binders)
+        if rerr.length > 0
+            return (-1, 0, rerr, repos)
+        ids.append(right)
+        ni = ri
+    kidx = kids.length
+    kids.append(ids)
+    a = sp_add(nodes, muts, "and", kidx, -1, -1, "")
+    if sp_kids_mut(muts, ids)
+        muts[a] = true
+    return (a, ni, "", 0)
+
+func sp_parse_cond(tokens: List<(text, text, int)>, i: int, depth: int, nodes: inout List<(text, int, int, int, text)>, kids: inout List<List<int>>, muts: inout List<bool>, binders: List<text>) -> (int, int, text, int)
+    node, ni, err, epos = sp_parse_cand(tokens, i, depth, nodes, kids, muts, binders)
+    if err.length > 0
+        return (-1, 0, err, epos)
+    if sp_is_op(tokens, ni, "||")
+        ids: List<int> = [node]
+        while sp_is_op(tokens, ni, "||")
+            right, ri, rerr, repos = sp_parse_cand(tokens, ni + 1, depth + 1, nodes, kids, muts, binders)
+            if rerr.length > 0
+                return (-1, 0, rerr, repos)
+            ids.append(right)
+            ni = ri
+        kidx = kids.length
+        kids.append(ids)
+        node = sp_add(nodes, muts, "or", kidx, -1, -1, "")
+        if sp_kids_mut(muts, ids)
+            muts[node] = true
+    return (node, ni, "", 0)
+
+// ── Statements ──────────────────────────────────────────────────────
+
+func sp_parse_body(tokens: List<(text, text, int)>, i: int, depth: int, nodes: inout List<(text, int, int, int, text)>, kids: inout List<List<int>>, muts: inout List<bool>, binders: List<text>) -> (int, int, text, int)
+    if sp_tok_kind(tokens, i) == "{"
+        inner, ni, err, epos = sp_parse_script_nodes(tokens, i + 1, depth + 1, nodes, kids, muts, binders, true)
+        if err.length > 0
+            return (-1, 0, err, epos)
+        if sp_tok_kind(tokens, ni) != "}"
+            return sp_err("Expected }", sp_tok_pos(tokens, ni))
+        return (inner, ni + 1, "", 0)
+    return sp_parse_stmt(tokens, i, depth + 1, nodes, kids, muts, binders)
+
+func sp_parse_stmt(tokens: List<(text, text, int)>, i: int, depth: int, nodes: inout List<(text, int, int, int, text)>, kids: inout List<List<int>>, muts: inout List<bool>, binders: List<text>) -> (int, int, text, int)
+    if depth > 64
+        return sp_err("Script too deeply nested", sp_tok_pos(tokens, i))
+    start_pos = sp_tok_pos(tokens, i)
+    if sp_tok_kind(tokens, i) == "{"
+        node, ni, err, epos = sp_parse_body(tokens, i, depth, nodes, kids, muts, binders)
+        if err.length > 0
+            return (-1, 0, err, epos)
+        if not (sp_is_op(tokens, ni, "->") or sp_is_op(tokens, ni, "~"))
+            return sp_err("A { block } statement needs -> or ~ after it", start_pos)
+        return sp_parse_loop_tail(tokens, ni, depth, node, nodes, kids, muts, binders)
+    // General statement: parse as cond-superset, then classify by what follows.
+    node, ni, err, epos = sp_parse_cond(tokens, i, depth, nodes, kids, muts, binders)
+    if err.length > 0
+        return (-1, 0, err, epos)
+    nkind, na, nb, nc, nsval = nodes[node]
+    if sp_tok_kind(tokens, ni) == "@" or sp_tok_kind(tokens, ni) == "atid"
+        if sp_is_cond_only_kind(nkind)
+            return sp_err("@ needs a set on its left", start_pos)
+        binder = "_"
+        if sp_tok_kind(tokens, ni) == "atid"
+            binder = sp_tok_sval(tokens, ni)
+        binders2: List<text> = []
+        for b in binders
+            binders2.append(b)
+        binders2.append(binder)
+        body, bi, berr, bepos = sp_parse_body(tokens, ni + 1, depth + 1, nodes, kids, muts, binders2)
+        if berr.length > 0
+            return (-1, 0, berr, bepos)
+        f = sp_add(nodes, muts, "foreach", node, body, -1, binder)
+        muts[f] = muts[node] or muts[body]
+        return (f, bi, "", 0)
+    if sp_is_op(tokens, ni, "?")
+        if muts[node]
+            return sp_err("Conditions must be pure — no combines, crosses, or bulk operations inside a condition", start_pos)
+        thenb, ti, terr, tepos = sp_parse_body(tokens, ni + 1, depth + 1, nodes, kids, muts, binders)
+        if terr.length > 0
+            return (-1, 0, terr, tepos)
+        if not sp_is_op(tokens, ti, ":")
+            return sp_err("Expected : for the ternary else branch", sp_tok_pos(tokens, ti))
+        elseb, ei, eerr, eepos = sp_parse_body(tokens, ti + 1, depth + 1, nodes, kids, muts, binders)
+        if eerr.length > 0
+            return (-1, 0, eerr, eepos)
+        t = sp_add(nodes, muts, "ternary", node, thenb, elseb, "")
+        muts[t] = muts[thenb] or muts[elseb]
+        return (t, ei, "", 0)
+    if sp_is_op(tokens, ni, "->") or sp_is_op(tokens, ni, "~")
+        if sp_is_cond_only_kind(nkind)
+            return sp_err("The left side of a loop must be a statement, not a condition", start_pos)
+        return sp_parse_loop_tail(tokens, ni, depth, node, nodes, kids, muts, binders)
+    if sp_is_cond_only_kind(nkind)
+        return sp_err("A condition needs ? or a loop around it", start_pos)
+    return (node, ni, "", 0)
+
+func sp_is_cond_only_kind(kind: text) -> bool
+    return kind == "cmp" or kind == "and" or kind == "or" or kind == "size" or kind == "num" or kind == "narith"
+
+func sp_parse_loop_tail(tokens: List<(text, text, int)>, i: int, depth: int, body: int, nodes: inout List<(text, int, int, int, text)>, kids: inout List<List<int>>, muts: inout List<bool>, binders: List<text>) -> (int, int, text, int)
+    node = body
+    ni = i
+    while sp_is_op(tokens, ni, "->") or sp_is_op(tokens, ni, "~")
+        loop_kind = "until"
+        if sp_tok_sval(tokens, ni) == "~"
+            loop_kind = "while"
+        cond_pos = sp_tok_pos(tokens, ni + 1)
+        cond, ci, cerr, cepos = sp_parse_cond(tokens, ni + 1, depth + 1, nodes, kids, muts, binders)
+        if cerr.length > 0
+            return (-1, 0, cerr, cepos)
+        if muts[cond]
+            return sp_err("Conditions must be pure — no combines, crosses, or bulk operations inside a condition", cond_pos)
+        prev_mut = muts[node]
+        node = sp_add(nodes, muts, loop_kind, node, cond, -1, "")
+        muts[node] = prev_mut
+        ni = ci
+    return (node, ni, "", 0)
+
+func sp_parse_script_nodes(tokens: List<(text, text, int)>, i: int, depth: int, nodes: inout List<(text, int, int, int, text)>, kids: inout List<List<int>>, muts: inout List<bool>, binders: List<text>, in_block: bool) -> (int, int, text, int)
+    ids: List<int> = []
+    ni = i
+    any_mut = false
+    while true
+        // tolerate empty statements / trailing semicolons
+        while sp_tok_kind(tokens, ni) == ";"
+            ni = ni + 1
+        if sp_tok_kind(tokens, ni) == ""
+            break
+        if in_block and sp_tok_kind(tokens, ni) == "}"
+            break
+        node, si, err, epos = sp_parse_stmt(tokens, ni, depth + 1, nodes, kids, muts, binders)
+        if err.length > 0
+            return (-1, 0, err, epos)
+        ids.append(node)
+        if muts[node]
+            any_mut = true
+        ni = si
+        if sp_tok_kind(tokens, ni) == ";"
+            continue
+        if sp_tok_kind(tokens, ni) == ""
+            break
+        if in_block and sp_tok_kind(tokens, ni) == "}"
+            break
+        return sp_err("Expected ; between statements", sp_tok_pos(tokens, ni))
+    kidx = kids.length
+    kids.append(ids)
+    kindname = "script"
+    if in_block
+        kindname = "block"
+    s = sp_add(nodes, muts, kindname, kidx, -1, -1, "")
+    muts[s] = any_mut
+    return (s, ni, "", 0)
+
+// Boundary: parse a script. Returns (ok, nodes, kids, muts, err, err_pos).
+// Root node is nodes.length - 1 when ok.
+export func script_parse(source: text) -> (bool, List<(text, int, int, int, text)>, List<List<int>>, List<bool>, text, int)
+    nodes: List<(text, int, int, int, text)> = []
+    kids: List<List<int>> = []
+    muts: List<bool> = []
+    ok, tokens, terr, tpos = script_tokenize(source)
+    if not ok
+        return (false, nodes, kids, muts, terr, tpos)
+    binders: List<text> = []
+    root, ni, err, epos = sp_parse_script_nodes(tokens, 0, 0, nodes, kids, muts, binders, false)
+    if err.length > 0
+        return (false, nodes, kids, muts, err, epos)
+    return (true, nodes, kids, muts, "", 0)
+
+// S-expression repr for tests.
+export func script_ast_repr(nodes: List<(text, int, int, int, text)>, kids: List<List<int>>, id: int) -> text
+    kind, a, b, c, sval = nodes[id]
+    if kind == "pattern" or kind == "ref" or kind == "strref"
+        return kind + ":" + sval
+    if kind == "num"
+        out: text = kind + ":"
+        v = a
+        if v == 0
+            out = out + "0"
+        else
+            digits: text = ""
+            while v > 0
+                d = v - (v / 10) * 10
+                ch = d + '0'
+                rev: text = ""
+                rev.append(ch)
+                digits = rev + digits
+                v = v / 10
+            out = out + digits
+        return out
+    if kind == "newreg"
+        return "newreg"
+    out2: text = "(" + kind
+    if kind == "assign" or kind == "foreach"
+        out2 = out2 + " " + sval
+    if kind == "cmp" or kind == "narith"
+        out2 = out2 + " " + sval
+    if kind == "script" or kind == "block" or kind == "union" or kind == "and" or kind == "or"
+        for kid in kids[a]
+            out2 = out2 + " " + script_ast_repr(nodes, kids, kid)
+    else
+        if a >= 0
+            out2 = out2 + " " + script_ast_repr(nodes, kids, a)
+        if b >= 0
+            out2 = out2 + " " + script_ast_repr(nodes, kids, b)
+        if c >= 0
+            out2 = out2 + " " + script_ast_repr(nodes, kids, c)
+    out2 = out2 + ")"
+    return out2
+
+
+// ---------------------------------------------------------------------------
+// Script language v0.6 — pure evaluation
+//
+// The kernel evaluates every statically-pure subtree in one call; hosts walk
+// only mutating spines and control flow, performing effects with the
+// existing bulk machinery. Env crosses the boundary as parallel lists
+// (names / value sets), already flattened for shadowing by the host.
+// ---------------------------------------------------------------------------
+
+func se_resolve_ref(elements: List<Element>, name: text) -> (bool, Element)
+    // Mirrors resolve_element's chain but reports misses instead of echoing
+    // the input back: script bare words must fail loud (spec §4.2).
+    for e in elements
+        if e.name == name
+            return (true, e)
+    stripped = strip_spaces(name)
+    for e2 in elements
+        if e2.name == stripped
+            return (true, e2)
+    title = title_case(stripped)
+    for e3 in elements
+        if e3.name == title
+            return (true, e3)
+    // Case-insensitive last resort, matching interactive forgiveness.
+    low = ascii_lower_text(stripped)
+    for e4 in elements
+        if ascii_lower_text(e4.name) == low
+            return (true, e4)
+    dummy = Element("", "", false)
+    return (false, dummy)
+
+func se_append_unique(out: inout List<Element>, seen: inout Set<text>, e: Element)
+    if not seen.has(e.name)
+        seen.add(e.name)
+        out.append(e)
+
+func se_recipe_pair_keys(recipes: Map<text, List<(text, text)>>) -> Set<text>
+    keys: Set<text> = Set()
+    for name in recipes.keys()
+        for pair in recipes[name]
+            pa, pb = pair
+            ka, kb = pair_key(pa, pb)
+            keys.add(ka + "\u{0}" + kb)
+    return keys
+
+func se_binary_setop(kind: text, lset: List<Element>, rset: List<Element>, recipes: Map<text, List<(text, text)>>) -> List<Element>
+    out: List<Element> = []
+    if kind == "diff" or kind == "intersect"
+        rnames: Set<text> = Set()
+        for re in rset
+            rnames.add(re.name)
+        for le in lset
+            if kind == "diff" and not rnames.has(le.name)
+                out.append(le)
+            if kind == "intersect" and rnames.has(le.name)
+                out.append(le)
+        return out
+    pair_keys = se_recipe_pair_keys(recipes)
+    for le2 in lset
+        has_known = false
+        for re2 in rset
+            ka, kb = pair_key(le2.name, re2.name)
+            if pair_keys.has(ka + "\u{0}" + kb)
+                has_known = true
+                break
+        if kind == "canrec" and has_known
+            out.append(le2)
+        if kind == "cantrec" and not has_known
+            out.append(le2)
+    return out
+
+// Hosts call this when a pure set operator has a mutating operand: children
+// are evaluated by the host walk, the operator itself stays kernel-owned.
+export func script_set_op_boundary(op: text, a: List<(text, text, bool)>, b: List<(text, text, bool)>, recipes: Map<text, List<(text, text)>>) -> List<(text, text, bool)>
+    return elements_to_tuples(se_binary_setop(op, elements_from_tuples(a), elements_from_tuples(b), recipes))
+
+func se_env_lookup(env_names: List<text>, env_values: List<List<Element>>, name: text) -> (bool, List<Element>)
+    // Later entries shadow earlier ones (host appends inner scopes last).
+    i = env_names.length - 1
+    while i >= 0
+        if env_names[i] == name
+            return (true, env_values[i])
+        i = i - 1
+    empty: List<Element> = []
+    return (false, empty)
+
+func se_eval(nodes: List<(text, int, int, int, text)>, kids: List<List<int>>, id: int, elements: List<Element>, recipes: Map<text, List<(text, text)>>, env_names: List<text>, env_values: List<List<Element>>, newreg: List<Element>) -> (bool, List<Element>, text)
+    empty: List<Element> = []
+    kind, a, b, c, sval = nodes[id]
+    if kind == "pattern"
+        matches, err = match_elements(elements, sval)
+        match err
+            case Some(msg)
+                return (false, empty, msg)
+            case None
+                return (true, matches, "")
+    if kind == "ref"
+        found, bound = se_env_lookup(env_names, env_values, sval)
+        if found
+            return (true, bound, "")
+        rfound, elem = se_resolve_ref(elements, sval)
+        if not rfound
+            return (false, empty, "Element not found: " + sval)
+        single: List<Element> = [elem]
+        return (true, single, "")
+    if kind == "strref"
+        sfound, selem = se_resolve_ref(elements, sval)
+        if not sfound
+            return (false, empty, "Element not found: " + sval)
+        single2: List<Element> = [selem]
+        return (true, single2, "")
+    if kind == "newreg"
+        return (true, newreg, "")
+    if kind == "first"
+        iok, inner, ierr = se_eval(nodes, kids, a, elements, recipes, env_names, env_values, newreg)
+        if not iok
+            return (false, empty, ierr)
+        firsts: List<Element> = []
+        for e in inner
+            if e.first
+                firsts.append(e)
+        return (true, firsts, "")
+    if kind == "union"
+        out: List<Element> = []
+        seen: Set<text> = Set()
+        for kid in kids[a]
+            kok, kset, kerr = se_eval(nodes, kids, kid, elements, recipes, env_names, env_values, newreg)
+            if not kok
+                return (false, empty, kerr)
+            for e2 in kset
+                se_append_unique(out, seen, e2)
+        return (true, out, "")
+    if kind == "diff" or kind == "intersect" or kind == "canrec" or kind == "cantrec"
+        lok, lset, lerr = se_eval(nodes, kids, a, elements, recipes, env_names, env_values, newreg)
+        if not lok
+            return (false, empty, lerr)
+        rok, rset, rerr = se_eval(nodes, kids, b, elements, recipes, env_names, env_values, newreg)
+        if not rok
+            return (false, empty, rerr)
+        return (true, se_binary_setop(kind, lset, rset, recipes), "")
+    return (false, empty, "Not a pure set expression: " + kind)
+
+func se_eval_num(nodes: List<(text, int, int, int, text)>, kids: List<List<int>>, id: int, elements: List<Element>, recipes: Map<text, List<(text, text)>>, env_names: List<text>, env_values: List<List<Element>>, newreg: List<Element>) -> (bool, int, text)
+    kind, a, b, c, sval = nodes[id]
+    if kind == "num"
+        return (true, a, "")
+    if kind == "size"
+        sok, sset, serr = se_eval(nodes, kids, a, elements, recipes, env_names, env_values, newreg)
+        if not sok
+            return (false, 0, serr)
+        return (true, sset.length, "")
+    if kind == "narith"
+        lok, lv, lerr = se_eval_num(nodes, kids, a, elements, recipes, env_names, env_values, newreg)
+        if not lok
+            return (false, 0, lerr)
+        rok, rv, rerr = se_eval_num(nodes, kids, b, elements, recipes, env_names, env_values, newreg)
+        if not rok
+            return (false, 0, rerr)
+        if sval == "+"
+            return (true, lv + rv, "")
+        if sval == "-"
+            return (true, lv - rv, "")
+        if sval == "*"
+            return (true, lv * rv, "")
+        if rv == 0
+            return (false, 0, "Division by zero in condition")
+        if sval == "/"
+            return (true, lv / rv, "")
+        return (true, lv - (lv / rv) * rv, "")
+    return (false, 0, "Not a numeric expression: " + kind)
+
+func se_eval_cond(nodes: List<(text, int, int, int, text)>, kids: List<List<int>>, id: int, elements: List<Element>, recipes: Map<text, List<(text, text)>>, env_names: List<text>, env_values: List<List<Element>>, newreg: List<Element>) -> (bool, bool, text)
+    kind, a, b, c, sval = nodes[id]
+    if kind == "or" or kind == "and"
+        for kid in kids[a]
+            kok, ktruth, kerr = se_eval_cond(nodes, kids, kid, elements, recipes, env_names, env_values, newreg)
+            if not kok
+                return (false, false, kerr)
+            if kind == "or" and ktruth
+                return (true, true, "")
+            if kind == "and" and not ktruth
+                return (true, false, "")
+        return (true, kind == "and", "")
+    if kind == "cmp"
+        lok, lv, lerr = se_eval_num(nodes, kids, a, elements, recipes, env_names, env_values, newreg)
+        if not lok
+            return (false, false, lerr)
+        rok, rv, rerr = se_eval_num(nodes, kids, b, elements, recipes, env_names, env_values, newreg)
+        if not rok
+            return (false, false, rerr)
+        if sval == ">="
+            return (true, lv >= rv, "")
+        if sval == "<="
+            return (true, lv <= rv, "")
+        if sval == ">"
+            return (true, lv > rv, "")
+        if sval == "<"
+            return (true, lv < rv, "")
+        if sval == "=="
+            return (true, lv == rv, "")
+        return (true, lv != rv, "")
+    if kind == "size" or kind == "num" or kind == "narith"
+        nok, nv, nerr = se_eval_num(nodes, kids, id, elements, recipes, env_names, env_values, newreg)
+        if not nok
+            return (false, false, nerr)
+        return (true, nv != 0, "")
+    eok, eset, eerr = se_eval(nodes, kids, id, elements, recipes, env_names, env_values, newreg)
+    if not eok
+        return (false, false, eerr)
+    return (true, eset.length > 0, "")
+
+// ── Boundaries ──────────────────────────────────────────────────────
+
+func se_env_from_tuples(env_values: List<List<(text, text, bool)>>) -> List<List<Element>>
+    out: List<List<Element>> = []
+    for tuples in env_values
+        out.append(elements_from_tuples(tuples))
+    return out
+
+export func script_eval_expr_boundary(nodes: List<(text, int, int, int, text)>, kids: List<List<int>>, id: int, elements: List<(text, text, bool)>, recipes: Map<text, List<(text, text)>>, env_names: List<text>, env_values: List<List<(text, text, bool)>>, newreg: List<(text, text, bool)>) -> (bool, List<(text, text, bool)>, text)
+    ok, result, err = se_eval(nodes, kids, id, elements_from_tuples(elements), recipes, env_names, se_env_from_tuples(env_values), elements_from_tuples(newreg))
+    return (ok, elements_to_tuples(result), err)
+
+export func script_eval_cond_boundary(nodes: List<(text, int, int, int, text)>, kids: List<List<int>>, id: int, elements: List<(text, text, bool)>, recipes: Map<text, List<(text, text)>>, env_names: List<text>, env_values: List<List<(text, text, bool)>>, newreg: List<(text, text, bool)>) -> (bool, bool, text)
+    return se_eval_cond(nodes, kids, id, elements_from_tuples(elements), recipes, env_names, se_env_from_tuples(env_values), elements_from_tuples(newreg))
+
+// Order-preserving name-deduped union of two tuple sets — hosts use this to
+// fold products and to merge mutating union operands without re-implementing
+// set identity.
+export func script_union_tuples(a: List<(text, text, bool)>, b: List<(text, text, bool)>) -> List<(text, text, bool)>
+    out: List<(text, text, bool)> = []
+    seen: Set<text> = Set()
+    for t in a
+        name, emoji, first = t
+        if not seen.has(name)
+            seen.add(name)
+            out.append(t)
+    for t2 in b
+        name2, emoji2, first2 = t2
+        if not seen.has(name2)
+            seen.add(name2)
+            out.append(t2)
+    return out
+
 // ---------------------------------------------------------------------------
 // Rate-window chrome math (pure). Hosts own clocks, deques, HTTP, paint.
 // Times are integer milliseconds (or any consistent unit).
@@ -1120,16 +2217,6 @@ func contains_plus_ws_pipe(s: text) -> bool
         i = i + 1
     return false
 
-func ends_with_space_plus(s: text) -> bool
-    // re.search(r" \+$", line.rstrip())
-    t = strip_spaces(s)
-    // strip_spaces strips both ends; rstrip only trims right — rebuild rstrip.
-    end = s.length
-    while end > 0 and is_ascii_space(s[end - 1])
-        end = end - 1
-    if end < 2
-        return false
-    return s[end - 2] == ' ' and s[end - 1] == '+'
 
 export func classify_command_line(line: text) -> Option<(text, text)>
     line = strip_spaces(line)
@@ -1141,18 +2228,8 @@ export func classify_command_line(line: text) -> Option<(text, text)>
         if rest_opt.is_some()
             kind = strip_prefix_one(cmd)
             return Some((kind, rest_opt.unwrap()))
-    if is_slash_command_attempt(line)
-        return None
-    if contains_plus_ws_pipe(line)
-        return Some(("bad+|", line))
-    if strings.contains(line, " ++ ")
-        return Some(("++", line))
-    if strings.contains(line, "+|")
-        return Some(("+|", line))
-    if strings.contains(line, " * ")
-        return Some(("*", line))
-    if strings.contains(line, " + ") or ends_with_space_plus(line)
-        return Some(("+", line))
+    // v2.0: non-slash lines are scripts (script_parse owns them); classify
+    // recognizes slash commands only.
     return None
 
 export func parse_two_elements(rest: text) -> Option<(text, text)>
@@ -1246,7 +2323,11 @@ func query_err_segments(err: Option<text>) -> Option<List<(text, bool)>>
 
 func bad_pipe_segments() -> List<(text, bool)>
     segs: List<(text, bool)> = []
-    segs.append(("  Use <element> +| <query> (no space between + and |). Type ", false))
+    segs.append(("  Pipes are not valid here. Use ", false))
+    segs.append(("/with <element> <query>", true))
+    segs.append((" or a script cross ", false))
+    segs.append(("A * B", true))
+    segs.append((". Type ", false))
     segs.append(("/help", true))
     segs.append((" for commands.", false))
     return segs
@@ -1283,7 +2364,7 @@ export func slash_combine_crawl_operator_error_segments(rest: text, kind: text) 
     segs: List<(text, bool)> = []
     segs.append(("  Slash /" + kind + " uses positional args, not +. Try ", false))
     segs.append((strip_spaces(rest), true))
-    segs.append((" (shorthand) or ", false))
+    segs.append((" (script) or ", false))
     segs.append((positional, true))
     segs.append((".", false))
     return Some(segs)
@@ -1304,7 +2385,7 @@ export func slash_cross_operator_error_segments(rest: text) -> Option<List<(text
     segs: List<(text, bool)> = []
     segs.append(("  Slash /cross uses positional args, not *. Try ", false))
     segs.append((strip_spaces(rest), true))
-    segs.append((" (shorthand) or ", false))
+    segs.append((" (script) or ", false))
     segs.append((positional, true))
     segs.append((".", false))
     return Some(segs)
@@ -1341,47 +2422,7 @@ func split_once(s: text, sep: text) -> (text, text)
     idx = idx_opt.unwrap()
     return (text_slice(s, 0, idx), text_from(s, idx + sep.length))
 
-func rsplit_once_space_plus(s: text) -> text
-    // payload.rsplit(" +", 1)[0] — last occurrence of " +"
-    last = -1
-    i = 0
-    while i + 1 < s.length
-        if s[i] == ' ' and s[i + 1] == '+'
-            last = i
-        i = i + 1
-    if last < 0
-        return s
-    return text_slice(s, 0, last)
 
-export func parse_operands(kind: text, payload: text) -> Option<(text, text)>
-    // Operand extraction for the shorthand kinds returned by
-    // classify_command_line ("++", "+|", "*", "+"). Python str.split(sep, 1)
-    // semantics: split on the separator's FIRST occurrence, the right side
-    // keeps any later separators ("A + B + C" -> ("A", "B + C")).
-    // Owner ruling 2026-08-07: JS String.split's second argument is a
-    // result-length limit, which silently truncated the tail; maxsplit
-    // semantics are canonical.
-    left: text = ""
-    right: text = ""
-    if kind == "++"
-        left, right = split_once(payload, " ++ ")
-    else if kind == "+|"
-        left, right = split_once(payload, "+|")
-    else if kind == "*"
-        left, right = split_once(payload, " * ")
-    else if kind == "+"
-        if strings.contains(payload, " + ")
-            left, right = split_once(payload, " + ")
-        else
-            left = rsplit_once_space_plus(payload)
-            right = ""
-    else
-        return None
-    l = strip_spaces(left)
-    r = strip_spaces(right)
-    if l.length == 0 or r.length == 0
-        return None
-    return Some((l, r))
 
 export func validate_command_line_segments(line: text) -> Option<List<(text, bool)>>
     classified = classify_command_line(line)
@@ -1401,8 +2442,6 @@ export func validate_command_line_segments(line: text) -> Option<List<(text, boo
         unk.append((" for commands.", false))
         return Some(unk)
     kind, payload = classified.unwrap()
-    if kind == "bad+|"
-        return Some(bad_pipe_segments())
     if kind == "permute" or kind == "permutate" or kind == "exhaust" or kind == "import"
         if strip_spaces(payload).length == 0
             if kind == "import"
@@ -1442,30 +2481,6 @@ export func validate_command_line_segments(line: text) -> Option<List<(text, boo
         if err.is_some()
             return query_err_segments(err)
         return query_err_segments(validate_query_at_enqueue(right_q))
-    if kind == "++"
-        if parse_operands(kind, payload).is_none()
-            return Some(plain_segment("  Usage: <element> ++ <element>"))
-        return None
-    if kind == "+|"
-        operands = parse_operands(kind, payload)
-        if operands.is_none()
-            return Some(plain_segment("  Usage: <element> +| <query>"))
-        op_left, op_right = operands.unwrap()
-        assert op_left == op_left
-        return query_err_segments(validate_query_at_enqueue(op_right))
-    if kind == "*"
-        operands = parse_operands(kind, payload)
-        if operands.is_none()
-            return Some(plain_segment("  Usage: <query> * <query>"))
-        op_left, op_right = operands.unwrap()
-        err = validate_query_at_enqueue(op_left)
-        if err.is_some()
-            return query_err_segments(err)
-        return query_err_segments(validate_query_at_enqueue(op_right))
-    if kind == "+"
-        if parse_operands(kind, payload).is_none()
-            return Some(plain_segment("  Usage: <element> + <element>"))
-        return None
     return None
 
 export func validate_command_line(line: text) -> Option<text>
@@ -1717,6 +2732,249 @@ func match_names(els: List<Element>, query: text) -> (Set<text>, Option<text>)
         names.add(e.name)
     return (names, err)
 
+test "known slash command dispatch"
+    assert is_known_slash_command("/help")
+    assert is_known_slash_command("/exhaust fire*")
+    assert is_known_slash_command("/script run.ice")
+    assert not is_known_slash_command("/steam/ , fire*")
+    assert not is_known_slash_command("/steam/")
+    assert not is_known_slash_command("fire + water")
+    assert not is_known_slash_command("/notacommand x")
+
+test "script eval v0.6"
+    els: List<(text, text, bool)> = [("Water", "w", false), ("Fire", "f", false), ("Steam", "s", true), ("Firefly", "ff", false), ("Mud", "m", false)]
+    recipes: Map<text, List<(text, text)>> = Map()
+    steam_pairs: List<(text, text)> = [("Fire", "Water")]
+    recipes["Steam"] = steam_pairs
+    mud_pairs: List<(text, text)> = [("Earth", "Water")]
+    recipes["Mud"] = mud_pairs
+    no_names: List<text> = []
+    no_vals: List<List<(text, text, bool)>> = []
+    no_reg: List<(text, text, bool)> = []
+    // pattern eval
+    ok, nodes, kids, muts, err, pos = script_parse("fire*")
+    assert ok
+    kind, a, b, c, sval = nodes[nodes.length - 1]
+    stmt = kids[a][0]
+    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, stmt, els, recipes, no_names, no_vals, no_reg)
+    assert eok
+    assert eset.length == 2
+    n0, e0, f0 = eset[0]
+    assert n0 == "Fire"
+    // bare ref: resolve chain incl title-case; miss errors
+    ok, nodes, kids, muts, err, pos = script_parse("water")
+    assert ok
+    kind, a, b, c, sval = nodes[nodes.length - 1]
+    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg)
+    assert eok
+    assert eset.length == 1
+    ok, nodes, kids, muts, err, pos = script_parse("xyzzy")
+    assert ok
+    kind, a, b, c, sval = nodes[nodes.length - 1]
+    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg)
+    assert not eok
+    // env shadowing: variable wins over element
+    env_names: List<text> = ["water"]
+    env_vals: List<List<(text, text, bool)>> = [[("Steam", "s", true), ("Mud", "m", false)]]
+    ok, nodes, kids, muts, err, pos = script_parse("water")
+    kind, a, b, c, sval = nodes[nodes.length - 1]
+    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, env_names, env_vals, no_reg)
+    assert eok
+    assert eset.length == 2
+    // union dedup + order, diff, intersect
+    ok, nodes, kids, muts, err, pos = script_parse("fire* , steam")
+    kind, a, b, c, sval = nodes[nodes.length - 1]
+    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg)
+    assert eok
+    assert eset.length == 3
+    ok, nodes, kids, muts, err, pos = script_parse("fire* - firefly")
+    kind, a, b, c, sval = nodes[nodes.length - 1]
+    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg)
+    assert eok
+    assert eset.length == 1
+    ok, nodes, kids, muts, err, pos = script_parse("fire* & firefly")
+    kind, a, b, c, sval = nodes[nodes.length - 1]
+    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg)
+    assert eok
+    assert eset.length == 1
+    // canrec / cantrec: Fire has a known recipe with Water; Firefly has none
+    ok, nodes, kids, muts, err, pos = script_parse("fire* / water")
+    kind, a, b, c, sval = nodes[nodes.length - 1]
+    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg)
+    assert eok
+    assert eset.length == 1
+    n1, e1, f1 = eset[0]
+    assert n1 == "Fire"
+    ok, nodes, kids, muts, err, pos = script_parse("fire* % water")
+    kind, a, b, c, sval = nodes[nodes.length - 1]
+    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg)
+    assert eok
+    assert eset.length == 1
+    n2, e2, f2 = eset[0]
+    assert n2 == "Firefly"
+    // first filter and newreg
+    ok, nodes, kids, muts, err, pos = script_parse("^(fire* , steam)")
+    kind, a, b, c, sval = nodes[nodes.length - 1]
+    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, no_reg)
+    assert eok
+    assert eset.length == 1
+    reg: List<(text, text, bool)> = [("Mud", "m", false)]
+    ok, nodes, kids, muts, err, pos = script_parse("[] , steam")
+    kind, a, b, c, sval = nodes[nodes.length - 1]
+    eok, eset, eerr = script_eval_expr_boundary(nodes, kids, kids[a][0], els, recipes, no_names, no_vals, reg)
+    assert eok
+    assert eset.length == 2
+    // conditions: sizes, arithmetic, modulo, truthiness, short-circuit
+    ok, nodes, kids, muts, err, pos = script_parse("|fire*| + 1 == 3 ? {steam} : {mud}")
+    assert ok
+    kind, a, b, c, sval = nodes[nodes.length - 1]
+    tern = kids[a][0]
+    tk, ta, tb, tc, ts = nodes[tern]
+    assert tk == "ternary"
+    cok, truth, cerr = script_eval_cond_boundary(nodes, kids, ta, els, recipes, no_names, no_vals, no_reg)
+    assert cok
+    assert truth
+    ok, nodes, kids, muts, err, pos = script_parse("|fire*| % 2 == 0 && |steam*| == 1 ? {a} : {b}")
+    kind, a, b, c, sval = nodes[nodes.length - 1]
+    tern2 = kids[a][0]
+    tk2, ta2, tb2, tc2, ts2 = nodes[tern2]
+    cok, truth, cerr = script_eval_cond_boundary(nodes, kids, ta2, els, recipes, no_names, no_vals, no_reg)
+    assert cok
+    assert truth
+    ok, nodes, kids, muts, err, pos = script_parse("nope* || |fire*| > 1 ? {a} : {b}")
+    kind, a, b, c, sval = nodes[nodes.length - 1]
+    tern3 = kids[a][0]
+    tk3, ta3, tb3, tc3, ts3 = nodes[tern3]
+    cok, truth, cerr = script_eval_cond_boundary(nodes, kids, ta3, els, recipes, no_names, no_vals, no_reg)
+    assert cok
+    assert truth
+    ok, nodes, kids, muts, err, pos = script_parse("|a| / 0 > 1 ? {a} : {b}")
+    kind, a, b, c, sval = nodes[nodes.length - 1]
+    tern4 = kids[a][0]
+    tk4, ta4, tb4, tc4, ts4 = nodes[tern4]
+    cok, truth, cerr = script_eval_cond_boundary(nodes, kids, ta4, els, recipes, no_names, no_vals, no_reg)
+    assert not cok
+    // union tuple helper preserves order and dedups
+    u = script_union_tuples([("A", "", false), ("B", "", false)], [("B", "x", true), ("C", "", false)])
+    assert u.length == 3
+
+test "script parser v0.6"
+    ok, nodes, kids, muts, err, pos = script_parse("fire + water")
+    assert ok
+    assert script_ast_repr(nodes, kids, nodes.length - 1) == "(script (combine ref:fire ref:water))"
+    ok, nodes, kids, muts, err, pos = script_parse("(fire*)* -> |[]| < 3")
+    assert ok
+    assert script_ast_repr(nodes, kids, nodes.length - 1) == "(script (until (permute pattern:fire*) (cmp < (size newreg) num:3)))"
+    ok, nodes, kids, muts, err, pos = script_parse("before := ^(fire* / water*) ; (before)* ; [] * (earth* / before)")
+    assert ok
+    assert script_ast_repr(nodes, kids, nodes.length - 1) == "(script (assign before (first (canrec pattern:fire* pattern:water*))) (permute ref:before) (cross newreg (canrec pattern:earth* ref:before)))"
+    ok, nodes, kids, muts, err, pos = script_parse("x := a* , (b* * c*)")
+    assert ok
+    assert script_ast_repr(nodes, kids, nodes.length - 1) == "(script (assign x (union pattern:a* (cross pattern:b* pattern:c*))))"
+    ok, nodes, kids, muts, err, pos = script_parse("fire* @f { (f)! } ; |[]| >= 1 ? {a} : {b}"
+    )
+    assert ok
+    assert script_ast_repr(nodes, kids, nodes.length - 1) == "(script (foreach f pattern:fire* (block (exhaust ref:f))) (ternary (cmp >= (size newreg) num:1) (block ref:a) (block ref:b)))"
+    ok, nodes, kids, muts, err, pos = script_parse("{ (fire*)* } ~ |!| < 2000")
+    assert ok
+    assert script_ast_repr(nodes, kids, nodes.length - 1) == "(script (while (block (permute pattern:fire*)) (cmp < (size pattern:!) num:2000)))"
+    ok, nodes, kids, muts, err, pos = script_parse("(metal* % fire*)!")
+    assert ok
+    assert script_ast_repr(nodes, kids, nodes.length - 1) == "(script (exhaust (cantrec pattern:metal* pattern:fire*)))"
+    ok, nodes, kids, muts, err, pos = script_parse("\u{22}salt, pepper\u{22} + fire")
+    assert ok
+    assert script_ast_repr(nodes, kids, nodes.length - 1) == "(script (combine strref:salt, pepper ref:fire))"
+    // muts flags: pure statements vs mutating ones
+    ok, nodes, kids, muts, err, pos = script_parse("fire* , water* ; fire + water")
+    assert ok
+    root_kind, root_a, root_b, root_c, root_s = nodes[nodes.length - 1]
+    stmts = kids[root_a]
+    assert not muts[stmts[0]]
+    assert muts[stmts[1]]
+    // static errors
+    ok, nodes, kids, muts, err, pos = script_parse("(fire*)* -> |[ (fire*)* ]| < 3")
+    assert not ok
+    ok, nodes, kids, muts, err, pos = script_parse("a - (b* * c*) ? {x} : {y}")
+    assert not ok
+    ok, nodes, kids, muts, err, pos = script_parse("{x} -> |a - (b* * c*)| > 0")
+    assert not ok
+    ok, nodes, kids, muts, err, pos = script_parse("x := a* , b* * c*")
+    assert not ok
+    ok, nodes, kids, muts, err, pos = script_parse("12 + water")
+    assert not ok
+    ok, nodes, kids, muts, err, pos = script_parse("a ; /fill")
+    assert not ok
+    ok, nodes, kids, muts, err, pos = script_parse("(_)!")
+    assert not ok
+    ok, nodes, kids, muts, err, pos = script_parse("fire* @ { (_)! }")
+    assert ok
+    ok, nodes, kids, muts, err, pos = script_parse("{a; b}")
+    assert not ok
+    ok, nodes, kids, muts, err, pos = script_parse("|a| > 2")
+    assert not ok
+    ok, nodes, kids, muts, err, pos = script_parse("fire water")
+    assert ok
+    assert script_ast_repr(nodes, kids, nodes.length - 1) == "(script ref:fire water)"
+    ok, nodes, kids, muts, err, pos = script_parse("(a) (b)")
+    assert not ok
+    ok, nodes, kids, muts, err, pos = script_parse("x := ")
+    assert not ok
+    ok, nodes, kids, muts, err, pos = script_parse("water +| fire*")
+    assert not ok
+    assert strings.starts_with(err, "+| was removed")
+
+test "script tokenizer v0.6"
+    ok, toks, err, pos = script_tokenize("mountain range + ship")
+    assert ok
+    assert script_tokens_repr(toks) == "word:mountain range\u{a7}op:+\u{a7}word:ship"
+    ok, toks, err, pos = script_tokenize("fire* * water*")
+    assert ok
+    assert script_tokens_repr(toks) == "word:fire*\u{a7}op:*\u{a7}word:water*"
+    ok, toks, err, pos = script_tokenize("(fire*)* -> |[]| < 3")
+    assert ok
+    assert script_tokens_repr(toks) == "(\u{a7}word:fire*\u{a7})\u{a7}post:*\u{a7}op:->\u{a7}|\u{a7}[]\u{a7}|\u{a7}op:<\u{a7}word:3"
+    ok, toks, err, pos = script_tokenize("[bc]at + mu[dg]")
+    assert ok
+    assert script_tokens_repr(toks) == "word:[bc]at\u{a7}op:+\u{a7}word:mu[dg]"
+    ok, toks, err, pos = script_tokenize("[ fire* ]")
+    assert ok
+    assert script_tokens_repr(toks) == "[\u{a7}word:fire*\u{a7}]"
+    ok, toks, err, pos = script_tokenize("[]!")
+    assert ok
+    assert script_tokens_repr(toks) == "[]\u{a7}post:!"
+    ok, toks, err, pos = script_tokenize("x := a* , (b* * c*)")
+    assert ok
+    assert script_tokens_repr(toks) == "word:x\u{a7}op::=\u{a7}word:a*\u{a7},\u{a7}(\u{a7}word:b*\u{a7}op:*\u{a7}word:c*\u{a7})"
+    ok, toks, err, pos = script_tokenize("fire* @f { (f)! }")
+    assert ok
+    assert script_tokens_repr(toks) == "word:fire*\u{a7}atid:f\u{a7}{\u{a7}(\u{a7}word:f\u{a7})\u{a7}post:!\u{a7}}"
+    ok, toks, err, pos = script_tokenize("\u{22}salt, pepper\u{22} + fire")
+    assert ok
+    assert script_tokens_repr(toks) == "str:salt, pepper\u{a7}op:+\u{a7}word:fire"
+    ok, toks, err, pos = script_tokenize("/steam engine/ + x")
+    assert ok
+    assert script_tokens_repr(toks) == "word:/steam engine/\u{a7}op:+\u{a7}word:x"
+    ok, toks, err, pos = script_tokenize("^(before) ; ^fire*")
+    assert ok
+    assert script_tokens_repr(toks) == "^(\u{a7}word:before\u{a7})\u{a7};\u{a7}word:^fire*"
+    ok, toks, err, pos = script_tokenize("a* # trailing note")
+    assert ok
+    assert script_tokens_repr(toks) == "word:a*"
+    ok, toks, err, pos = script_tokenize("jack-in-the-box + water")
+    assert ok
+    assert script_tokens_repr(toks) == "word:jack-in-the-box\u{a7}op:+\u{a7}word:water"
+    ok, toks, err, pos = script_tokenize("|a*| || |b?|")
+    assert ok
+    assert script_tokens_repr(toks) == "|\u{a7}word:a*\u{a7}|\u{a7}op:||\u{a7}|\u{a7}word:b?\u{a7}|"
+    ok, toks, err, pos = script_tokenize("!fire* - !")
+    assert ok
+    assert script_tokens_repr(toks) == "word:!fire*\u{a7}op:-\u{a7}word:!"
+    ok, toks, err, pos = script_tokenize("c ? {a} : {b}")
+    assert ok
+    assert script_tokens_repr(toks) == "word:c\u{a7}op:?\u{a7}{\u{a7}word:a\u{a7}}\u{a7}op::\u{a7}{\u{a7}word:b\u{a7}}"
+    ok, toks, err, pos = script_tokenize("\u{22}unterminated")
+    assert not ok
+
 test "auto approve and rate note"
     assert is_local_command("/auto")
     assert is_local_command("/auto on")
@@ -1850,6 +3108,12 @@ test "queue lane and target pure rules"
     assert not may_bulk_confirm("/combine Water Fire")
     assert not may_bulk_confirm("/fill")
     assert not may_bulk_confirm("/crawl Water Fire")
+    // v2.0 scripts: mutating scripts may bulk-confirm; pure ones never do
+    assert may_bulk_confirm("(fire*)!")
+    assert may_bulk_confirm("fire + water")
+    assert not may_bulk_confirm("fire* , water*")
+    assert not may_bulk_confirm("x := fire* - water*")
+    assert not may_bulk_confirm("not a ( valid script")
     assert should_bulk_warn(201, 200)
     assert not should_bulk_warn(200, 200)
     assert not should_bulk_warn(0, 200)
@@ -2082,18 +3346,13 @@ test "parse_two_elements and cross helpers"
     assert b == "fire*"
 
 test "classify_command_line parity"
-    c = classify_command_line("Water + | Fire")
-    assert c.is_some()
-    k, p = c.unwrap()
-    assert k == "bad+|"
-    c = classify_command_line("Water +| Fire")
-    assert c.is_some()
-    k, p = c.unwrap()
-    assert k == "+|"
-    c = classify_command_line("/^fi/ * /^wa/")
-    assert c.is_some()
-    k, p = c.unwrap()
-    assert k == "*"
+    // v2.0: classify recognizes slash commands only; every non-slash line
+    // belongs to the script grammar.
+    assert classify_command_line("Water + Fire").is_none()
+    assert classify_command_line("Water +| Fire").is_none()
+    assert classify_command_line("Water + | Fire").is_none()
+    assert classify_command_line("/^fi/ * /^wa/").is_none()
+    assert classify_command_line("Water +").is_none()
     c = classify_command_line("/combine Water + Fire")
     assert c.is_some()
     k, p = c.unwrap()
@@ -2103,109 +3362,40 @@ test "classify_command_line parity"
     assert c.is_some()
     k, p = c.unwrap()
     assert k == "combine"
-    c = classify_command_line("Water +")
-    assert c.is_some()
-    k, p = c.unwrap()
-    assert k == "+"
-    c = classify_command_line("Water + Fire")
-    assert c.is_some()
-    k, p = c.unwrap()
-    assert k == "+"
     assert not is_slash_command_attempt("/^fi/ * /^wa/")
     assert is_slash_command_attempt("/notacommand")
     assert not is_slash_command_attempt("Water + Fire")
 
 test "validate_command_line error presence"
+    // v2.0: hosts call validate only for known slash commands; non-slash
+    // lines go to script_parse. validate still answers generically
+    // ("Unknown input") for anything unclassified.
     assert validate_command_line("/combine Water Fire").is_none()
     assert validate_command_line("/crawl Water Fire").is_none()
     assert validate_command_line("/cross Water Fire").is_none()
     assert validate_command_line("/combine Water + Fire").is_some()
     assert validate_command_line("/cross fire* * water*").is_some()
-    assert validate_command_line("Water + | Fire").is_some()
     assert validate_command_line("/combine Water + | Fire").is_some()
-    assert validate_command_line("Water +").is_some()
-    assert validate_command_line("Water + Fire").is_none()
-    assert validate_command_line("/^fi/ * /^wa/").is_none()
     assert validate_command_line("/cross /^fi/ /^wa/").is_none()
-    assert validate_command_line("/^fi/").is_some()
     assert validate_command_line("/notacommand").is_some()
-    assert validate_command_line("Water Fire").is_some()
     assert validate_command_line("/permute").is_some()
     assert validate_command_line("/with Water").is_some()
-    assert validate_command_line("Water ++").is_some()
     assert validate_command_line("/import").is_some()
-
-test "parse_operands maxsplit semantics"
-    // The tail keeps later separators (Python split(sep, 1) semantics) —
-    // these four inputs are exactly where the old JS length-limit split
-    // truncated the second operand.
-    r = parse_operands("+", "A + B + C")
-    assert r.is_some()
-    a, b = r.unwrap()
-    assert a == "A"
-    assert b == "B + C"
-    r = parse_operands("++", "A ++ B ++ C")
-    assert r.is_some()
-    a, b = r.unwrap()
-    assert a == "A"
-    assert b == "B ++ C"
-    r = parse_operands("+|", "A+|b+|c")
-    assert r.is_some()
-    a, b = r.unwrap()
-    assert a == "A"
-    assert b == "b+|c"
-    r = parse_operands("*", "x * y * z")
-    assert r.is_some()
-    a, b = r.unwrap()
-    assert a == "x"
-    assert b == "y * z"
-    r = parse_operands("+", "Water + Fire")
-    assert r.is_some()
-    a, b = r.unwrap()
-    assert a == "Water"
-    assert b == "Fire"
-    // operands are stripped
-    r = parse_operands("+|", "  Water  +|  fire*  ")
-    assert r.is_some()
-    a, b = r.unwrap()
-    assert a == "Water"
-    assert b == "fire*"
-    // missing/empty operands
-    assert parse_operands("+", "Water +").is_none()
-    assert parse_operands("+", "Water").is_none()
-    assert parse_operands("++", "A ++ ").is_none()
-    assert parse_operands("++", " ++ B").is_none()
-    assert parse_operands("+|", "A+|").is_none()
-    assert parse_operands("*", " * y").is_none()
-    // non-shorthand kinds are not this function's job
-    assert parse_operands("combine", "Water Fire").is_none()
-    assert parse_operands("", "Water + Fire").is_none()
+    assert validate_command_line("Water + Fire").is_some()
 
 test "validate_command_line exact messages"
     err = validate_command_line("/combine Water + Fire")
     assert err.is_some()
-    assert err.unwrap() == "  Slash /combine uses positional args, not +. Try Water + Fire (shorthand) or /combine Water Fire."
+    assert err.unwrap() == "  Slash /combine uses positional args, not +. Try Water + Fire (script) or /combine Water Fire."
     err = validate_command_line("/cross fire* * water*")
     assert err.is_some()
-    assert err.unwrap() == "  Slash /cross uses positional args, not *. Try fire* * water* (shorthand) or /cross fire* water*."
-    err = validate_command_line("Water + | Fire")
-    assert err.is_some()
-    assert err.unwrap() == "  Use <element> +| <query> (no space between + and |). Type /help for commands."
+    assert err.unwrap() == "  Slash /cross uses positional args, not *. Try fire* * water* (script) or /cross fire* water*."
     err = validate_command_line("/combine Water + | Fire")
     assert err.is_some()
-    assert err.unwrap() == "  Use <element> +| <query> (no space between + and |). Type /help for commands."
-    err = validate_command_line("Water +")
-    assert err.is_some()
-    assert err.unwrap() == "  Usage: <element> + <element>"
-    err = validate_command_line("/^fi/")
-    assert err.is_some()
-    assert err.unwrap() == "  Unknown input. Type /help for commands."
+    assert err.unwrap() == "  Pipes are not valid here. Use /with <element> <query> or a script cross A * B. Type /help for commands."
     err = validate_command_line("/notacommand")
     assert err.is_some()
     assert err.unwrap() == "  Unknown command: /notacommand. Type /help for commands."
-    err = validate_command_line("Water Fire")
-    assert err.is_some()
-    assert err.unwrap() == "  Unknown input. Type /help for commands."
     err = validate_command_line("/crawl Banana")
     assert err.is_some()
     assert err.unwrap() == "  Usage: /crawl <element> <element>"
@@ -2241,14 +3431,13 @@ test "validate_command_line segments highlights"
     assert x3t == "/cross fire* water*"
     assert x3h
     // segments concat == plain validate for every error shape
-    for bad_line in ["Water +", "/notacommand", "Water Fire", "/combine Water + Fire", "Water + | Fire", "/permute", "/with Water", "/cross fire* * water*", "/^fi/"]
+    for bad_line in ["/notacommand", "/combine Water + Fire", "/combine Water + | Fire", "/permute", "/with Water", "/cross fire* * water*"]
         v = validate_command_line(bad_line)
         assert v.is_some()
         sv = validate_command_line_segments(bad_line)
         assert sv.is_some()
         assert seg_concat(sv.unwrap()) == v.unwrap()
     // no-error lines yield no segments
-    assert validate_command_line_segments("Water + Fire").is_none()
     assert validate_command_line_segments("/combine Water Fire").is_none()
 
 test "pair_key and exhaust_pairs parity"

@@ -56,7 +56,9 @@ class TestConfirmAndRunPairs:
 
 
 class TestDoPermutate:
-    def test_max_permutate_rounds_cap(self, capsys):
+    def test_permutate_stops_on_natural_convergence(self, capsys):
+        # v2.0: no round cap — permutate stops when a round adds nothing new
+        # (the pair cache makes round 2 a no-op here).
         from infinite_craft_cli.cli import do_permutate
 
         client = make_mock_client()
@@ -65,12 +67,9 @@ class TestDoPermutate:
             MockElement("Wind", "🌬️"),
         ]
         storage = make_mock_storage(list(discoveries))
-        round_num = 0
 
         async def mock_pair(a, b):
-            nonlocal round_num
-            round_num += 1
-            return MockElement(f"Wind{round_num}", "🌬️")
+            return MockElement("Steam", "💨")
 
         client.pair = mock_pair
 
@@ -82,11 +81,11 @@ class TestDoPermutate:
             return None
 
         storage.add.side_effect = add_side_effect
-        with patch("infinite_craft_cli.cli._MAX_PERMUTATE_ROUNDS", 2):
-            with patch("infinite_craft_cli.cli._record_recipes_batch"):
-                run_async(do_permutate(client, storage, "w*"))
+        with patch("infinite_craft_cli.cli._record_recipes_batch"):
+            run_async(do_permutate(client, storage, "w*"))
         captured = capsys.readouterr()
-        assert "Reached max rounds (2)" in captured.out
+        assert "Reached max rounds" not in captured.out
+        assert "Permutate done after" in captured.out
 
 
 class TestDoExhaust:

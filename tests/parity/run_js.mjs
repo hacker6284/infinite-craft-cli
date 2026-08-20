@@ -18,8 +18,9 @@ import {
 import {
   classify_command_line,
   validate_command_line,
-  parse_operands,
   validate_command_line_segments,
+  script_parse,
+  script_ast_repr,
   permute_pairs_boundary,
   cross_pairs_boundary,
   with_pairs_boundary,
@@ -152,9 +153,10 @@ function runScenario(scenario, fixtures) {
     return r === undefined ? null : r;
   }
 
-  if (op === "operands") {
-    const r = parse_operands(scenario.kind, scenario.payload);
-    return r === null || r === undefined ? null : Array.from(r);
+  if (op === "script_parse") {
+    const [ok, nodes, kids, muts, err] = script_parse(scenario.source);
+    if (!ok) return ["err", err];
+    return ["ok", script_ast_repr(nodes, kids, nodes.length - 1), muts.map(Boolean)];
   }
 
   if (op === "permute_pairs") {

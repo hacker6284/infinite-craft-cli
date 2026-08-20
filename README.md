@@ -55,7 +55,7 @@ Sticky chrome under the log always shows the pair-API **rate** bar (next-slot wa
 
 ### Non-interactive mode
 
-Most REPL commands are available as subcommands (shorthand operators like `+`, `++`, `+|`, and `*` are REPL-only):
+Most REPL commands are available as subcommands (shorthand operators like `+`, `++`, and `*` are REPL-only; `script` runs a script non-interactively):
 
 ```bash
 infinite-craft combine "Water" "Fire"
@@ -88,7 +88,6 @@ infinite-craft --version
 
 | Shorthand | Slash command | Description |
 |-----------|---------------|-------------|
-| `<element>` then `+|` then `<query>` (adjacent operator) | `/with <element> <query>` | Combine element with all matching discoveries |
 | `<query> * <query>` | `/cross <query> <query>` | Cross-combine matches from both queries |
 | | `/permute <query>` | Combine all matching elements with each other |
 | | `/permutate <query>` | Permute repeatedly until no new discoveries |
@@ -96,7 +95,7 @@ infinite-craft --version
 
 ### Query syntax
 
-Used by `/search`, `/with`, `/permute`, `/permutate`, `/cross`, `/exhaust`, and the `+|` / `*` shorthands:
+Used by `/search`, `/with`, `/permute`, `/permutate`, `/cross`, `/exhaust`, and script patterns:
 
 | Syntax | Meaning |
 |--------|---------|
@@ -128,6 +127,20 @@ Used by `/search`, `/with`, `/permute`, `/permutate`, `/cross`, `/exhaust`, and 
 | `/help` | Show help |
 | `/quit` | Exit |
 
+### Scripting
+
+Every non-slash line in the REPL is a script (the old shorthands are one-statement scripts). Statements are separated by `;`; whitespace-delimited operators are structure and everything attached is pattern material, so `mountain range + ship` still combines exactly what it says. Bare words are element references (error if unknown); patterns with metacharacters (`* ? [] /regex/ ! ^`) are queries; quoted strings are exact element references.
+
+```text
+targets := ^(fire* / water*) ;          # bind first-discoveries having a fire*+water* recipe
+(targets)* -> |[]| < 2 ;                # permute passes until a pass yields < 2 new
+[] * (earth* / fire*)                   # cross what that made against filtered earth*
+```
+
+Highlights: `,` union, `-` difference, `&` intersect, `/`/`%` known-recipe filters, `(S)*`/`(S)**`/`(S)!` permute/permutate/exhaust, `A * B` cross, `A ++ B` crawl, `[ expr ]`/`[]` new-element sets, `set @x body` for-each, `body -> cond` do-until, `body ~ cond` while, `cond ? a : b` ternary. Conditions are statically pure — mutations inside a condition are parse errors. Every mutating operation's value is the set it produced, so pipelines chain. Save scripts as `.ice` files and run them with `/script <path>` (file picker in the trainer) or `infinite-craft script -f path`. Full spec: `docs/superpowers/specs/2026-08-20-script-language-v0.6.md`.
+
+Breaking changes in 2.0: `+|` is removed (use `*`; `/with` remains), bare words in old `*`//`+|` positions were substring queries and are now element references (write `*fire*` for substring), bare pattern lines print matches instead of erroring, `A + B + C` chains combines, and `/permutate` no longer stops at 50 rounds.
+
 ### Queues and confirm (Python REPL + trainer)
 
 Pair-API work (combine, crawl, permute, exhaust, …) and Infinibrowser work (`/fill`, `/prune`, `/import`) use **independent queues** so one lane can run while the other is busy. Local commands (`/help`, `/search`, `/list`, `/recipe`, `/history`, `/clear`, `/unfilled`, `/queue`, `/target`) run immediately — their output may interleave with a running job.
@@ -151,7 +164,7 @@ Discoveries and recipes are stored in `~/.infinite-craft-cli/`:
 
 ## Browser extension / bookmarklet
 
-The [browser trainers](https://hacker6284.github.io/infinite-craft-cli/) share the same command syntax and query matching as the Python CLI (wildcards, `/regex/`, `!` exclude, `^` first discoveries, `/combine`, `/with`, `/cross`, `/target`, and operator shorthands `+`, `++`, `+|`, `*`). Browser-only additions: `/clear` to clear the output panel, and IndexedDB storage instead of `~/.infinite-craft-cli/`. Rate, job, and queue status live in the sticky panel above the input (visual-only; no `/queue` command). Local commands such as `/search` may interleave output with a running queued command.
+The [browser trainers](https://hacker6284.github.io/infinite-craft-cli/) share the same command syntax, query matching, and script language as the Python CLI (wildcards, `/regex/`, `!` exclude, `^` first discoveries, `/combine`, `/with`, `/cross`, `/target`, and scripts). Browser-only additions: `/clear` to clear the output panel, and IndexedDB storage instead of `~/.infinite-craft-cli/`. Rate, job, and queue status live in the sticky panel above the input (visual-only; no `/queue` command). Local commands such as `/search` may interleave output with a running queued command.
 
 **Long runs in a background tab:** the trainer holds a [Web Lock](https://developer.mozilla.org/en-US/docs/Web/API/Web_Locks_API) while a run is active, which keeps Chrome's Memory Saver / Energy Saver from freezing the tab under current heuristics. If a backgrounded run still pauses (the exemption is a heuristic, not a guarantee), add `neal.fun` to `chrome://settings/performance` → "Always keep these sites active", or keep the tab in a partially visible window. Truly long unattended jobs are what the Python CLI is for.
 
