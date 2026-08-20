@@ -193,7 +193,11 @@ snapshot it first (`before := fire*`).
   `]`, `[]`, or another postfix, mirroring the `*`/`**`/`!` family:
   `(S)n` = first `min(n, |S|)` elements in set order; `(S)n?` = `n`
   uniformly random elements (shuffle-then-take, without replacement);
-  `(S)?` = the whole set shuffled. Counts are attached digits or an
+  `(S)?` = the whole set shuffled. Both adjacent spellings sample —
+  `(S)n?` (one paired operator) and `(S)?n` (plain composition) mean the
+  same thing — because the dangerous confusion is membership vs order:
+  "first n, shuffled" contains different elements than "n random", so it
+  requires the explicit form `((S)n)?`. Counts are attached digits or an
   attached parenthesized numeric expression (`(fire*)(|water*| - 3)`)
   with the condition sublanguage's grammar; count expressions are
   statically pure (same check as conditions); `n ≤ 0` yields the empty

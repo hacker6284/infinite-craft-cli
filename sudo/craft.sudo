@@ -3102,6 +3102,16 @@ test "take shuffle sample postfixes"
     ok, nodes, kids, muts, err, pos = script_parse("(fire*)(|water*|)")
     assert ok
     assert script_ast_repr(nodes, kids, nodes.length - 1) == "(script (take pattern:fire* (size pattern:water*)))"
+    // the semantics triangle: 100? and ?100 both sample; ((S)100)? reorders
+    ok, nodes, kids, muts, err, pos = script_parse("(a*)100?")
+    assert ok
+    assert script_ast_repr(nodes, kids, nodes.length - 1) == "(script (sample pattern:a* num:100))"
+    ok, nodes, kids, muts, err, pos = script_parse("(a*)?100")
+    assert ok
+    assert script_ast_repr(nodes, kids, nodes.length - 1) == "(script (take (shuffle pattern:a*) num:100))"
+    ok, nodes, kids, muts, err, pos = script_parse("((a*)100)?")
+    assert ok
+    assert script_ast_repr(nodes, kids, nodes.length - 1) == "(script (shuffle (take pattern:a* num:100)))"
 
 test "lucky pairs sampling"
     els: List<(text, text, bool)> = [("Water", "w", false), ("Fire", "f", false), ("Wind", "n", false), ("Earth", "e", false)]
