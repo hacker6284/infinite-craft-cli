@@ -9,10 +9,17 @@
   results for free. The neal.fun per-IP limit is now pooled across willing
   users. Serving the hive while idle is on by default and symmetric.
 - **Peer review** — a cache entry becomes trusted only after a second
-  independent client re-asks neal and confirms it (review bounties always
-  hit neal, never local cache). A conflicting claim against an unreviewed
-  entry drops it and re-opens the pair, so the network self-heals rather
-  than trusting last-writer.
+  independent client re-asks neal and confirms it. A conflicting claim
+  against an unreviewed entry drops it and re-opens the pair, so the shared
+  cache self-heals rather than trusting last-writer. **All** bounty
+  fulfillment (not just review bounties) re-derives from neal rather than
+  answering from local cache, so a poisoned local entry can never be
+  re-propagated into the hive and every contribution is an independent
+  sighting.
+- **Relay observability** — `/api/stats` reports live sessions/IPs, lookup
+  hit rate, cache size, peer-reviewed count, review backlog, self-heals,
+  and bounty throughput; `/api/dashboard` renders the same as a small
+  auto-refreshing status page.
 - **Same-IP budget split** — the relay reports how many sessions on your
   public IP are spending neal budget, and each client divides its per-IP
   window by that count *proactively*. Two clients behind one router each

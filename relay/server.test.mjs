@@ -303,3 +303,30 @@ test("peers envelope counts spending sessions", async () => {
     server.close();
   }
 });
+
+
+test("stats metrics + dashboard render", async () => {
+  _resetForTests();
+  const server = makeServer();
+  await new Promise((resolve) => server.listen(0, resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const H = { "Content-Type": "application/json", "x-ic-session": "s1", "x-ic-state": "idle" };
+  try {
+    await fetch(`${base}/api/contribute`, { method:"POST", headers:H, body: JSON.stringify({ entries: [["Fire","Water","Steam",""]] }) });
+    // one hit, one miss
+    await fetch(`${base}/api/lookup`, { method:"POST", headers:H, body: JSON.stringify({ pairs: [["Water","Fire"],["No","Hit"]] }) });
+    const s = await (await fetch(`${base}/api/stats`)).json();
+    assert.equal(s.metrics.lookupPairs, 2);
+    assert.equal(s.metrics.lookupHits, 1);
+    assert.equal(s.metrics.hitRate, 0.5);
+    assert.equal(s.metrics.contributed, 1);
+    assert.equal(s.live.sessions, 1);
+    const dash = await fetch(`${base}/api/dashboard`);
+    assert.equal(dash.headers.get("content-type").split(";")[0], "text/html");
+    const html = await dash.text();
+    assert.ok(html.includes("Infinite Craft hive"));
+    assert.ok(html.includes("50.0%"));
+  } finally {
+    server.close();
+  }
+});

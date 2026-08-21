@@ -208,6 +208,8 @@ def _reset_test_state() -> None:
     _bounty_task = None
     _bounties_worked = 0
     _bounty_progress = None
+    relay_client.last_hive["peers"] = 0
+    relay_client.last_hive["cooledUntil"] = 0
     _script_new_reg = []
     _confirm_reason = ""
     _skip_summary_shown = False
@@ -979,65 +981,70 @@ def _bounty_preempted() -> bool:
     )
 
 
-async def _bounty_worker(client, storage) -> None:
-    """Serve the hive while idle at the prompt.
+async def _bounty_cycle(client, storage) -> None:
+    """One poll-and-serve pass (extracted for testing).
 
-    Polls the board every 10s (the poll doubles as the presence heartbeat);
-    the relay refuses us whenever any session on our IP is running, so this
-    can never contest a household's own runs. Review bounties always re-ask
-    neal (never answered from local cache — that's the point of a review);
-    pair bounties may be answered from local cache for free."""
+    Every bounty — pair or review — is answered by a FRESH neal call, never
+    from local cache. This makes each contribution an independent neal
+    sighting (so it counts toward peer review) and closes the only path by
+    which a poisoned local-cache entry could be re-propagated into the hive.
+    The relay refuses us whenever any session on our IP is running, so this
+    can never contest a household's own runs."""
     global _bounties_worked, _bounty_progress
+    if _bounty_preempted():
+        return
+    items = await asyncio.to_thread(relay_client.take_bounties, 5)
+    if items is None:
+        _relay_mark_unreachable()
+        return
+    _relay_apply_hive(client)
+    if not items:
+        return
+    done = 0
+    _bounty_progress = (0, len(items))
+    _paint_queue_panel(force=True)
+    try:
+        for it in items:
+            if _bounty_preempted():
+                break
+            a_name = it.get("first") or ""
+            b_name = it.get("second") or ""
+            if not a_name or not b_name:
+                continue
+            key = craft.pair_key(a_name, b_name)
+            try:
+                res = await client.pair(a_name, b_name, fleet=True)
+            except NealRateLimited:
+                _trip_cooldown()
+                break
+            except RateLimitCancelled:
+                break
+            except Exception:
+                continue
+            _pair_cache[key] = res
+            if res.name is not None:
+                _record_recipes_batch([(res.name, a_name, b_name)])
+            entry = (key[0], key[1], res.name, res.emoji or "")
+            added = await asyncio.to_thread(relay_client.contribute, [entry])
+            if added is None:
+                _relay_mark_unreachable()
+                break
+            done += 1
+            _bounties_worked += 1
+            _bounty_progress = (done, len(items))
+            _paint_queue_panel(force=True)
+    finally:
+        _bounty_progress = None
+        _paint_queue_panel(force=True)
+
+
+async def _bounty_worker(client, storage) -> None:
+    """Serve the hive while idle at the prompt. Polls every ~10s (the poll
+    doubles as the presence heartbeat)."""
     while True:
         await asyncio.sleep(craft.bounty_poll_interval_ms() / 1000.0)
-        if _bounty_preempted():
-            continue
-        items = await asyncio.to_thread(relay_client.take_bounties, 5)
-        if items is None:
-            _relay_mark_unreachable()
-            continue
-        _relay_apply_hive(client)
-        if not items:
-            continue
-        done = 0
-        _bounty_progress = (0, len(items))
-        _paint_queue_panel(force=True)
-        try:
-            for it in items:
-                if _bounty_preempted():
-                    break
-                a_name = it.get("first") or ""
-                b_name = it.get("second") or ""
-                if not a_name or not b_name:
-                    continue
-                key = craft.pair_key(a_name, b_name)
-                if it.get("kind") != "review" and key in _pair_cache:
-                    res = _pair_cache[key]
-                else:
-                    try:
-                        res = await client.pair(a_name, b_name, fleet=True)
-                    except NealRateLimited:
-                        _trip_cooldown()
-                        break
-                    except RateLimitCancelled:
-                        break
-                    except Exception:
-                        continue
-                    _pair_cache[key] = res
-                    if res.name is not None:
-                        _record_recipes_batch([(res.name, a_name, b_name)])
-                entry = (key[0], key[1], res.name, res.emoji or "")
-                added = await asyncio.to_thread(relay_client.contribute, [entry])
-                if added is None:
-                    _relay_mark_unreachable()
-                    break
-                done += 1
-                _bounties_worked += 1
-                _bounty_progress = (done, len(items))
-                _paint_queue_panel(force=True)
-        finally:
-            _bounty_progress = None
-            _paint_queue_panel(force=True)
+        with contextlib.suppress(Exception):
+            await _bounty_cycle(client, storage)
 
 
 def _request_skip_current() -> bool:

@@ -78,6 +78,17 @@ const deletedDirty = new Set();
 // caller so clients split the per-IP window without talking to each other.
 const PRESENCE_TTL_MS = 180_000;
 const presence = new Map();
+
+// Lifetime counters for observability (/api/stats, /api/dashboard).
+const metrics = {
+  lookupPairs: 0, // total pairs asked about
+  lookupHits: 0, // of those, served from the hive
+  contributed: 0, // new entries accepted
+  confirmed: 0, // duplicate-confirmations that advanced review
+  healed: 0, // entries dropped by a conflicting claim
+  bountiesPosted: 0,
+  bountiesTaken: 0,
+};
 // ip → epoch-ms until which the IP is cooling down (one session tripped a
 // neal 429 — an IP-scoped, hours-long ban). Broadcast to all sessions.
 const ipCooldown = new Map();
@@ -155,6 +166,50 @@ function pruneBounties(now) {
     if (now - b.at > BOUNTY_TTL_MS) bounties.delete(key);
   }
 }
+
+// Live sessions/IPs across the whole relay (expires stale entries as it goes).
+function presenceTotals(now) {
+  let sessions = 0;
+  let spending = 0;
+  for (const [ip, bySession] of presence) {
+    for (const [session, info] of bySession) {
+      if (now - info.at > PRESENCE_TTL_MS) {
+        bySession.delete(session);
+        continue;
+      }
+      sessions++;
+      if (info.state === "running" || info.state === "serving") spending++;
+    }
+    if (bySession.size === 0) presence.delete(ip);
+  }
+  return { sessions, spending, ips: presence.size };
+}
+
+function statsPayload(now) {
+  let reviewed = 0;
+  for (const v of entries.values()) if (v.rv) reviewed++;
+  const totals = presenceTotals(now);
+  const lookups = metrics.lookupPairs;
+  return {
+    entries: entries.size,
+    reviewed,
+    reviewBacklog: reviewPending.size,
+    openBounties: bounties.size,
+    live: totals, // { sessions, spending, ips }
+    metrics: {
+      ...metrics,
+      hitRate: lookups ? Number((metrics.lookupHits / lookups).toFixed(4)) : 0,
+    },
+    uptimeSec: Math.floor((now - bootAt) / 1000),
+    snapshot: {
+      enabled: snapshot.enabled,
+      loaded: snapshot.loaded,
+      pendingFlush: dirty.size + deletedDirty.size,
+      lastOkAt: snapshot.lastOkAt,
+      lastErr: snapshot.lastErr,
+    },
+  };
+}
 const bootAt = Date.now();
 const snapshot = {
   enabled: Boolean(UPSTASH_URL && UPSTASH_TOKEN),
@@ -199,9 +254,13 @@ export function doLookup(pairs) {
     const a = sanitizeName(p[0]);
     const b = sanitizeName(p[1]);
     if (!a || !b) continue;
+    metrics.lookupPairs++;
     const key = pairKey(a, b);
     const hit = entries.get(key);
-    if (hit) results[key] = { r: hit.r, e: hit.e };
+    if (hit) {
+      results[key] = { r: hit.r, e: hit.e };
+      metrics.lookupHits++;
+    }
   }
   return { results };
 }
@@ -226,6 +285,7 @@ export function doContribute(list) {
         // Independent identical claim = a peer review passing: one
         // confirmation (per design review) flips the entry to reviewed.
         prev.c += 1;
+        metrics.confirmed++;
         if (prev.c >= 2 && !prev.rv) {
           prev.rv = true;
           reviewPending.delete(key);
@@ -240,6 +300,7 @@ export function doContribute(list) {
         dirty.delete(key);
         deletedDirty.add(key);
         reviewPending.delete(key);
+        metrics.healed++;
         if (bounties.size < MAX_BOUNTIES && !bounties.has(key)) {
           bounties.set(key, { first: a, second: b, at: Date.now(), claimedBy: "", claimedAt: 0 });
         }
@@ -256,6 +317,7 @@ export function doContribute(list) {
     dirty.add(key);
     if (reviewPending.size < REVIEW_PENDING_MAX) reviewPending.set(key, null);
     bounties.delete(key); // a fresh result fulfills any open bounty
+    metrics.contributed++;
     added++;
   }
   return { added, dupes, total: entries.size };
@@ -282,6 +344,7 @@ export function doPostBounties(pairs, now) {
     }
     if (bounties.has(key) || bounties.size >= MAX_BOUNTIES) continue;
     bounties.set(key, { first: a, second: b, at: now, claimedBy: "", claimedAt: 0 });
+    metrics.bountiesPosted++;
     posted++;
   }
   return { results, posted, open: bounties.size };
@@ -301,6 +364,7 @@ export function doTakeBounties(limit, session, snap, now) {
     if (b.claimedBy && now - b.claimedAt <= CLAIM_TTL_MS) continue;
     b.claimedBy = session || "?";
     b.claimedAt = now;
+    metrics.bountiesTaken++;
     out.push({ kind: "pair", first: b.first, second: b.second });
   }
   // Idle capacity beyond open bounties goes to peer review: re-ask neal
@@ -416,6 +480,54 @@ function startSnapshotLoop() {
   setTimeout(tick, SNAPSHOT_INTERVAL_MS).unref();
 }
 
+// ── dashboard: a tiny honey-themed status page (self-refresh, no deps) ─
+function dashboardHtml(s) {
+  const m = s.metrics;
+  const pct = (m.hitRate * 100).toFixed(1);
+  const rows = [
+    ["Cache entries", s.entries.toLocaleString()],
+    ["Peer-reviewed", `${s.reviewed.toLocaleString()} (${s.entries ? ((s.reviewed / s.entries) * 100).toFixed(0) : 0}%)`],
+    ["Review backlog", s.reviewBacklog.toLocaleString()],
+    ["Open bounties", s.openBounties.toLocaleString()],
+    ["Live sessions", `${s.live.sessions} (${s.live.spending} spending) · ${s.live.ips} IPs`],
+    ["Lookup hit rate", `${pct}% of ${m.lookupPairs.toLocaleString()}`],
+    ["Contributed", m.contributed.toLocaleString()],
+    ["Confirmations", m.confirmed.toLocaleString()],
+    ["Self-healed", m.healed.toLocaleString()],
+    ["Bounties posted / taken", `${m.bountiesPosted.toLocaleString()} / ${m.bountiesTaken.toLocaleString()}`],
+    ["Snapshot", s.snapshot.enabled ? (s.snapshot.lastErr ? "error: " + s.snapshot.lastErr : "ok") : "disabled"],
+    ["Uptime", `${Math.floor(s.uptimeSec / 3600)}h ${Math.floor((s.uptimeSec % 3600) / 60)}m`],
+  ];
+  const cells = rows
+    .map(
+      ([k, v]) =>
+        `<div class="cell"><div class="k">${k}</div><div class="v">${String(v)}</div></div>`
+    )
+    .join("");
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="10">
+<title>🐝 Infinite Craft hive</title>
+<style>
+  :root{--bg:#12100a;--panel:#1c1810;--line:#2e2716;--text:#f0e6d2;--muted:#a99a76;--honey:#ffb300;--honey2:#ffcf4d}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:32px 20px}
+  main{max-width:640px;margin:0 auto}
+  h1{font-size:20px;margin:0 0 2px;letter-spacing:.02em}
+  .sub{color:var(--muted);font-size:13px;margin:0 0 24px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
+  .cell{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
+  .k{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.09em;margin-bottom:4px}
+  .v{color:var(--honey2);font-size:18px;font-variant-numeric:tabular-nums}
+  footer{color:var(--muted);font-size:12px;margin-top:22px}
+</style></head><body><main>
+  <h1>🐝 Infinite Craft hive</h1>
+  <p class="sub">Shared pair-result cache · auto-refreshes every 10s</p>
+  <div class="grid">${cells}</div>
+  <footer>Raw JSON at <code>/api/stats</code></footer>
+</main></body></html>`;
+}
+
 // ── http plumbing ────────────────────────────────────────────────────
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -480,21 +592,12 @@ export function makeServer() {
         return;
       }
       if (req.method === "GET" && url.pathname === "/api/stats") {
-        send(res, 200, {
-          entries: entries.size,
-          reviewed: [...entries.values()].filter((v) => v.rv).length,
-          reviewBacklog: reviewPending.size,
-          openBounties: bounties.size,
-          ipsPresent: presence.size,
-          uptimeSec: Math.floor((now - bootAt) / 1000),
-          snapshot: {
-            enabled: snapshot.enabled,
-            loaded: snapshot.loaded,
-            pendingFlush: dirty.size + deletedDirty.size,
-            lastOkAt: snapshot.lastOkAt,
-            lastErr: snapshot.lastErr,
-          },
-        });
+        send(res, 200, statsPayload(now));
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/dashboard") {
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", ...CORS });
+        res.end(dashboardHtml(statsPayload(now)));
         return;
       }
       if (req.method === "POST" && url.pathname === "/api/lookup") {
@@ -554,6 +657,7 @@ export function _resetForTests() {
   ipCooldown.clear();
   bounties.clear();
   reviewPending.clear();
+  for (const k of Object.keys(metrics)) metrics[k] = 0;
 }
 
 const isMain = process.argv[1] && import.meta.url.endsWith(process.argv[1].split("/").pop());

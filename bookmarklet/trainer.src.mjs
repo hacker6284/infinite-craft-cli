@@ -802,18 +802,17 @@ async function bountyTick() {
       const aName = it.first, bName = it.second;
       if (!aName || !bName) continue;
       const key = pairKey(aName, bName);
+      // Always a fresh neal call (fleet=true skips local + hive caches):
+      // every contribution is then an independent sighting for peer review,
+      // and a poisoned local entry can never be re-propagated to the hive.
       let res;
-      if (it.kind !== "review" && pairCache.has(key)) {
-        res = pairCache.get(key);
-      } else {
-        try {
-          res = await apiPair(aName, bName, true);
-        } catch (e) {
-          if (String(e && e.message).includes("429")) break;
-          continue;
-        }
-        pairCache.set(key, res);
+      try {
+        res = await apiPair(aName, bName, true);
+      } catch (e) {
+        if (String(e && e.message).includes("429")) break;
+        continue;
       }
+      pairCache.set(key, res);
       const [ka, kb] = pairKeyKernel(aName, bName);
       const added = await relayFetch(
         "/api/contribute",

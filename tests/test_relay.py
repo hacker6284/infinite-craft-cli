@@ -299,36 +299,58 @@ class TestBudgetSplit:
 
 
 class TestBountyWorker:
-    def test_worker_serves_then_contributes(self):
+    def test_cycle_serves_then_contributes_via_neal(self):
         import infinite_craft_cli.cli as cli
 
         _relay_on(cli)
         client = make_mock_client()
         client.pair.return_value = MockElement("Dust", "")
         storage = make_mock_storage()
-
         bounties = [{"kind": "pair", "first": "Earth", "second": "Wind"}]
 
-        async def one_cycle():
-            # Drive a single worker iteration directly (no 10s sleep).
-            with patch.object(cli.relay_client, "take_bounties", return_value=bounties), \
-                 patch.object(cli.relay_client, "contribute", return_value=1) as contrib:
-                # Inline the body of the loop once.
-                items = await cli.asyncio.to_thread(cli.relay_client.take_bounties, 5)
-                assert items
-                for it in items:
-                    res = await client.pair(it["first"], it["second"], fleet=True)
-                    key = cli.craft.pair_key(it["first"], it["second"])
-                    added = await cli.asyncio.to_thread(
-                        cli.relay_client.contribute,
-                        [(key[0], key[1], res.name, res.emoji or "")],
-                    )
-                    assert added == 1
-                return contrib.called
+        with patch.object(cli.relay_client, "take_bounties", return_value=bounties), \
+             patch.object(cli.relay_client, "contribute", return_value=1) as contrib:
+            run_async(cli._bounty_cycle(client, storage))
 
-        assert run_async(one_cycle())
-        # fleet=True must have tagged the slot (real limiter would; mock records call)
+        client.pair.assert_awaited_once()
         assert client.pair.await_args.kwargs.get("fleet") is True
+        assert contrib.called
+        assert cli._bounties_worked == 1
+        assert cli._bounty_progress is None  # reset in finally
+
+    def test_bounty_always_hits_neal_even_when_locally_cached(self):
+        """Poison-containment: a pair we already hold locally must still be
+        re-derived from neal when served as a bounty, never answered from
+        the local cache."""
+        import infinite_craft_cli.cli as cli
+
+        _relay_on(cli)
+        client = make_mock_client()
+        client.pair.return_value = MockElement("Real", "")
+        storage = make_mock_storage()
+        # Pre-seed local cache with a (possibly poisoned) value.
+        cli._pair_cache[cli.craft.pair_key("Earth", "Wind")] = MockElement("Stale", "")
+        bounties = [{"kind": "pair", "first": "Earth", "second": "Wind"}]
+
+        contributed = []
+        with patch.object(cli.relay_client, "take_bounties", return_value=bounties), \
+             patch.object(cli.relay_client, "contribute", side_effect=lambda e: contributed.extend(e) or 1):
+            run_async(cli._bounty_cycle(client, storage))
+
+        client.pair.assert_awaited_once()  # hit neal despite the cache
+        # Contributed the FRESH neal value, not the stale cache entry.
+        assert contributed[0][2] == "Real"
+
+    def test_cycle_noop_when_preempted(self):
+        import infinite_craft_cli.cli as cli
+
+        _relay_on(cli)
+        client = make_mock_client()
+        storage = make_mock_storage()
+        cli._current_command = "/permute *"
+        with patch.object(cli.relay_client, "take_bounties") as take:
+            run_async(cli._bounty_cycle(client, storage))
+            take.assert_not_called()
 
     def test_worker_preempted_by_running_command(self):
         import infinite_craft_cli.cli as cli
