@@ -54,3 +54,11 @@ def test_loader_fetches_hosted_url() -> None:
     loader = _read(LOADER)
     assert TRAINER_URL in loader
     assert "trainer.js" not in loader
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

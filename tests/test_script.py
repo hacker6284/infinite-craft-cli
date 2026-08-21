@@ -302,3 +302,11 @@ class TestTakeSampleShuffle:
         out = capsys.readouterr().out
         assert "Script error" in out
         client.pair.assert_not_called()
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

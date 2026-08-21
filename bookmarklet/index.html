@@ -127,24 +127,36 @@ function switchTab(name) {
 <div class="card">
   <h2>Commands</h2>
   <div class="commands">
-    <strong>Combine</strong><br>
-    <span class="cmd">&lt;element&gt; + &lt;element&gt;</span> <span class="desc">— Combine two elements</span><br>
-    <span class="cmd">/combine &lt;element&gt; &lt;element&gt;</span> <span class="desc">— Combine two elements</span><br>
-    <br>
-    <strong>Crawl</strong><br>
-    <span class="cmd">&lt;element&gt; ++ &lt;element&gt;</span> <span class="desc">— Combine &amp; crawl until no new discoveries</span><br>
-    <span class="cmd">/crawl &lt;element&gt; &lt;element&gt;</span> <span class="desc">— Combine &amp; crawl until no new discoveries</span><br>
+    <strong>Combine &amp; crawl</strong><br>
+    <span class="cmd">&lt;element&gt; + &lt;element&gt;</span> <span class="desc">— Combine two elements (chains: a + b + c)</span><br>
+    <span class="cmd">&lt;element&gt; ++ &lt;element&gt;</span> <span class="desc">— Crawl: generations over a growing pool until one adds nothing</span><br>
+    <span class="cmd">/combine</span>, <span class="cmd">/crawl</span> <span class="desc">— Slash forms of the above</span><br>
     <br>
     <strong>Bulk combine</strong><br>
-    <span class="cmd">&lt;element&gt; +| &lt;query&gt;</span> <span class="desc">— Combine with all matching discoveries</span><br>
+    <span class="cmd">&lt;query&gt; * &lt;query&gt;</span> <span class="desc">— Cross-combine matches from both queries (also /cross)</span><br>
     <span class="cmd">/with &lt;element&gt; &lt;query&gt;</span> <span class="desc">— Combine element with all matching discoveries</span><br>
-    <span class="cmd">&lt;query&gt; * &lt;query&gt;</span> <span class="desc">— Cross-combine matches from both queries</span><br>
-    <span class="cmd">/cross &lt;query&gt; &lt;query&gt;</span> <span class="desc">— Cross-combine matches from both queries</span><br>
     <span class="cmd">/permute &lt;query&gt;</span> <span class="desc">— Combine all matching elements with each other</span><br>
     <span class="cmd">/permutate &lt;query&gt;</span> <span class="desc">— Permute repeatedly until no new discoveries</span><br>
     <span class="cmd">/exhaust &lt;query&gt;</span> <span class="desc">— Each match combined with all discoveries</span><br>
+    <span class="cmd">/lucky [count]</span> <span class="desc">— Try random untried pairs — entropy mining (default 10)</span><br>
     <br>
-    <strong>Query syntax</strong> (<span class="cmd">/search</span>, <span class="cmd">/with</span>, <span class="cmd">/permute</span>, <span class="cmd">/permutate</span>, <span class="cmd">/cross</span>, <span class="cmd">/exhaust</span>, shorthands) — substring (default), <span class="cmd">* ? []</span> wildcards, <span class="cmd">/pattern/</span> regex, <span class="cmd">!&lt;query&gt;</span> to exclude, <span class="cmd">^&lt;query&gt;</span> for first discoveries only<br>
+    <strong>Scripting</strong> <span class="desc">(every non-slash line is a script)</span><br>
+    <span class="cmd">stmt ; stmt</span> <span class="desc">— Run statements in sequence</span><br>
+    <span class="cmd">name := expr</span> <span class="desc">— Bind a set for this script run</span><br>
+    <span class="cmd">a* , b*</span> <span class="desc">— Union</span> &nbsp;<span class="cmd">a* - b*</span> <span class="desc">— difference</span> &nbsp;<span class="cmd">a* &amp; b*</span> <span class="desc">— intersect</span><br>
+    <span class="cmd">a* / b*</span> <span class="desc">— Keep a* having a known recipe with b* (<span class="cmd">%</span> = lacking)</span><br>
+    <span class="cmd">(expr)*  (expr)**  (expr)!</span> <span class="desc">— Permute / permutate / exhaust the set</span><br>
+    <span class="cmd">(expr)100  (expr)100?  (expr)?</span> <span class="desc">— First 100 / random 100 / shuffle; <span class="cmd">(expr)(|x*|)</span> = dynamic count</span><br>
+    <span class="cmd">[ expr ]</span> / <span class="cmd">[]</span> <span class="desc">— New elements made by expr / by the last operation</span><br>
+    <span class="cmd">^(expr)</span> <span class="desc">— First discoveries only</span><br>
+    <span class="cmd">set @ body</span> / <span class="cmd">set @x body</span> <span class="desc">— For each element (as <span class="cmd">_</span> or <span class="cmd">x</span>) run body</span><br>
+    <span class="cmd">body -&gt; cond</span> <span class="desc">— Run body, repeat until cond is true</span><br>
+    <span class="cmd">body ~ cond</span> <span class="desc">— While cond is true, run body</span><br>
+    <span class="cmd">cond ? body : body</span> <span class="desc">— Conds: <span class="cmd">|expr|</span> sizes, comparisons, <span class="cmd">&amp;&amp;</span> <span class="cmd">||</span></span><br>
+    <span class="cmd">"exact name"</span> <span class="desc">— Quoted = exact element (spaces, commas, shadowed names)</span><br>
+    <span class="cmd">/script</span> <span class="desc">— Run a saved .ice script file</span><br>
+    <br>
+    <strong>Query syntax</strong> <span class="desc">— substring (default), <span class="cmd">* ? []</span> wildcards, <span class="cmd">/pattern/</span> regex, <span class="cmd">!&lt;query&gt;</span> exclude, <span class="cmd">^&lt;query&gt;</span> first discoveries only</span><br>
     <br>
     <strong>Discoveries &amp; recipes</strong><br>
     <span class="cmd">/search &lt;query&gt;</span> <span class="desc">— Search discoveries</span><br>
@@ -156,7 +168,11 @@ function switchTab(name) {
     <span class="cmd">/prune</span> <span class="desc">— Remove orphan elements Infinibrowser can't fill</span><br>
     <span class="cmd">/export</span> <span class="desc">— Download discoveries as .ic file</span><br>
     <span class="cmd">/history</span> <span class="desc">— Show combinations this session</span><br>
+    <span class="cmd">/queue</span> <span class="desc">— Running and pending commands (also shown in the sticky panel)</span><br>
+    <br>
+    <strong>Modes</strong><br>
     <span class="cmd">/target &lt;element&gt;</span> <span class="desc">— Ask y/n to continue the batch when this is crafted</span><br>
+    <span class="cmd">/auto [on|off]</span> <span class="desc">— Auto-approve bulk y/n confirms (bare /auto toggles)</span><br>
     <span class="cmd">/clear</span> <span class="desc">— Clear output</span><br>
     <span class="cmd">/help</span> <span class="desc">— Show commands in the trainer</span><br>
   </div>
@@ -165,8 +181,9 @@ function switchTab(name) {
 <div class="card">
   <h2>Tips</h2>
   <p>Use <code>Up</code>/<code>Down</code> arrows to scroll through command history.</p>
-  <p>Bulk operations show a <strong>Stop</strong> button. Click it or wait for completion.</p>
-  <p>After combining elements, <strong>refresh the page</strong> to see them in the game's sidebar.</p>
+  <p>Bulk operations show a <strong>Stop</strong> button; runs over 200 pairs ask y/n first (skip with <code>/auto</code>).</p>
+  <p>New elements appear in the game's sidebar <strong>live</strong> — no refresh needed — and elements you craft by hand are picked up by the trainer too.</p>
+  <p>Pure queries (like a bare <code>fire*</code>) run instantly, even while a bulk command is working.</p>
   <p>For the full desktop CLI with more features, install the <a href="https://github.com/hacker6284/infinite-craft-cli">Python package</a>.</p>
 </div>
 

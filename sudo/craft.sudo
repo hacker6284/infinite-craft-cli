@@ -781,6 +781,12 @@ export func is_ib_command(line: text) -> bool
 // Always-script dispatch (v2): a line starting with "/" is a slash command
 // only when its first token names a known command; anything else (e.g. a
 // /regex/ statement) is a script. First token = up to first whitespace.
+// The canonical command inventory — the single source of truth that the
+// docs-drift test checks every documentation surface against (README,
+// CLI /help, trainer /help, the GitHub Pages site).
+export func known_slash_commands() -> List<text>
+    return ["/help", "/search", "/recipe", "/list", "/history", "/target", "/auto", "/clear", "/unfilled", "/queue", "/import", "/fill", "/prune", "/export", "/combine", "/crawl", "/with", "/cross", "/permute", "/permutate", "/exhaust", "/script", "/lucky"]
+
 export func is_known_slash_command(line: text) -> bool
     stripped = strip_spaces(line)
     if stripped.length == 0 or stripped[0] != '/'
@@ -789,8 +795,7 @@ export func is_known_slash_command(line: text) -> bool
     while end < stripped.length and not is_ascii_space(stripped[end])
         end = end + 1
     head = text_slice(stripped, 0, end)
-    known: List<text> = ["/help", "/search", "/recipe", "/list", "/history", "/target", "/auto", "/clear", "/unfilled", "/queue", "/import", "/fill", "/prune", "/export", "/combine", "/crawl", "/with", "/cross", "/permute", "/permutate", "/exhaust", "/script", "/lucky"]
-    for k in known
+    for k in known_slash_commands()
         if head == k
             return true
     return false
@@ -3218,6 +3223,12 @@ test "runs_local: pure loop-free scripts are immediate"
     assert not runs_local("/script run.ice")
     assert not runs_local("/notacommand")
     assert not runs_local("")
+
+test "known slash command inventory"
+    cmds = known_slash_commands()
+    assert cmds.length == 23
+    for c in cmds
+        assert is_known_slash_command(c)
 
 test "known slash command dispatch"
     assert is_known_slash_command("/help")

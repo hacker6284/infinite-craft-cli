@@ -125,6 +125,7 @@ Used by `/search`, `/with`, `/permute`, `/permutate`, `/cross`, `/exhaust`, and 
 | `/target <element>` | Watch for a result; ask y/n to continue the batch on hit |
 | `/target` | Show current target |
 | `/target clear` | Clear target |
+| `/auto [on|off]` | Auto-approve bulk y/n confirms — bare `/auto` toggles |
 | `/queue` | Show running and pending commands (status also appears in chrome) |
 | `/help` | Show help |
 | `/quit` | Exit |
@@ -141,7 +142,7 @@ targets := ^(fire* / water*) ;          # bind first-discoveries having a fire*+
 
 Pure, loop-free scripts (bare queries, unions, filters, walrus bindings) run immediately and interleave with a running bulk command, like `/search`; mutating scripts and loops queue on the pair lane.
 
-Highlights: `,` union, `-` difference, `&` intersect, `/`/`%` known-recipe filters, `(S)*`/`(S)**`/`(S)!` permute/permutate/exhaust, `(S)100` first-100 (`(S)(|x*|)` dynamic counts), `(S)100?` random-100, `(S)?` shuffle, `A * B` cross, `A ++ B` crawl, `[ expr ]`/`[]` new-element sets, `set @x body` for-each, `body -> cond` do-until, `body ~ cond` while, `cond ? a : b` ternary. Conditions are statically pure — mutations inside a condition are parse errors. Every mutating operation's value is the set it produced, so pipelines chain. Save scripts as `.ice` files and run them with `/script <path>` (file picker in the trainer) or `infinite-craft script -f path`. Non-interactive runs have no y/n prompt: bulk operations over the warn threshold announce their pair count and proceed; script failures exit non-zero. Full spec: `docs/superpowers/specs/2026-08-20-script-language-v0.6.md`.
+Highlights: `,` union, `-` difference, `&` intersect, `/`/`%` known-recipe filters, `(expr)*`/`(expr)**`/`(expr)!` permute/permutate/exhaust, `(expr)100` first-100 (`(expr)(|x*|)` dynamic counts), `(expr)100?` random-100, `(expr)?` shuffle, `A * B` cross, `A ++ B` crawl, `[ expr ]`/`[]` new-element sets, `set @x body` for-each, `body -> cond` do-until, `body ~ cond` while, `cond ? a : b` ternary. Conditions are statically pure — mutations inside a condition are parse errors. Every mutating operation's value is the set it produced, so pipelines chain. Save scripts as `.ice` files and run them with `/script <path>` (file picker in the trainer) or `infinite-craft script -f path`. Non-interactive runs have no y/n prompt: bulk operations over the warn threshold announce their pair count and proceed; script failures exit non-zero. Full spec: `docs/superpowers/specs/2026-08-20-script-language-v0.6.md`.
 
 Breaking changes in 2.0: `+|` is removed (use `*`; `/with` remains), bare words in old `*`//`+|` positions were substring queries and are now element references (write `*fire*` for substring), bare pattern lines print matches instead of erroring, `A + B + C` chains combines, and `/permutate` no longer stops at 50 rounds.
 
