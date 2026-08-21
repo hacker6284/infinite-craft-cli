@@ -37,8 +37,21 @@ const MAX_NAME = 200;
 const MAX_EMOJI = 16;
 const SNAPSHOT_INTERVAL_MS = Number(process.env.RELAY_SNAPSHOT_MS || 60_000);
 
-const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL || "";
-const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
+// Upstash's dashboard copy-paste wraps values in quotes (KEY="value");
+// strip them so pasted-as-is env vars just work.
+export function envStr(raw) {
+  let v = (raw || "").trim();
+  if (
+    (v.startsWith('"') && v.endsWith('"') && v.length >= 2) ||
+    (v.startsWith("'") && v.endsWith("'") && v.length >= 2)
+  ) {
+    v = v.slice(1, -1);
+  }
+  return v;
+}
+
+const UPSTASH_URL = envStr(process.env.UPSTASH_REDIS_REST_URL).replace(/\/+$/, "");
+const UPSTASH_TOKEN = envStr(process.env.UPSTASH_REDIS_REST_TOKEN);
 const SNAP_KEY = "pairs";
 
 /** key "<a>\0<b>" → { r: string|null, e: string, c: number } */
