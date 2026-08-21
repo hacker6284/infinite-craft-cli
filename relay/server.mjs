@@ -94,12 +94,17 @@ export function pairKey(a, b) {
 export function sanitizeName(raw) {
   if (typeof raw !== "string") return "";
   let out = "";
+  let cps = 0;
   for (const ch of raw.trim()) {
     const cp = ch.codePointAt(0);
     if (cp < 0x20 || (cp >= 0x7f && cp <= 0x9f) || cp === 0x2028 || cp === 0x2029) continue;
     out += ch;
+    cps += 1;
   }
-  return out.length > MAX_NAME ? "" : out;
+  // Length bound is relay-only DoS hygiene (the kernel imposes none) and is
+  // measured in CODE POINTS so astral-heavy names get the same budget as
+  // ASCII — real game names are far shorter than 200 either way.
+  return cps > MAX_NAME ? "" : out;
 }
 
 function sanitizeEmoji(raw) {
@@ -151,7 +156,9 @@ export function doContribute(list) {
       dupes++;
       continue;
     }
-    if (entries.size >= MAX_ENTRIES) break;
+    // At capacity: skip the insert but keep scanning — confirmations for
+    // already-present keys later in the batch must still land.
+    if (entries.size >= MAX_ENTRIES) continue;
     entries.set(key, { r, e, c: 1 });
     dirty.add(key);
     added++;
@@ -248,21 +255,37 @@ function send(res, status, body) {
   res.end(data);
 }
 
+// Oversized uploads: destroying the socket mid-upload races the 413 and the
+// client sees a bare connection reset (stress finding F1); responding early
+// races the client's remaining writes the same way. So drain the body
+// (discarding, bounded by MAX_DRAIN against abuse) and reject at `end` —
+// the request is fully consumed, keep-alive stays sound, and the client
+// reliably reads the 413.
+const MAX_DRAIN = 64 * 1024 * 1024;
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let size = 0;
+    let overflowed = false;
     const chunks = [];
     req.on("data", (c) => {
       size += c.length;
+      if (overflowed) {
+        if (size > MAX_DRAIN) req.destroy();
+        return;
+      }
       if (size > MAX_BODY) {
-        reject(new Error("body too large"));
-        req.destroy();
+        overflowed = true;
+        chunks.length = 0;
         return;
       }
       chunks.push(c);
     });
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-    req.on("error", reject);
+    req.on("end", () => {
+      if (overflowed) reject(new Error("body too large"));
+      else resolve(Buffer.concat(chunks).toString("utf8"));
+    });
+    req.on("error", () => reject(new Error("body read error")));
   });
 }
 
