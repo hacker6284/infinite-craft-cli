@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.4.1] - 2026-08-22
+
+### Fixed
+- **Reloading the trainer no longer halves your rate budget to `/30`.** The
+  trainer minted a fresh relay session id on every page load, so a reload
+  while a run or hive-serve was active left the old session lingering in the
+  relay's presence table for up to 3 minutes — the new load counted it as a
+  second client on your IP and split the budget in half. The session id now
+  persists in `sessionStorage` (survives a reload of the same tab, stays
+  unique per tab), and the relay's presence TTL dropped 180s→60s so any
+  genuine phantom (a closed tab that can't heartbeat) clears ~3× faster.
+
 ## [2.4.0] - 2026-08-22
 
 ### Added
