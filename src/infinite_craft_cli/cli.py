@@ -999,9 +999,15 @@ async def _hive_aware_wait(client, batch, tail) -> None:
         ]
         if not misses:
             return  # all cached → gather resolves for free
-        left, _m, _f = client._rate_limiter.chrome_snapshot()
+        left, maximum, _f = client._rate_limiter.chrome_snapshot()
         if left >= len(misses):
             return  # enough slots → gather won't block
+        if left >= 1 and left >= maximum:
+            # The window is as full as it will ever get and still can't cover
+            # the batch (only reachable if the same-IP budget split dropped the
+            # effective max below the batch size). Waiting can't help — proceed
+            # and let the gather spend what slots it has (review finding F4).
+            return
         now = time.monotonic()
         if now - last_resweep >= resweep_interval:
             merged = await _hive_sweep(client, tail)
@@ -1074,9 +1080,12 @@ async def _bounty_cycle(client, storage) -> str:
     global _bounties_worked, _bounty_progress
     if _bounty_preempted():
         return "blocked"
-    if not _fleet_slot_available(client):
+    left, _max, _frac = client._rate_limiter.chrome_snapshot()
+    if left <= 0:
         return "blocked"  # rate-limited — don't even claim work we can't do
-    items = await asyncio.to_thread(relay_client.take_bounties, 5)
+    # Claim only as many as we can actually serve this window, so we don't
+    # lock bounties we'll abandon to their claim-TTL (review finding F3).
+    items = await asyncio.to_thread(relay_client.take_bounties, min(5, left))
     if items is None:
         _relay_mark_unreachable()
         return "unreachable"
@@ -1124,6 +1133,12 @@ async def _bounty_cycle(client, storage) -> str:
     finally:
         _bounty_progress = None
         _paint_queue_panel(force=True)
+    # A cycle that served nothing (e.g. a non-429 neal outage: every pair
+    # raised and continued) must NOT report "worked" — otherwise the worker
+    # skips its backoff and bursts the whole rate budget on failing requests
+    # (review finding F1). Report "blocked" so it idle-polls instead.
+    if status == "worked" and done == 0:
+        status = "blocked"
     return status
 
 

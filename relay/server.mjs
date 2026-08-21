@@ -368,7 +368,9 @@ export function doContribute(list, session = "") {
         reviewPending.delete(key);
         metrics.healed++;
         if (bounties.size < MAX_BOUNTIES && !bounties.has(key)) {
-          bounties.set(key, { first: a, second: b, at: Date.now(), claimedBy: "", claimedAt: 0 });
+          // Self-heal bounty: postedBy "" so anyone (including either
+          // disputing party) can re-derive it fresh.
+          bounties.set(key, { first: a, second: b, at: Date.now(), claimedBy: "", claimedAt: 0, postedBy: "" });
         }
       }
       // Conflicts against a reviewed entry are ignored: 2+ independent
@@ -390,9 +392,9 @@ export function doContribute(list, session = "") {
 }
 
 // ── bounty ops ───────────────────────────────────────────────────────
-export function doPostBounties(pairs, now) {
+export function doPostBounties(pairs, now, ip = "") {
   // Pairs already cached come straight back as results (no bounty needed);
-  // the rest go on the board.
+  // the rest go on the board, tagged with the poster's IP.
   const results = {};
   let posted = 0;
   let m = 0;
@@ -409,14 +411,14 @@ export function doPostBounties(pairs, now) {
       continue;
     }
     if (bounties.has(key) || bounties.size >= MAX_BOUNTIES) continue;
-    bounties.set(key, { first: a, second: b, at: now, claimedBy: "", claimedAt: 0 });
+    bounties.set(key, { first: a, second: b, at: now, claimedBy: "", claimedAt: 0, postedBy: ip });
     metrics.bountiesPosted++;
     posted++;
   }
   return { results, posted, open: bounties.size };
 }
 
-export function doTakeBounties(limit, session, snap, now) {
+export function doTakeBounties(limit, session, snap, now, ip = "") {
   // Eligibility: the caller's whole IP must be idle (no running session)
   // and not cooling down — bounty work must never contest a household's
   // own runs or a banned IP.
@@ -428,6 +430,11 @@ export function doTakeBounties(limit, session, snap, now) {
   for (const [key, b] of bounties) {
     if (out.length >= cap) break;
     if (b.claimedBy && now - b.claimedAt <= CLAIM_TTL_MS) continue;
+    // Never hand a bounty back to the IP that posted it: same-IP clients
+    // share one neal budget, so self-serving spends the exact rate the
+    // poster would have — and it means a cancelled run's leftover bounties
+    // can't be silently resumed by the poster's own idle worker.
+    if (b.postedBy && b.postedBy === ip) continue;
     b.claimedBy = session || "?";
     b.claimedAt = now;
     metrics.bountiesTaken++;
@@ -701,7 +708,10 @@ export function makeServer() {
           return;
         }
         pruneBounties(now);
-        send(res, 200, { ...doPostBounties(body.pairs, now), hive: hiveEnvelope(req, now) });
+        send(res, 200, {
+          ...doPostBounties(body.pairs, now, callerIp(req)),
+          hive: hiveEnvelope(req, now),
+        });
         return;
       }
       if (req.method === "GET" && url.pathname === "/api/bounties") {
@@ -709,7 +719,7 @@ export function makeServer() {
         const session = envStr(req.headers["x-ic-session"] || "");
         const snap = ipSnapshot(req, now);
         send(res, 200, {
-          ...doTakeBounties(limit, session, snap, now),
+          ...doTakeBounties(limit, session, snap, now, callerIp(req)),
           hive: { peers: snap.spending, cooledUntil: snap.cooledUntil },
         });
         return;

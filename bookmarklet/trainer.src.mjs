@@ -815,8 +815,11 @@ function fleetSlotAvailable() {
 // "blocked" (preempted or out of rate), "unreachable". Serving never blocks
 // on a rate slot — it checks availability first and backs off to polling.
 async function bountyTick() {
-  if (bountyPreempted() || !fleetSlotAvailable()) return "blocked";
-  const data = await relayFetch(`/api/bounties?limit=5`, null, 4000);
+  if (bountyPreempted()) return "blocked";
+  const left = rateChromeSnapshot().remaining;
+  if (left <= 0) return "blocked";
+  // Claim only as many as we can serve this window (review finding F3).
+  const data = await relayFetch(`/api/bounties?limit=${Math.min(5, left)}`, null, 4000);
   if (data == null) { relayMarkUnreachable(); return "unreachable"; }
   if (!Array.isArray(data.bounties) || !data.bounties.length) return "empty";
   const items = data.bounties;
@@ -837,7 +840,8 @@ async function bountyTick() {
       try {
         res = await apiPair(aName, bName, true);
       } catch (e) {
-        if (String(e && e.message).includes("429")) { status = "blocked"; break; }
+        const msg = String(e && e.message);
+        if (msg.includes("429") || msg.includes("Cancelled")) { status = "blocked"; break; }
         continue;
       }
       pairCache.set(key, res);
@@ -850,7 +854,7 @@ async function bountyTick() {
         { entries: [[ka, kb, res ? res.text : null, res ? res.emoji : ""]] },
         8000
       );
-      if (added == null) { status = "unreachable"; break; }
+      if (added == null) { relayMarkUnreachable(); status = "unreachable"; break; }
       relayContributed += added.added || 0;
       done++;
       bountiesWorked++;
@@ -861,6 +865,9 @@ async function bountyTick() {
     bountyProgress = null;
     updateChrome();
   }
+  // Served nothing (e.g. every pair errored) → don't report "worked", or the
+  // scheduler skips its backoff and bursts the budget (review finding F1).
+  if (status === "worked" && done === 0) status = "blocked";
   return status;
 }
 
@@ -960,7 +967,11 @@ async function apiPair(firstName, secondName, fleet = false) {
     result = { text: json.result, emoji: json.emoji || "", discovered: !!json.isNew };
   }
   pairCache.set(key, result);
-  if (relayActive()) {
+  // Contribute back — but NOT for fleet (bounty) serving: the bounty path
+  // contributes explicitly and awaits the count, so contributing here too
+  // would double-post the same entry (review finding T2; matches Python,
+  // where client.pair never contributes and the bounty path does).
+  if (!fleet && relayActive()) {
     const [ka, kb] = pairKeyKernel(firstName, secondName);
     relayContribute([[ka, kb, result ? result.text : null, result ? result.emoji : ""]]);
   }

@@ -10,6 +10,7 @@ import {
   makeServer,
   envStr,
   doTakeBounties,
+  doPostBounties,
   _resetForTests,
 } from "./server.mjs";
 
@@ -144,42 +145,44 @@ test("bounty lifecycle: post, take, fulfill via contribute", async () => {
   const server = makeServer();
   await new Promise((resolve) => server.listen(0, resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
-  const H = (session, state) => ({
+  const H = (session, state, ip) => ({
     "Content-Type": "application/json",
     "x-ic-session": session,
     "x-ic-state": state,
+    "x-forwarded-for": ip,
   });
   try {
     // Seed one cached pair so posting returns it as a result, not a bounty.
     doContribute([["Fire", "Water", "Steam", ""]]);
-    // Poster (running) posts three pairs; one is already cached.
+    // Poster on IP A (running) posts three pairs; one is already cached.
     const post = await (
       await fetch(`${base}/api/bounties`, {
         method: "POST",
-        headers: H("poster", "running"),
+        headers: H("poster", "running", "1.1.1.1"),
         body: JSON.stringify({ pairs: [["Water", "Fire"], ["Earth", "Wind"], ["Lava", "Sea"]] }),
       })
     ).json();
     assert.equal(post.posted, 2);
     assert.equal(Object.keys(post.results).length, 1);
 
-    // Same-IP taker is refused while the poster is running (127.0.0.1 shared).
+    // A sibling on the SAME IP is refused while the poster is running.
     const refused = await (
-      await fetch(`${base}/api/bounties?limit=5`, { headers: H("helper", "idle") })
+      await fetch(`${base}/api/bounties?limit=5`, { headers: H("sibling", "idle", "1.1.1.1") })
     ).json();
     assert.equal(refused.bounties.length, 0);
     assert.equal(refused.reason, "ip-active");
     assert.equal(refused.hive.peers, 1);
 
-    // Poster goes idle → helper is eligible and claims both bounties
-    // (plus the review bounty for the seeded unreviewed entry).
+    // Poster goes idle. A helper on a DIFFERENT IP claims both pair bounties
+    // (plus the review bounty for the seeded unreviewed entry). Same-IP would
+    // be refused — a poster is never handed its own bounties back.
     await fetch(`${base}/api/lookup`, {
       method: "POST",
-      headers: H("poster", "idle"),
+      headers: H("poster", "idle", "1.1.1.1"),
       body: JSON.stringify({ pairs: [] }),
     });
     const take = await (
-      await fetch(`${base}/api/bounties?limit=5`, { headers: H("helper", "serving") })
+      await fetch(`${base}/api/bounties?limit=5`, { headers: H("helper", "serving", "2.2.2.2") })
     ).json();
     const kinds = take.bounties.map((b) => b.kind).sort();
     assert.deepEqual(kinds, ["pair", "pair", "review"]);
@@ -189,7 +192,7 @@ test("bounty lifecycle: post, take, fulfill via contribute", async () => {
 
     // Claimed bounties are not re-offered inside the claim TTL.
     const again = await (
-      await fetch(`${base}/api/bounties?limit=5`, { headers: H("helper2", "idle") })
+      await fetch(`${base}/api/bounties?limit=5`, { headers: H("helper2", "idle", "2.2.2.2") })
     ).json();
     assert.equal(again.bounties.length, 0);
 
@@ -197,7 +200,7 @@ test("bounty lifecycle: post, take, fulfill via contribute", async () => {
     const fulfil = await (
       await fetch(`${base}/api/contribute`, {
         method: "POST",
-        headers: H("helper", "serving"),
+        headers: H("helper", "serving", "2.2.2.2"),
         body: JSON.stringify({
           entries: [
             ["Earth", "Wind", "Dust", ""],
@@ -214,6 +217,22 @@ test("bounty lifecycle: post, take, fulfill via contribute", async () => {
   } finally {
     server.close();
   }
+});
+
+test("a bounty is never handed back to the IP that posted it", () => {
+  _resetForTests();
+  const now = Date.now();
+  // Poster on IP A posts one bounty.
+  const posted = doPostBounties([["Moon", "Star"]], now, "1.1.1.1");
+  assert.equal(posted.posted, 1);
+  // Same IP asking for work gets nothing (would be self-serving its own
+  // cancelled/leftover bounty on the shared per-IP budget).
+  const self = doTakeBounties(5, "sA", { cooledUntil: 0, running: 0 }, now, "1.1.1.1");
+  assert.equal(self.bounties.length, 0);
+  // A different IP is offered it.
+  const other = doTakeBounties(5, "sB", { cooledUntil: 0, running: 0 }, now, "2.2.2.2");
+  assert.equal(other.bounties.length, 1);
+  assert.equal(other.bounties[0].first, "Moon");
 });
 
 test("mismatch against unreviewed entry heals: delete + reopen bounty", () => {

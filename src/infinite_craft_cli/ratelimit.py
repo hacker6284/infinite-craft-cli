@@ -167,8 +167,13 @@ class RateLimiter:
         (or the current oldest's birth) until the next free. Resets to 0 when
         something drops off the window log, then fills over that inter-drop
         interval — so a 2s gap to the next free fills the left half in 2s,
-        not 60s. ``1000`` when idle (no in-window requests). Best-effort display
-        only (no async lock).
+        not 60s. ``1000`` when idle (no in-window requests).
+
+        No async lock, but safe as a control-flow oracle (the hive-aware wait
+        and the bounty slot gate both read ``slots_left`` here): it is fully
+        synchronous, so on the single event-loop thread it cannot interleave
+        with ``acquire``'s critical section — the read reflects a consistent
+        window snapshot at call time.
         """
         if self._max <= 0:
             return (0, 0, 1000)

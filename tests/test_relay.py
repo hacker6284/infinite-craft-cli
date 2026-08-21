@@ -532,3 +532,90 @@ class TestHiveAwareWait:
         with patch.object(cli.relay_client, "lookup") as look:
             run_async(cli._hive_aware_wait(client, [(a, b)], [(a, b)]))
             look.assert_not_called()  # nothing unresolved → don't wait
+
+
+class TestReviewFixes:
+    def test_cycle_serving_nothing_reports_blocked_not_worked(self):
+        """F1: a cycle that claims work but serves none (non-429 neal outage)
+        must not return 'worked', or the eager worker skips its backoff."""
+        import infinite_craft_cli.cli as cli
+
+        _relay_on(cli)
+        client = make_mock_client()  # 60 free
+        client.pair.side_effect = RuntimeError("neal 503")  # generic outage
+        storage = make_mock_storage()
+        bounties = [{"kind": "pair", "first": "Earth", "second": "Wind"}]
+        with patch.object(cli.relay_client, "take_bounties", return_value=bounties), \
+             patch.object(cli.relay_client, "contribute", return_value=1) as contrib:
+            status = run_async(cli._bounty_cycle(client, storage))
+        assert cli._bounties_worked == 0
+        assert not contrib.called
+        assert status == "blocked"  # → worker backs off, no budget burst
+
+    def test_cycle_claims_only_available_slots(self):
+        """F3: with 3 free slots, claim at most 3 (not 5) so we don't lock
+        bounties we'd abandon to their claim-TTL."""
+        import infinite_craft_cli.cli as cli
+
+        _relay_on(cli)
+        client = make_mock_client()
+        client._rate_limiter.chrome_snapshot.return_value = (3, 60, 1000)
+        client.pair.return_value = MockElement("X", "")
+        storage = make_mock_storage()
+        with patch.object(cli.relay_client, "take_bounties", return_value=[]) as take, \
+             patch.object(cli.relay_client, "contribute", return_value=1):
+            run_async(cli._bounty_cycle(client, storage))
+        take.assert_called_once_with(3)  # min(5, left=3)
+
+    def test_worker_eager_polls_after_worked_then_backs_off(self):
+        """Eager cadence: 'worked' → immediate re-poll (sleep 0); anything
+        else → the poll interval."""
+        import infinite_craft_cli.cli as cli
+        from unittest.mock import AsyncMock
+
+        client = make_mock_client()
+        storage = make_mock_storage()
+        poll = cli.craft.bounty_poll_interval_ms() / 1000.0
+
+        def last_sleep_for(status_val):
+            sleeps = []
+
+            async def fake_sleep(secs):
+                sleeps.append(secs)
+                raise asyncio.CancelledError()  # break after the first sleep
+
+            with patch.object(cli, "_bounty_cycle", new=AsyncMock(return_value=status_val)), \
+                 patch("infinite_craft_cli.cli.asyncio.sleep", side_effect=fake_sleep):
+                with pytest.raises(asyncio.CancelledError):
+                    run_async(cli._bounty_worker(client, storage))
+            return sleeps[-1]
+
+        assert last_sleep_for("worked") == 0  # immediate re-poll
+        assert last_sleep_for("empty") == poll  # back off
+        assert last_sleep_for("blocked") == poll
+
+    def test_hive_aware_wait_ticks_then_exits_on_cooldown(self):
+        """F4/coverage: the load-bearing loop path — no slot, hive doesn't
+        fill — sleeps a tick and re-loops, exiting when cooldown trips."""
+        import infinite_craft_cli.cli as cli
+
+        _relay_on(cli)
+        client = make_mock_client()
+        client._rate_limiter.chrome_snapshot.return_value = (0, 60, 500)  # never a slot
+        storage = make_mock_storage()
+        a, b = MockElement("A"), MockElement("B")
+        ticks = {"n": 0}
+
+        async def fake_tick(_secs):
+            ticks["n"] += 1
+            if ticks["n"] >= 2:
+                cli._cooldown_until = cli.time.time() + 3600  # trip cooldown → exit
+            return False  # not cancelled
+
+        # hive never fills (lookup returns no hit for this pair)
+        with patch.object(cli.relay_client, "lookup", return_value={}), \
+             patch.object(cli, "_sleep_cancellable_async", side_effect=fake_tick):
+            run_async(cli._hive_aware_wait(client, [(a, b)], [(a, b)]))
+        assert ticks["n"] >= 2  # it actually looped-and-slept, then exited
+
+
