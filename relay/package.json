@@ -1,0 +1,11 @@
+{
+  "name": "infinite-craft-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Shared pair-result cache relay for infinite-craft-cli — RAM + client re-seed, optional Upstash snapshot.",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test server.test.mjs"
+  }
+}

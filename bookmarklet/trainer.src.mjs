@@ -40,6 +40,8 @@ import {
   confirm_answer_key as confirmAnswerKey,
   should_bulk_warn as shouldBulkWarn,
   auto_approve_outcome as autoApproveOutcome,
+  relay_toggle_outcome as relayToggleOutcome,
+  relay_reseed_entries as relayReseedEntries,
   bulk_confirm_required as bulkConfirmRequired,
   rate_status_note as rateStatusNote,
   script_parse as scriptParse,
@@ -103,6 +105,13 @@ let ibJobTotal = 0;
 let targetElement = "";
 let targetHitChain = Promise.resolve(); // serialize target acks
 let autoApprove = false; // /auto: skip bulk-size y/n confirms this session
+// Hive-mind relay (shared pair-result cache) session state — consulted only
+// when the user toggle is on AND the last ping succeeded; fails open.
+let relayUserOn = true; // /relay session toggle
+let relayReachable = null; // null = not yet pinged (warming)
+let relayHits = 0;
+let relayContributed = 0;
+let relaySeeded = false;
 
 // DOM refs — initialized in initBrowserUI() so module evaluation is Node-safe
 let output, input, body, toggle, stopBtn, queueEl, rateEl, jobEl, promptEl;
@@ -634,10 +643,106 @@ function pairKey(a, b) {
   return ka + "\0" + kb;
 }
 
+// ── Hive-mind relay (shared pair-result cache tier) ──────────────────
+// Cache order everywhere: local pairCache → relay → neal.fun. A rate-limit
+// slot is committed only after both cache tiers miss; fresh neal results
+// are contributed back in the background. Every call fails open.
+const RELAY_URL =
+  (typeof window !== "undefined" && window.IC_RELAY_URL) ||
+  "https://infinite-craft-relay.onrender.com";
+
+function relayActive() {
+  return relayUserOn && relayReachable === true;
+}
+
+async function relayFetch(path, payload, timeoutMs) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), timeoutMs);
+  try {
+    const opts =
+      payload == null
+        ? { signal: ctl.signal }
+        : {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+            signal: ctl.signal,
+          };
+    const resp = await fetch(RELAY_URL + path, opts);
+    if (!resp.ok) return null;
+    return await resp.json();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Batch lookup. Returns {key: {r, e}} (hits only) or null (unreachable). */
+async function relayLookup(pairs) {
+  const data = await relayFetch("/api/lookup", { pairs }, 4000);
+  if (data == null) {
+    relayReachable = false;
+    return null;
+  }
+  return data.results || {};
+}
+
+/** Relay {r, e} value → trainer pairCache value (null = Nothing). */
+function relayResultToCache(v) {
+  return v.r === null ? null : { text: v.r, emoji: v.e || "", discovered: false };
+}
+
+/** Fire-and-forget: share fresh neal results with the hive. */
+function relayContribute(entries) {
+  relayFetch("/api/contribute", { entries }, 8000).then((d) => {
+    if (d && d.added) relayContributed += d.added;
+  });
+}
+
+/** Ping (wakes a spun-down free instance), then re-seed the hive once per
+    session from this save's recipe index. */
+async function relayWarmup() {
+  if (!relayUserOn) return;
+  let health = await relayFetch("/health", null, 8000);
+  if (health == null) {
+    // Free instances cold-start in tens of seconds; one more try.
+    await new Promise((r) => setTimeout(r, 20000));
+    health = await relayFetch("/health", null, 8000);
+  }
+  relayReachable = health != null && !!health.ok;
+  if (!relayReachable || relaySeeded || !relayUserOn) return;
+  const entries = relayReseedEntries(elementTuples(), recipeIndex).map((t) =>
+    Array.from(t)
+  );
+  for (let i = 0; i < entries.length; i += 2000) {
+    const d = await relayFetch(
+      "/api/contribute",
+      { entries: entries.slice(i, i + 2000) },
+      8000
+    );
+    if (d == null) {
+      relayReachable = false;
+      return;
+    }
+    relayContributed += d.added || 0;
+  }
+  relaySeeded = true;
+}
+
 async function apiPair(firstName, secondName) {
   if (cancelled) throw new Error("Cancelled");
   const key = pairKey(firstName, secondName);
   if (pairCache.has(key)) return pairCache.get(key);
+  if (relayActive()) {
+    const found = await relayLookup([[firstName, secondName]]);
+    if (found && found[key] !== undefined) {
+      const result = relayResultToCache(found[key]);
+      pairCache.set(key, result);
+      relayHits++;
+      return result;
+    }
+  }
   await acquireRate();
   if (cancelled) throw new Error("Cancelled");
   const url = `/api/infinite-craft/pair?first=${encodeURIComponent(firstName)}&second=${encodeURIComponent(secondName)}`;
@@ -663,6 +768,10 @@ async function apiPair(firstName, secondName) {
     result = { text: json.result, emoji: json.emoji || "", discovered: !!json.isNew };
   }
   pairCache.set(key, result);
+  if (relayActive()) {
+    const [ka, kb] = pairKeyKernel(firstName, secondName);
+    relayContribute([[ka, kb, result ? result.text : null, result ? result.emoji : ""]]);
+  }
   return result;
 }
 
@@ -806,6 +915,32 @@ function doAuto(arg) {
   }
 }
 
+function doRelay(arg) {
+  const [kind, newState] = relayToggleOutcome(relayUserOn, arg || "");
+  if (kind === "invalid") {
+    print(`  Usage: ${yellow("/relay [on|off|status]")} (bare /relay toggles)`);
+    return;
+  }
+  relayUserOn = newState;
+  if (newState && relayReachable !== true) relayWarmup();
+  const conn =
+    relayReachable === true
+      ? green("connected")
+      : relayReachable === null
+        ? yellow("warming up")
+        : red("unreachable");
+  const counters = `${green(String(relayHits))} served from hive, ${relayContributed} contributed`;
+  if (kind === "on") {
+    print(`  Relay ${green("on")} (${conn}) — ${counters}.`);
+  } else if (kind === "off") {
+    print(`  Relay ${yellow("off")} — pairs go straight to neal.fun.`);
+  } else if (kind === "show_on") {
+    print(`  Relay is ${green("on")} (${conn}) — ${counters}.`);
+  } else {
+    print(`  Relay is ${yellow("off")}.`);
+  }
+}
+
 /** Pause for y/n after target hit. Returns true if batch should stop. */
 async function acknowledgeTargetHit(aName, bName, resultName) {
   // Serialize concurrent hits (API concurrency / multi-gen).
@@ -840,9 +975,12 @@ function pairTuples(pairs) {
 
 function prioritizePairs(pairs) {
   // Kernel priority order — proven combiners first (ingredient-usage
-  // score descending, pair-key tie-break); same ordering as the CLI.
+  // score descending, pair-key tie-break), then cached hits promoted to
+  // the front (they cost no rate-limit slot); same ordering as the CLI.
   if (pairs.length < 2) return pairs;
-  return pairsFromBoundary(prioritizePairsBoundary(pairTuples(pairs), recipeIndex));
+  return pairsFromBoundary(
+    prioritizePairsBoundary(pairTuples(pairs), recipeIndex, [...pairCache.keys()])
+  );
 }
 
 // ── Bulk pair processor ──────────────────────────────────────────────
@@ -854,6 +992,23 @@ function prioritizePairs(pairs) {
 //       only when the result is new or hits the target
 //   skipSummary — omit the final "Done: N new…" line (crawl gens use their own)
 async function runPairsInner(pairs, opts = {}) {
+  if (pairs.length > 1 && relayActive()) {
+    // One hive sweep for the whole batch: anything any user has already
+    // tried becomes a local cache hit before the first rate-limit slot is
+    // spent, and the cache-first prioritization below promotes it.
+    const missing = pairs.filter(([a, b]) => !pairCache.has(pairKey(a.text, b.text)));
+    if (missing.length) {
+      const found = await relayLookup(missing.map(([a, b]) => [a.text, b.text]));
+      if (found) {
+        for (const [a, b] of missing) {
+          const v = found[pairKey(a.text, b.text)];
+          if (v === undefined) continue;
+          pairCache.set(pairKey(a.text, b.text), relayResultToCache(v));
+          relayHits++;
+        }
+      }
+    }
+  }
   pairs = prioritizePairs(pairs);
   let done = 0, newCount = 0, nothingCount = 0, errors = 0;
   const total = pairs.length;
@@ -2000,6 +2155,10 @@ function doHelp() {
     ${cyan("/history")}                    Show combinations this session
     ${cyan("/target [element|clear]")}     Watch for a result; ask y/n to continue on hit
     ${cyan("/auto [on|off]")}              Auto-approve bulk y/n confirms (bare /auto toggles)
+    ${cyan("/relay [on|off|status]")}      Hive mind: shared pair cache with other users
+                                (bare /relay toggles; on by default). Pairs anyone
+                                has tried are served without spending your rate
+                                limit; your fresh results are shared back.
     ${cyan("/clear")}                      Clear output (browser only)
     ${cyan("/help")}                       Show this help`);
 }
@@ -2311,6 +2470,7 @@ async function executeCommand(line) {
   if ((rest = slashArgs(line, "/history")) !== null) { doHistory(); return; }
   if ((rest = slashArgs(line, "/target")) !== null) { doTarget(rest); return; }
   if ((rest = slashArgs(line, "/auto")) !== null) { doAuto(rest); return; }
+  if ((rest = slashArgs(line, "/relay")) !== null) { doRelay(rest); return; }
   if ((rest = slashArgs(line, "/script")) !== null) { await doScriptFile(); return; }
   if ((rest = slashArgs(line, "/clear")) !== null) { output.innerHTML = ""; return; }
   if ((rest = slashArgs(line, "/unfilled")) !== null) { doUnfilled(); return; }
@@ -2512,6 +2672,7 @@ function initBrowserUI() {
     rebuildIndexes();
     rebuildRecipeIndex();
     startPageSync();
+    relayWarmup();
     output.innerHTML = "";
     print(bold(cyan("=== Infinite Craft Trainer ===")) + dim(`  v${TRAINER_VERSION}`));
     print(`  Active save: ${bold(esc(saveName))} (id=${_saveId})`);

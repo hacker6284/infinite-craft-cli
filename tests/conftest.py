@@ -1,5 +1,12 @@
 """Shared test fixtures for infinite-craft-cli tests."""
 
+import os
+
+# Kill the hive-mind relay tier before infinite_craft_cli.cli is imported:
+# tests must never fire network pings at the real relay (and subprocess-based
+# tests inherit this via os.environ).
+os.environ.setdefault("IC_RELAY", "off")
+
 import asyncio
 import queue
 import pytest

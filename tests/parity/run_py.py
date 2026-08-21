@@ -170,7 +170,9 @@ def _run_scenario(scenario: dict, fixtures: dict, scratch_root: str):
             }
 
         if op == "prioritize_pairs":
-            raw = cli.craft.prioritize_pairs_boundary(scenario["pairs"], recipes)
+            raw = cli.craft.prioritize_pairs_boundary(
+                scenario["pairs"], recipes, scenario.get("cached", [])
+            )
             return [list(t) for t in raw]
 
         if op == "crawl_pairs":

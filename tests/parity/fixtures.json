@@ -873,6 +873,68 @@
       }
     },
     {
+      "id": "prioritize-pairs-cached-hits-promoted",
+      "op": "prioritize_pairs",
+      "pairs": [
+        [
+          "Zzz",
+          "",
+          false,
+          "Earth",
+          "",
+          false
+        ],
+        [
+          "Fire",
+          "",
+          false,
+          "Earth",
+          "",
+          false
+        ],
+        [
+          "Water",
+          "",
+          false,
+          "Zzz",
+          "",
+          false
+        ],
+        [
+          "Water",
+          "",
+          false,
+          "Fire",
+          "",
+          false
+        ]
+      ],
+      "recipes": {
+        "Steam": [
+          [
+            "Fire",
+            "Water"
+          ]
+        ],
+        "Mud": [
+          [
+            "Earth",
+            "Water"
+          ]
+        ],
+        "Lake": [
+          [
+            "Water",
+            "Water"
+          ]
+        ]
+      },
+      "cached": [
+        "Earth\u0000Zzz",
+        "Water\u0000Zzz"
+      ]
+    },
+    {
       "id": "prioritize-pairs-tie-break-pair-key",
       "op": "prioritize_pairs",
       "pairs": [

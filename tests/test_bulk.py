@@ -198,3 +198,40 @@ class TestDoCrawl:
             run_async(do_crawl(client, storage, "Water", "Fire"))
         captured = capsys.readouterr()
         assert "Steam" in captured.out
+
+
+class TestCombinePairsCacheFirst:
+    def test_cached_pairs_run_first_without_api_calls(self, capsys):
+        """Pairs already in _pair_cache execute before rate-limited misses
+        (kernel cache_first_pairs promotion), and never touch client.pair."""
+        import infinite_craft_cli.cli as cli
+        from infinite_craft_cli.cli import _combine_pairs, craft
+
+        client = make_mock_client()
+        storage = make_mock_storage()
+        result = MagicMock()
+        result.name = "Fresh Thing"
+        result.emoji = ""
+        result.is_first_discovery = False
+        client.pair.return_value = result
+
+        # Empty recipes → priority order is the ascending pair-key tie-break,
+        # so without promotion (Y, Z) would run LAST.
+        pairs = [
+            (MockElement("A"), MockElement("B")),
+            (MockElement("C"), MockElement("D")),
+            (MockElement("Y"), MockElement("Z")),
+        ]
+        cached_result = MockElement("Cached Thing")
+        cli._pair_cache[craft.pair_key("Y", "Z")] = cached_result
+
+        run_async(_combine_pairs(client, storage, pairs))
+        captured = capsys.readouterr()
+
+        lines = [l for l in captured.out.splitlines() if "[1/3]" in l]
+        assert lines, captured.out
+        assert "Cached Thing" in lines[0]
+        # The cache hit spent no API call: only the two misses reached pair().
+        assert client.pair.await_count == 2
+        called = {tuple(sorted((c.args[0], c.args[1]))) for c in client.pair.await_args_list}
+        assert ("Y", "Z") not in called

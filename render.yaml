@@ -1,0 +1,17 @@
+# Infinite Craft hive-mind relay — pocket-putt-style Blueprint.
+# Deploy: Render → New → Blueprint → this repo, branch main.
+# CI redeploys via Deploy Hook (.github/workflows/deploy-relay.yml).
+services:
+  - type: web
+    name: infinite-craft-relay
+    runtime: node
+    plan: free
+    rootDir: relay
+    buildCommand: "true"
+    startCommand: npm start
+    healthCheckPath: /health
+    # PORT is injected by Render — do not set it.
+    # Optional dashboard env vars:
+    #   UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN — snapshot backstop
+    #   RELAY_MAX_ENTRIES=1500000
+    #   RELAY_SNAPSHOT_MS=60000

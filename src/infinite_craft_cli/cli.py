@@ -33,6 +33,7 @@ except ImportError:
     pass  # readline not available on Windows
 
 from infinite_craft_cli.element import Element
+from infinite_craft_cli import relay as relay_client
 from infinite_craft_cli.client import (
     InfiniteCraftClient,
     fetch_json,
@@ -190,6 +191,15 @@ def _reset_test_state() -> None:
     _rate_ticker_task = None
     _target_element = ""
     _auto_approve = False
+    global _relay_user_on, _relay_reachable, _relay_hits, _relay_contributed
+    global _relay_seeded, _relay_warmup_task
+    _relay_user_on = _relay_default_on()
+    _relay_reachable = None
+    _relay_hits = 0
+    _relay_contributed = 0
+    _relay_seeded = False
+    _relay_warmup_task = None
+    _relay_bg_tasks.clear()
     _script_new_reg = []
     _confirm_reason = ""
     _skip_summary_shown = False
@@ -361,11 +371,30 @@ def _raise_if_cancelled() -> None:
 
 
 async def _cached_pair(client, storage, a, b):
-    """Wrapper around client.pair that caches results by sorted element names."""
+    """Wrapper around client.pair that caches results by sorted element names.
+
+    Cache tiers: local run cache → hive-mind relay → neal.fun. A neal slot
+    is committed only after both cache tiers miss; fresh neal results are
+    contributed back to the hive in the background."""
+    global _relay_hits
     _raise_if_cancelled()
     key = craft.pair_key(a.name, b.name)
     if key in _pair_cache:
         return _pair_cache[key]
+    if _relay_active():
+        found = await asyncio.to_thread(relay_client.lookup, [(a.name, b.name)])
+        if found is None:
+            _relay_mark_unreachable()
+        else:
+            hit = found.get(f"{key[0]}\0{key[1]}")
+            if hit is not None:
+                r, e = hit
+                result = Element(name=r, emoji=e or "", is_first_discovery=False)
+                _pair_cache[key] = result
+                _relay_hits += 1
+                if r is not None:
+                    _record_recipes_batch([(r, a.name, b.name)])
+                return result
     for attempt in range(craft.pair_retry_max_attempts()):
         _raise_if_cancelled()
         try:
@@ -381,6 +410,7 @@ async def _cached_pair(client, storage, a, b):
     _pair_cache[key] = result
     if result.name is not None:
         _record_recipes_batch([(result.name, a.name, b.name)])
+    _relay_contribute_bg(a.name, b.name, result)
     return result
 
 
@@ -693,6 +723,28 @@ _rate_ticker_task: asyncio.Task | None = None
 _target_element: str = ""
 _auto_approve: bool = False  # /auto: skip bulk-size y/n confirms this session
 _script_new_reg: list[tuple[str, str, bool]] = []  # the [] register (session-global)
+# Hive-mind relay (shared pair-result cache) session state. The tier is
+# consulted only when the user toggle is on AND the last ping succeeded;
+# everything fails open to plain neal.fun behavior.
+
+
+def _relay_default_on() -> bool:
+    """IC_RELAY=off disables the hive tier at startup (tests, air-gapped)."""
+    return os.environ.get("IC_RELAY", "on").strip().lower() not in (
+        "off",
+        "0",
+        "no",
+        "false",
+    )
+
+
+_relay_user_on: bool = _relay_default_on()  # /relay session toggle
+_relay_reachable: bool | None = None  # None = not yet pinged (warming)
+_relay_hits: int = 0  # pairs served from the hive this session
+_relay_contributed: int = 0  # entries the relay hadn't seen, from us
+_relay_seeded: bool = False  # one re-seed upload per session
+_relay_warmup_task: asyncio.Task | None = None
+_relay_bg_tasks: set = set()
 _target_hit_lock = asyncio.Lock()
 # Confirm chrome reason (e.g. "331 pairs"); keys live only on the prompt.
 _confirm_reason: str = ""
@@ -724,6 +776,80 @@ def _rate_limit_wait_callback(waiting: bool) -> None:
             _chrome_sync()
         else:
             _paint_queue_panel(force=True)
+
+
+def _relay_active() -> bool:
+    return _relay_user_on and _relay_reachable is True
+
+
+def _relay_mark_unreachable() -> None:
+    global _relay_reachable
+    _relay_reachable = False
+
+
+async def _relay_warmup(storage) -> None:
+    """Ping the relay (wakes a spun-down free instance), then re-seed the
+    hive once per session from this save's recipe store."""
+    global _relay_reachable, _relay_seeded, _relay_contributed
+    health = await asyncio.to_thread(relay_client.ping)
+    if health is None:
+        # Free instances cold-start in tens of seconds; one more try.
+        await asyncio.sleep(20)
+        health = await asyncio.to_thread(relay_client.ping)
+    _relay_reachable = health is not None
+    if not _relay_reachable or _relay_seeded or not _relay_user_on:
+        return
+    entries = [
+        tuple(t)
+        for t in craft.relay_reseed_entries(
+            [
+                (e.name, e.emoji or "", bool(e.is_first_discovery))
+                for e in storage.get_all()
+            ],
+            _load_recipes(),
+        )
+    ]
+    if entries:
+        added = await asyncio.to_thread(relay_client.contribute, entries)
+        if added is None:
+            _relay_reachable = False
+            return
+        _relay_contributed += added
+    _relay_seeded = True
+
+
+def _relay_spawn_warmup(storage) -> None:
+    global _relay_warmup_task
+    if not _relay_user_on:
+        return
+    if _relay_warmup_task is not None and not _relay_warmup_task.done():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    _relay_warmup_task = loop.create_task(_relay_warmup(storage))
+
+
+def _relay_contribute_bg(a_name: str, b_name: str, result) -> None:
+    """Fire-and-forget: share a fresh neal.fun result with the hive."""
+    if not _relay_active():
+        return
+    ka, kb = craft.pair_key(a_name, b_name)
+    entry = (ka, kb, result.name, result.emoji or "")
+
+    async def run():
+        global _relay_contributed
+        added = await asyncio.to_thread(relay_client.contribute, [entry])
+        if added:
+            _relay_contributed += added
+
+    try:
+        task = asyncio.get_running_loop().create_task(run())
+    except RuntimeError:
+        return
+    _relay_bg_tasks.add(task)
+    task.add_done_callback(_relay_bg_tasks.discard)
 
 
 def _request_skip_current() -> bool:
@@ -1900,6 +2026,35 @@ async def _combine_pairs(client, storage, pairs: list[tuple], collect: dict | No
     (ingredient-usage score descending, pair-key tie-break). This is the
     single choke point, so permute/cross/with/exhaust and each crawl
     generation all get the same ordering."""
+    global _relay_hits
+    if len(pairs) > 1 and _relay_active():
+        # One hive sweep for the whole batch: anything any user has already
+        # tried becomes a local cache hit before we spend a single neal slot,
+        # and the cache-first prioritization below promotes it to the front.
+        missing = [
+            (a, b)
+            for (a, b) in pairs
+            if craft.pair_key(a.name, b.name) not in _pair_cache
+        ]
+        if missing:
+            found = await asyncio.to_thread(
+                relay_client.lookup, [(a.name, b.name) for a, b in missing]
+            )
+            if found is None:
+                _relay_mark_unreachable()
+            else:
+                for a, b in missing:
+                    ka, kb = craft.pair_key(a.name, b.name)
+                    v = found.get(f"{ka}\0{kb}")
+                    if v is None:
+                        continue
+                    r, e = v
+                    _pair_cache[(ka, kb)] = Element(
+                        name=r, emoji=e or "", is_first_discovery=False
+                    )
+                    _relay_hits += 1
+                    if r is not None:
+                        _record_recipes_batch([(r, a.name, b.name)])
     if len(pairs) > 1:
         pair_elements = {e.name: e for pair in pairs for e in pair}
         pair_tuples = craft.prioritize_pairs_boundary(
@@ -1915,6 +2070,7 @@ async def _combine_pairs(client, storage, pairs: list[tuple], collect: dict | No
                 for a, b in pairs
             ],
             _load_recipes(),
+            [f"{ka}\0{kb}" for (ka, kb) in _pair_cache.keys()],
         )
         pairs = _pairs_from_boundary(pair_tuples, pair_elements.values())
     total = len(pairs)
@@ -2586,6 +2742,12 @@ def do_help() -> str:
     /target clear                 Clear target
     /auto [on|off]                Auto-approve bulk y/n confirms (bare /auto toggles)
 
+  Hive mind:
+    /relay [on|off|status]        Shared pair cache with other users (bare /relay
+                                  toggles; on by default). Pairs anyone has tried
+                                  are served from the hive without spending your
+                                  rate limit; your fresh results are shared back.
+
   Query syntax (/search, /with, /permute, /permutate, /cross, /exhaust, shorthands):
     substring                     Default: case-insensitive substring
     * ? []                        fnmatch wildcards (e.g. fire*, mu?)
@@ -2695,6 +2857,37 @@ def do_auto(arg: str) -> str:
     if kind == "show_on":
         return f"  Auto-approve is {_color('on', GREEN)}."
     return f"  Auto-approve is {_color('off', YELLOW)}."
+
+
+def do_relay(arg: str, storage) -> str:
+    """Toggle, set, or show the hive-mind relay tier (grammar in kernel)."""
+    global _relay_user_on
+    kind, new_state = craft.relay_toggle_outcome(_relay_user_on, arg)
+    if kind == "invalid":
+        return f"  Usage: {_color('/relay [on|off|status]', YELLOW)} (bare /relay toggles)"
+    _relay_user_on = new_state
+    if new_state and _relay_reachable is not True:
+        _relay_spawn_warmup(storage)
+    if _relay_reachable is True:
+        conn = _color("connected", GREEN)
+    elif _relay_reachable is None:
+        conn = _color("warming up", YELLOW)
+    else:
+        conn = _color("unreachable", RED)
+    counters = (
+        f"{_color(str(_relay_hits), GREEN)} served from hive, "
+        f"{_relay_contributed} contributed"
+    )
+    if kind == "on":
+        return f"  Relay {_color('on', GREEN)} ({conn}) — {counters}."
+    if kind == "off":
+        return f"  Relay {_color('off', YELLOW)} — pairs go straight to neal.fun."
+    if kind == "show_on":
+        return (
+            f"  Relay is {_color('on', GREEN)} ({conn}) — {counters}.\n"
+            f"  {_color(relay_client.relay_url(), DIM)}"
+        )
+    return f"  Relay is {_color('off', YELLOW)}."
 
 
 async def _acknowledge_target_hit(a_name: str, b_name: str, result_name: str) -> bool:
@@ -3452,6 +3645,8 @@ async def _dispatch_line(client, storage, line: str) -> None:
         _repl_print_lines(do_target(rest))
     elif (rest := craft.slash_args(line, "/auto")) is not None:
         _repl_print_lines(do_auto(rest))
+    elif (rest := craft.slash_args(line, "/relay")) is not None:
+        _repl_print_lines(do_relay(rest, storage))
     elif line == "/queue":
         _paint_queue_panel(force=True)
         if (
@@ -3764,6 +3959,7 @@ async def interactive_mode():
         ) as client:
             _active_client = client
             _rate_ticker_task = asyncio.create_task(_rate_ticker_loop())
+            _relay_spawn_warmup(storage)
             starters = "  ".join(format_element(e) for e in storage.get_all()[:4])
             _repl_print_lines(f"  Starting elements: {starters}")
             total = len(storage.get_all())
@@ -3922,6 +4118,7 @@ async def noninteractive_mode(args):
         # Commands that need the API client
         storage = DiscoveryStorage(DISCOVERIES_PATH)
         async with InfiniteCraftClient(rate_limit=API_RATE_LIMIT) as client:
+            _relay_spawn_warmup(storage)
             if args.command == "combine":
                 print(await do_combine(client, storage, args.first, args.second))
             elif args.command == "exhaust":

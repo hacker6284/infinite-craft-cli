@@ -1,0 +1,49 @@
+# Trigger a Render deploy of the relay when relay code changes on main.
+# Secret: RENDER_DEPLOY_HOOK = full Deploy Hook URL from Render service
+# Settings (same pattern as pocket-putt).
+name: Deploy Relay to Render
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "relay/**"
+      - "render.yaml"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Render deploy hook
+        env:
+          RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RENDER_DEPLOY_HOOK:-}" ]; then
+            echo "Missing secret RENDER_DEPLOY_HOOK"
+            echo "Add it under repo Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+
+          # Render hooks occasionally return 5xx (transient). Retry with backoff.
+          MAX_ATTEMPTS=5
+          DELAY=2
+          attempt=1
+          while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
+            echo "Deploy hook attempt ${attempt}/${MAX_ATTEMPTS}..."
+            if curl -fsS -X POST --max-time 30 "$RENDER_DEPLOY_HOOK"; then
+              echo
+              echo "Render deploy hook triggered."
+              exit 0
+            fi
+            status=$?
+            if [ "$attempt" -eq "$MAX_ATTEMPTS" ]; then
+              echo "Deploy hook failed after ${MAX_ATTEMPTS} attempts (last curl exit ${status})."
+              exit "$status"
+            fi
+            echo "Attempt ${attempt} failed (curl exit ${status}); retrying in ${DELAY}s..."
+            sleep "$DELAY"
+            DELAY=$((DELAY * 2))
+            attempt=$((attempt + 1))
+          done

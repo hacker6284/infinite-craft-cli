@@ -126,6 +126,7 @@ Used by `/search`, `/with`, `/permute`, `/permutate`, `/cross`, `/exhaust`, and 
 | `/target` | Show current target |
 | `/target clear` | Clear target |
 | `/auto [on|off]` | Auto-approve bulk y/n confirms — bare `/auto` toggles |
+| `/relay [on|off|status]` | Hive mind: shared pair cache with other users — bare `/relay` toggles, on by default |
 | `/queue` | Show running and pending commands (status also appears in chrome) |
 | `/help` | Show help |
 | `/quit` | Exit |
@@ -158,6 +159,24 @@ Large batches and `/target` hits pause on `confirm [y/n]>`: **y** continues, **n
 | Ctrl+C | While running: stop and discard remaining queue; at confirm: decline only |
 
 Deferred commands print `Queued:` when that lane is already running.
+
+## Hive mind (shared pair cache)
+
+Neal's server caches every pair anyone has ever combined — only genuinely novel
+discoveries cost real inference — so there is no reason for two players to spend
+rate-limit slots asking the same question twice. The CLI and trainer share a
+small relay (`relay/`, a free Render web service) holding the union of every
+connected user's results. Cache order everywhere is **local → hive → neal.fun**:
+a rate-limit slot is committed only after both cache tiers miss, and fresh
+results are contributed back automatically. Bulk runs sweep the whole batch
+against the hive in one request before spending their first slot.
+
+The tier is on by default and fails open — if the relay is down or cold, the
+CLI just talks to neal.fun as before. `/relay` toggles it per session;
+`IC_RELAY=off` disables it at startup; `IC_RELAY_URL` points at a different
+relay. The relay keeps its cache in RAM and is re-seeded by clients from their
+own recipe stores on connect (plus an optional Upstash Redis snapshot across
+restarts), so a cold instance refills within minutes.
 
 ## Data storage
 

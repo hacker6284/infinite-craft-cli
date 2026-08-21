@@ -463,6 +463,31 @@ func prioritize_pairs(pairs: List<(Element, Element)>, recipes: Map<text, List<(
         out.append(pairs[r_idx])
     return out
 
+// Cache-first promotion: pairs whose canonical key the host already holds a
+// result for execute first — they consume no rate-limit slot, so a bulk run
+// surfaces every already-known result immediately instead of stranding cache
+// hits behind rate-limited misses. Stable partition: priority order is
+// preserved within the hits and within the misses. `cached` uses the same
+// NUL-joined canonical keys as lucky_pairs' tried list.
+func cache_first_pairs(ordered: List<(Element, Element)>, cached: List<text>) -> List<(Element, Element)>
+    if cached.length == 0
+        return ordered
+    seen: Set<text> = Set()
+    for k in cached
+        seen.add(k)
+    hits: List<(Element, Element)> = []
+    misses: List<(Element, Element)> = []
+    for p in ordered
+        a, b = p
+        ka, kb = pair_key(a.name, b.name)
+        if seen.has(ka + "\u{0}" + kb)
+            hits.append(p)
+        else
+            misses.append(p)
+    for m in misses
+        hits.append(m)
+    return hits
+
 // ---------------------------------------------------------------------------
 // Recipe BFS / backtrack / trace (unbounded depth)
 // ---------------------------------------------------------------------------
@@ -766,6 +791,8 @@ export func is_local_command(line: text) -> bool
         return true
     if line == "/auto" or strings.starts_with(line, "/auto ")
         return true
+    if line == "/relay" or strings.starts_with(line, "/relay ")
+        return true
     return false
 
 // Infinibrowser-backed long commands — independent host queue from pair API.
@@ -785,7 +812,7 @@ export func is_ib_command(line: text) -> bool
 // docs-drift test checks every documentation surface against (README,
 // CLI /help, trainer /help, the GitHub Pages site).
 export func known_slash_commands() -> List<text>
-    return ["/help", "/search", "/recipe", "/list", "/history", "/target", "/auto", "/clear", "/unfilled", "/queue", "/import", "/fill", "/prune", "/export", "/combine", "/crawl", "/with", "/cross", "/permute", "/permutate", "/exhaust", "/script", "/lucky"]
+    return ["/help", "/search", "/recipe", "/list", "/history", "/target", "/auto", "/relay", "/clear", "/unfilled", "/queue", "/import", "/fill", "/prune", "/export", "/combine", "/crawl", "/with", "/cross", "/permute", "/permutate", "/exhaust", "/script", "/lucky"]
 
 export func is_known_slash_command(line: text) -> bool
     stripped = strip_spaces(line)
@@ -957,6 +984,39 @@ export func auto_approve_outcome(prev: bool, arg: text) -> (text, bool)
             return ("show_on", true)
         return ("show_off", false)
     return ("invalid", prev)
+
+// /relay: session toggle for the hive-mind shared-cache tier. Same grammar
+// as /auto (bare toggles; on/off/status explicit) — deliberately the same
+// state machine, aliased so hosts wire intent, not a lookalike.
+export func relay_toggle_outcome(prev: bool, arg: text) -> (text, bool)
+    return auto_approve_outcome(prev, arg)
+
+// Re-seed payload for the hive-mind relay: every (a, b) → result edge the
+// recipe store knows, canonicalized and deduped by pair key, with the
+// result's emoji joined from the element list. Deterministic order
+// (ascending result name, then recipe order; first claim per pair wins)
+// so both backends emit identical lists.
+export func relay_reseed_entries(elements: List<(text, text, bool)>, recipes: Map<text, List<(text, text)>>) -> List<(text, text, text, text)>
+    emojis: Map<text, text> = Map()
+    for e in elements
+        n, em, f = e
+        emojis[n] = em
+    names: List<text> = []
+    for k in recipes.keys()
+        names.append(k)
+    sorting.sort_by(names, text_lex_less)
+    seen: Set<text> = Set()
+    out: List<(text, text, text, text)> = []
+    for name in names
+        for pr in recipes[name]
+            pa, pb = pr
+            ka, kb = pair_key(pa, pb)
+            key = ka + "\u{0}" + kb
+            if seen.has(key)
+                continue
+            seen.add(key)
+            out.append((ka, kb, name, emojis.get(name).get_or("")))
+    return out
 
 // Bulk confirm gate with session auto-approve folded in.
 export func bulk_confirm_required(n: int, threshold: int, auto_approve: bool) -> bool
@@ -2898,8 +2958,8 @@ func element_pairs_from_boundary(pairs: List<(text, text, bool, text, text, bool
         out.append((Element(name = an, emoji = ae, first = af), Element(name = bn, emoji = be, first = bf)))
     return out
 
-export func prioritize_pairs_boundary(pairs: List<(text, text, bool, text, text, bool)>, recipes: Map<text, List<(text, text)>>) -> List<(text, text, bool, text, text, bool)>
-    return element_pairs_to_boundary(prioritize_pairs(element_pairs_from_boundary(pairs), recipes))
+export func prioritize_pairs_boundary(pairs: List<(text, text, bool, text, text, bool)>, recipes: Map<text, List<(text, text)>>, cached: List<text>) -> List<(text, text, bool, text, text, bool)>
+    return element_pairs_to_boundary(cache_first_pairs(prioritize_pairs(element_pairs_from_boundary(pairs), recipes), cached))
 
 export func crawl_generation_pairs_boundary(pool: List<(text, text, bool)>, tried_keys: List<text>) -> (List<(text, text, bool, text, text, bool)>, List<text>)
     tried: Set<text> = Set()
@@ -3226,7 +3286,7 @@ test "runs_local: pure loop-free scripts are immediate"
 
 test "known slash command inventory"
     cmds = known_slash_commands()
-    assert cmds.length == 23
+    assert cmds.length == 24
     for c in cmds
         assert is_known_slash_command(c)
 
@@ -3567,6 +3627,8 @@ test "is_local_command parity"
     assert is_local_command("/target")
     assert is_local_command("/target Steam")
     assert is_local_command("/target clear")
+    assert is_local_command("/relay")
+    assert is_local_command("/relay off")
     assert not is_local_command("/combine Water + Fire")
     assert not is_local_command("/fill")
     assert not is_local_command("/prune")
@@ -4262,11 +4324,112 @@ test "ingredient_usage_counts and prioritize_pairs"
     bpairs: List<(text, text, bool, text, text, bool)> = []
     bpairs.append(("Zzz", "", false, "Earth", "", false))
     bpairs.append(("Water", "", false, "Fire", "", false))
-    bp = prioritize_pairs_boundary(bpairs, recipes)
+    no_cache: List<text> = []
+    bp = prioritize_pairs_boundary(bpairs, recipes, no_cache)
     assert bp.length == 2
     bn0, be0, bf0, bn1, be1, bf1 = bp[0]
     assert bn0 == "Water"
     assert bn1 == "Fire"
+
+test "cache_first_pairs promotes cached hits, stable within halves"
+    water = Element(name = "Water", emoji = "", first = false)
+    fire = Element(name = "Fire", emoji = "", first = false)
+    earth = Element(name = "Earth", emoji = "", first = false)
+    zzz = Element(name = "Zzz", emoji = "", first = false)
+    ordered: List<(Element, Element)> = []
+    ordered.append((water, fire))
+    ordered.append((water, zzz))
+    ordered.append((fire, earth))
+    ordered.append((zzz, earth))
+    // Cache holds Fire+Earth and Zzz+Earth (canonical keys; reversed input
+    // order must still hit — keys are canonicalized before lookup).
+    cached: List<text> = []
+    ek, fk = pair_key("Earth", "Fire")
+    cached.append(ek + "\u{0}" + fk)
+    ek2, zk = pair_key("Earth", "Zzz")
+    cached.append(ek2 + "\u{0}" + zk)
+    out = cache_first_pairs(ordered, cached)
+    // Hits first in original relative order, then misses in original order.
+    h0a, h0b = out[0]
+    assert h0a.name == "Fire"
+    assert h0b.name == "Earth"
+    h1a, h1b = out[1]
+    assert h1a.name == "Zzz"
+    assert h1b.name == "Earth"
+    m0a, m0b = out[2]
+    assert m0a.name == "Water"
+    assert m0b.name == "Fire"
+    m1a, m1b = out[3]
+    assert m1a.name == "Water"
+    assert m1b.name == "Zzz"
+    // Empty cache: order untouched (identity path).
+    empty_c: List<text> = []
+    same = cache_first_pairs(ordered, empty_c)
+    s0a, s0b = same[0]
+    assert s0a.name == "Water"
+    assert s0b.name == "Fire"
+    assert same.length == 4
+    // Boundary composes prioritize + cache promotion: with recipes empty,
+    // priority ties break on pair key, then the cached pair jumps the queue.
+    empty_recipes2: Map<text, List<(text, text)>> = Map()
+    bpairs2: List<(text, text, bool, text, text, bool)> = []
+    bpairs2.append(("Water", "", false, "Fire", "", false))
+    bpairs2.append(("Zzz", "", false, "Earth", "", false))
+    zcache: List<text> = []
+    zk1, zk2 = pair_key("Zzz", "Earth")
+    zcache.append(zk1 + "\u{0}" + zk2)
+    bp2 = prioritize_pairs_boundary(bpairs2, empty_recipes2, zcache)
+    c0a, c0e, c0f, c0b, c0e2, c0f2 = bp2[0]
+    assert c0a == "Zzz"
+    assert c0b == "Earth"
+
+test "relay_reseed_entries canonical deduped deterministic"
+    elements: List<(text, text, bool)> = []
+    elements.append(("Steam", "\u{1F4A8}", false))
+    elements.append(("Mud", "", false))
+    recipes: Map<text, List<(text, text)>> = Map()
+    // Reversed ingredient order must canonicalize; a second recipe for the
+    // same pair under a different result must dedupe (first claim in sorted
+    // result order wins — "Mud" sorts before "Steam").
+    recipes["Steam"] = [("Water", "Fire"), ("Fire", "Water")]
+    recipes["Mud"] = [("Earth", "Water"), ("Water", "Fire")]
+    out = relay_reseed_entries(elements, recipes)
+    assert out.length == 2
+    a0, b0, r0, e0 = out[0]
+    assert a0 == "Earth"
+    assert b0 == "Water"
+    assert r0 == "Mud"
+    assert e0 == ""
+    a1, b1, r1, e1 = out[1]
+    assert a1 == "Fire"
+    assert b1 == "Water"
+    assert r1 == "Mud"
+    // Result with no matching element gets empty emoji; matching gets its own.
+    recipes2: Map<text, List<(text, text)>> = Map()
+    recipes2["Steam"] = [("Fire", "Water")]
+    recipes2["Ghost"] = [("Air", "Air")]
+    out2 = relay_reseed_entries(elements, recipes2)
+    assert out2.length == 2
+    ga, gb, gr, ge = out2[0]
+    assert gr == "Ghost"
+    assert ge == ""
+    sa, sb, sr, se = out2[1]
+    assert sr == "Steam"
+    assert se == "\u{1F4A8}"
+
+test "relay_toggle_outcome mirrors auto grammar"
+    k1, s1 = relay_toggle_outcome(false, "")
+    assert k1 == "on"
+    assert s1
+    k2, s2 = relay_toggle_outcome(true, "")
+    assert k2 == "off"
+    assert not s2
+    k3, s3 = relay_toggle_outcome(true, "status")
+    assert k3 == "show_on"
+    assert s3
+    k4, s4 = relay_toggle_outcome(false, "bogus")
+    assert k4 == "invalid"
+    assert not s4
 
 test "crawl_generation_pairs sorted order tried and self-pairs"
     w = Element(name = "Water", emoji = "", first = false)

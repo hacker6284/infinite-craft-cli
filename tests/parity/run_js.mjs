@@ -211,9 +211,11 @@ function runScenario(scenario, fixtures) {
   }
 
   if (op === "prioritize_pairs") {
-    return prioritize_pairs_boundary(scenario.pairs, recipes).map((t) =>
-      Array.from(t)
-    );
+    return prioritize_pairs_boundary(
+      scenario.pairs,
+      recipes,
+      scenario.cached || []
+    ).map((t) => Array.from(t));
   }
 
   if (op === "crawl_pairs") {

@@ -1,5 +1,30 @@
 # Changelog
 
+## [2.2.0] - 2026-08-21
+
+### Added
+- **Hive mind: shared pair cache across all CLI/trainer users** (`/relay`,
+  on by default). A small relay service (`relay/`, deployed on Render)
+  holds the union of every connected user's pair results. Cache order
+  everywhere is local → hive → neal.fun: a rate-limit slot is committed
+  only after both cache tiers miss, and fresh results are contributed
+  back automatically in the background. Since Neal's server caches every
+  previously-tried pair, the hive strictly *reduces* load on neal.fun —
+  no player ever spends a slot asking a question another player has
+  already answered.
+- **Session re-seeding** — on connect, clients upload their own recipe
+  stores (kernel `relay_reseed_entries`), so a cold relay instance
+  (free tier: ephemeral disk) refills within minutes. Optional Upstash
+  Redis snapshot survives restarts when configured.
+- **Cache-first bulk ordering** (kernel `cache_first_pairs`) — bulk runs
+  now execute every already-cached pair first (they cost no rate-limit
+  slot), then true misses in the usual proven-combiners-first priority
+  order. Bulk runs also sweep the whole batch against the hive in one
+  request before spending their first slot.
+- `/relay [on|off|status]` in both hosts; `IC_RELAY=off` disables the
+  tier at startup; `IC_RELAY_URL` points at a different relay. Everything
+  fails open — an unreachable relay never breaks or slows a run.
+
 ## [2.1.1] - 2026-08-21
 
 ### Fixed
