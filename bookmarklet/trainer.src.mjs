@@ -1313,7 +1313,7 @@ async function runPairsInner(pairs, opts = {}) {
   setLaneProgress("pair", 0, total);
   for (let i = 0; i < pairs.length; i++) {
     const [a, b] = pairs[i];
-    if (cancelled) { print("  " + yellow("Cancelled.")); break; }
+    if (cancelled) break;
     if (cooling()) {
       print("  " + red(`429 cooldown — ${pairs.length - i} pairs skipped.`));
       break;
@@ -1323,7 +1323,7 @@ async function runPairsInner(pairs, opts = {}) {
     // hits) and wait only until a slot frees or this pair gets filled.
     if (relayActive()) {
       await hiveAwareWait([a, b], pairs.slice(i));
-      if (cancelled) { print("  " + yellow("Cancelled.")); break; }
+      if (cancelled) break;
       if (cooling()) { print("  " + red(`429 cooldown — ${pairs.length - i} pairs skipped.`)); break; }
     }
     // Bump progress when the pair *starts* so chrome never sits at 0/N
@@ -1332,7 +1332,7 @@ async function runPairsInner(pairs, opts = {}) {
     setLaneProgress("pair", i + 1, total);
     try {
       const result = await apiPair(a.text, b.text);
-      if (cancelled) { print("  " + yellow("Cancelled.")); break; }
+      if (cancelled) break;
       done = i + 1;
       if (result) {
         const isNew = addElement(result.text, result.emoji, result.discovered);
@@ -1361,7 +1361,7 @@ async function runPairsInner(pairs, opts = {}) {
         history.push({ a: a.text, b: b.text, result: "Nothing" });
       }
     } catch (e) {
-      if (cancelled) { print("  " + yellow("Cancelled.")); break; }
+      if (cancelled) break;
       done = i + 1;
       errors++;
     }
@@ -1386,6 +1386,10 @@ async function confirmAndRunPairs(pairs) {
     if (cancelled) return;
     print(`  Running ${bold(String(pairs.length))} combinations...`);
     await runPairsInner(pairs);
+    // runPairsInner is silent on cancel (it's an inner helper) so each
+    // command layer prints its own single message — here, for the direct
+    // /permute /cross /with /exhaust /combine path.
+    if (cancelled) print("  " + yellow("Cancelled."));
   } finally {
     endRun();
   }
