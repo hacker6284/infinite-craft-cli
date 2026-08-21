@@ -482,3 +482,53 @@ class TestBountyWorker:
         cli._current_command = ""
         cli._relay_user_on = False
         assert cli._bounty_preempted() is True
+
+
+class TestHiveAwareWait:
+    def test_returns_when_hive_fills_the_miss(self):
+        """The payoff path: rate-limited, but the fleet fills the pair — we
+        resolve it from cache for free instead of spending a slot."""
+        import infinite_craft_cli.cli as cli
+
+        _relay_on(cli)
+        client = make_mock_client()
+        client._rate_limiter.chrome_snapshot.return_value = (0, 60, 500)  # drained
+        storage = make_mock_storage()
+        a, b = MockElement("A"), MockElement("B")
+        key = _nul_key(cli, "A", "B")
+        with patch.object(cli.relay_client, "lookup", return_value={key: ("AB", "")}):
+            run_async(cli._hive_aware_wait(client, [(a, b)], [(a, b)]))
+        assert cli.craft.pair_key("A", "B") in cli._pair_cache  # filled, no slot spent
+
+    def test_returns_immediately_when_a_slot_is_free(self):
+        import infinite_craft_cli.cli as cli
+
+        _relay_on(cli)
+        client = make_mock_client()  # 60 free
+        a, b = MockElement("A"), MockElement("B")
+        with patch.object(cli.relay_client, "lookup") as look:
+            run_async(cli._hive_aware_wait(client, [(a, b)], [(a, b)]))
+            look.assert_not_called()  # slot available → no need to drain/wait
+
+    def test_noop_when_relay_off(self):
+        import infinite_craft_cli.cli as cli
+
+        cli._relay_user_on = False
+        client = make_mock_client()
+        client._rate_limiter.chrome_snapshot.return_value = (0, 60, 500)
+        a, b = MockElement("A"), MockElement("B")
+        with patch.object(cli.relay_client, "lookup") as look:
+            run_async(cli._hive_aware_wait(client, [(a, b)], [(a, b)]))
+            look.assert_not_called()
+
+    def test_returns_when_batch_already_cached(self):
+        import infinite_craft_cli.cli as cli
+
+        _relay_on(cli)
+        client = make_mock_client()
+        client._rate_limiter.chrome_snapshot.return_value = (0, 60, 500)
+        cli._pair_cache[cli.craft.pair_key("A", "B")] = MockElement("AB")
+        a, b = MockElement("A"), MockElement("B")
+        with patch.object(cli.relay_client, "lookup") as look:
+            run_async(cli._hive_aware_wait(client, [(a, b)], [(a, b)]))
+            look.assert_not_called()  # nothing unresolved → don't wait

@@ -472,6 +472,16 @@ export function bounty_poll_interval_ms() {
     return _rt.int_out(_r);
 }
 
+export function hive_wait_tick_ms() {
+    const _r = _impl.hive_wait_tick_ms();
+    return _rt.int_out(_r);
+}
+
+export function hive_resweep_interval_ms() {
+    const _r = _impl.hive_resweep_interval_ms();
+    return _rt.int_out(_r);
+}
+
 export function rate_bar_segment(filled, width) {
     filled = _rt.host_int(filled);
     width = _rt.host_int(width);

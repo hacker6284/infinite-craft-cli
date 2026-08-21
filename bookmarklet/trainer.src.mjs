@@ -46,6 +46,8 @@ import {
   effective_rate_limit as effectiveRateLimit,
   cooldown_duration_ms as cooldownDurationMs,
   bounty_poll_interval_ms as bountyPollIntervalMs,
+  hive_wait_tick_ms as hiveWaitTickMs,
+  hive_resweep_interval_ms as hiveResweepIntervalMs,
   bulk_confirm_required as bulkConfirmRequired,
   rate_status_note as rateStatusNote,
   script_parse as scriptParse,
@@ -1214,6 +1216,33 @@ async function hiveSweep(pairs) {
   return merged;
 }
 
+// Before spending a rate slot on a genuine miss, prefer the hive: while the
+// pair isn't cached and no slot is free, re-sweep the tail (fleet-filled
+// pairs land free) and wait a short, cancellable tick. Returns once the pair
+// is cached or a slot is available, so the apiPair call never blocks on
+// acquire. No-ops when the relay is down.
+async function hiveAwareWait(pairEl, tail) {
+  const resweepInterval = Number(hiveResweepIntervalMs());
+  const tick = Number(hiveWaitTickMs());
+  let lastResweep = 0;
+  while (!cancelled && !cooling() && relayActive()) {
+    const key = pairKey(pairEl[0].text, pairEl[1].text);
+    if (pairCache.has(key)) return; // filled by the fleet → free
+    if (rateChromeSnapshot().remaining >= 1) return; // a slot is available
+    const now = Date.now();
+    if (now - lastResweep >= resweepInterval) {
+      const merged = await hiveSweep(tail);
+      lastResweep = Date.now();
+      if (merged) continue; // re-check: this pair may now be cached
+    }
+    try {
+      await sleepCancellable(tick);
+    } catch {
+      return; // cancelled
+    }
+  }
+}
+
 async function runPairsInner(pairs, opts = {}) {
   if (pairs.length > 1) {
     // One hive sweep for the whole batch: anything any user has already
@@ -1248,7 +1277,6 @@ async function runPairsInner(pairs, opts = {}) {
     }
   }
   pairs = prioritizePairs(pairs);
-  let lastResweep = Date.now();
   let done = 0, newCount = 0, nothingCount = 0, errors = 0;
   const total = pairs.length;
   const onResult = opts.onResult;
@@ -1261,14 +1289,13 @@ async function runPairsInner(pairs, opts = {}) {
       print("  " + red(`429 cooldown — ${pairs.length - i} pairs skipped.`));
       break;
     }
-    // While the local budget is drained, other users may be filling our
-    // posted bounties — re-sweep the tail so their results land free.
-    if (relayActive() && Date.now() - lastResweep > 20000) {
-      const snap = rateChromeSnapshot();
-      if (snap.remaining <= 0) {
-        await hiveSweep(pairs.slice(i));
-        lastResweep = Date.now();
-      }
+    // Hive-aware wait: rather than block on a rate slot for a genuine miss,
+    // drain the hive for the tail (fleet-filled pairs land as free cache
+    // hits) and wait only until a slot frees or this pair gets filled.
+    if (relayActive()) {
+      await hiveAwareWait([a, b], pairs.slice(i));
+      if (cancelled) { print("  " + yellow("Cancelled.")); break; }
+      if (cooling()) { print("  " + red(`429 cooldown — ${pairs.length - i} pairs skipped.`)); break; }
     }
     // Bump progress when the pair *starts* so chrome never sits at 0/N
     // while a fetch (or rate-limit wait) is in flight.

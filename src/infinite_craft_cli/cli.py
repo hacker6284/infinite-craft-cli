@@ -978,6 +978,40 @@ async def _hive_sweep(client, pairs) -> int:
     return _merge_hive_results(found, missing)
 
 
+async def _hive_aware_wait(client, batch, tail) -> None:
+    """Before spending rate slots on a batch's genuine misses, prefer the hive.
+
+    While the batch still has misses AND we lack the slots to cover them
+    without blocking, re-sweep the whole remaining ``tail`` against the hive
+    (pulling any fleet-filled pairs into the local cache for free) and wait a
+    short, cancellable tick. Returns once the batch is fully covered — either
+    every miss now has a slot free to spend, or the hive filled them — so the
+    subsequent gather never blocks inside acquire. No-ops when the relay is
+    down. Cancellation and 429 cooldown break the wait immediately."""
+    resweep_interval = craft.hive_resweep_interval_ms() / 1000.0
+    tick = craft.hive_wait_tick_ms() / 1000.0
+    last_resweep = 0.0
+    while not _cancelled and not _cooling() and _relay_active():
+        misses = [
+            p
+            for p in batch
+            if craft.pair_key(p[0].name, p[1].name) not in _pair_cache
+        ]
+        if not misses:
+            return  # all cached → gather resolves for free
+        left, _m, _f = client._rate_limiter.chrome_snapshot()
+        if left >= len(misses):
+            return  # enough slots → gather won't block
+        now = time.monotonic()
+        if now - last_resweep >= resweep_interval:
+            merged = await _hive_sweep(client, tail)
+            last_resweep = time.monotonic()
+            if merged:
+                continue  # re-evaluate: the batch's misses may have shrunk
+        if await _sleep_cancellable_async(tick):
+            return  # cancelled
+
+
 def _relay_spawn_bg(coro) -> None:
     """Track a fire-and-forget relay task (or drop it with no loop)."""
     try:
@@ -2419,7 +2453,6 @@ async def _combine_pairs(client, storage, pairs: list[tuple], collect: dict | No
                     return
 
     # Process in batches of API_CONCURRENCY to avoid overwhelming the rate limiter
-    last_resweep = time.monotonic()
     for i in range(0, len(pairs), API_CONCURRENCY):
         if _cancelled:
             break
@@ -2429,15 +2462,22 @@ async def _combine_pairs(client, storage, pairs: list[tuple], collect: dict | No
                 f"  {_color(f'429 cooldown — {skipped} pairs skipped.', RED)}"
             )
             break
-        # While the local budget is drained, other users may be filling our
-        # posted bounties: re-sweep the remaining pairs so their results
-        # land as free cache hits instead of future neal spend.
-        if _relay_active() and time.monotonic() - last_resweep > 20:
-            left_rs, _m, _f = client._rate_limiter.chrome_snapshot()
-            if left_rs <= 0:
-                await _hive_sweep(client, pairs[i:])
-                last_resweep = time.monotonic()
         batch = pairs[i : i + API_CONCURRENCY]
+        # Hive-aware wait: rather than block inside the gather waiting on a
+        # rate slot for a genuine miss, keep draining the hive for the tail
+        # (pairs the fleet fills land as free cache hits) and wait only until
+        # a slot frees or these pairs get filled. Spend a scarce neal slot
+        # only on pairs the hive genuinely can't provide.
+        if _relay_active():
+            await _hive_aware_wait(client, batch, pairs[i:])
+            if _cancelled:
+                break
+            if _cooling():
+                skipped = total - done_count
+                _repl_print_lines(
+                    f"  {_color(f'429 cooldown — {skipped} pairs skipped.', RED)}"
+                )
+                break
         # Show the first pair of each batch immediately (before the fetch).
         if batch:
             _set_last_pair(batch[0][0].name, batch[0][1].name)

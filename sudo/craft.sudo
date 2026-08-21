@@ -2589,6 +2589,17 @@ export func cooldown_duration_ms(strikes: int) -> int
 export func bounty_poll_interval_ms() -> int
     return 10000
 
+// Hive-aware rate wait: while a bulk run is rate-limited on genuine misses,
+// it re-checks rate/cache every tick and re-sweeps the hive for the tail
+// every interval — draining fleet-filled pairs for free instead of blocking
+// on a slot. A slot frees ~once/sec at 60/min, so a 1s tick paces naturally;
+// re-sweeping every 3s keeps relay load bounded on a large tail.
+export func hive_wait_tick_ms() -> int
+    return 1000
+
+export func hive_resweep_interval_ms() -> int
+    return 3000
+
 // Glyph segment for rate bars: clamp filled to [0, width], then █ filled + ░ empty.
 // Hosts keep ANSI/HTML wrappers; kernel owns clamp + glyph construction.
 // █ = U+2588 (9608), ░ = U+2591 (9617).
@@ -3909,6 +3920,8 @@ test "effective_rate_limit and cooldown policy"
     assert cooldown_duration_ms(3) == 28800000
     assert cooldown_duration_ms(9) == 28800000
     assert bounty_poll_interval_ms() == 10000
+    assert hive_wait_tick_ms() == 1000
+    assert hive_resweep_interval_ms() == 3000
     assert rate_bar_segment(-3, 4) == "░░░░"
     assert rate_bar_segment(99, 4) == "████"
     assert rate_bar_segment(0, 0) == ""
