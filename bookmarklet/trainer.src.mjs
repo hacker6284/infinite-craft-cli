@@ -114,6 +114,7 @@ let autoApprove = false; // /auto: skip bulk-size y/n confirms this session
 let relayUserOn = true; // /relay session toggle
 let relayReachable = null; // null = not yet pinged (warming)
 let relayHits = 0;
+let lastRenderedHits = 0; // for the one-shot bee pulse (fires when relayHits grows)
 let relayContributed = 0;
 let relaySeeded = false;
 // Presence identity + same-IP arbitration (relay-fed)
@@ -2437,8 +2438,14 @@ function updateChrome() {
   // Permanent rate line: segmented bar + optional last pair (pair lane only).
   const { remaining, max, oldestFracMilli, fleetUsed } = rateChromeSnapshot();
   const rateNote = rateStatusNote(remaining);
+  // One-shot pulse: the rate line is rebuilt every RATE_TICK_MS, so a
+  // continuous CSS animation just resets before it ever peaks. Instead tag
+  // the bee with `.pulse` only on the render where the hit count actually
+  // grew — the freshly-mounted element plays the short animation once.
+  const beePulse = relayHits > lastRenderedHits ? " pulse" : "";
+  lastRenderedHits = relayHits;
   const hiveHtml = relayHits > 0
-    ? ` <span class="ict-rate-sep">·</span> <span class="ict-rate-hive"><span class="ict-bee">🐝</span> +${relayHits}</span>`
+    ? ` <span class="ict-rate-sep">·</span> <span class="ict-rate-hive"><span class="ict-bee${beePulse}">🐝</span> +${relayHits}</span>`
     : "";
   const servingHtml = bountyProgress !== null
     ? ` <span class="ict-rate-sep">·</span> <span class="ict-rate-hive">🐝 serving</span>`
@@ -2764,9 +2771,10 @@ function initBrowserUI() {
     #ict-rate .ict-rate-bar-dark{color:#33405e}
     #ict-rate .ict-rate-hive{color:#ffb300}
     #ict-rate .ict-rate-cool{color:#ff6b6b}
-    #ict-rate .ict-bee{display:inline-block;animation:ict-bee-pulse 1.6s ease-in-out infinite;transform-origin:60% 60%}
-    @keyframes ict-bee-pulse{0%,68%,100%{transform:scale(1)}76%{transform:scale(1.22);filter:drop-shadow(0 0 5px rgba(255,179,0,.8))}}
-    @media (prefers-reduced-motion: reduce){#ict-rate .ict-bee{animation:none}}
+    #ict-rate .ict-bee{display:inline-block;transform-origin:60% 60%}
+    #ict-rate .ict-bee.pulse{animation:ict-bee-pulse 0.3s ease-out}
+    @keyframes ict-bee-pulse{0%{transform:scale(1)}45%{transform:scale(1.32);filter:drop-shadow(0 0 6px rgba(255,179,0,.9))}100%{transform:scale(1)}}
+    @media (prefers-reduced-motion: reduce){#ict-rate .ict-bee.pulse{animation:none}}
     #ict-rate .ict-rate-num{color:#e0e0e0;margin-left:2px}
     #ict-rate .ict-rate-sep{color:#555;margin:0 4px}
     #ict-rate .ict-rate-pair{color:#e0e0e0}
