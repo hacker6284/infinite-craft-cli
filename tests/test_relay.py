@@ -394,8 +394,69 @@ class TestBountyWorker:
         storage = make_mock_storage()
         cli._current_command = "/permute *"
         with patch.object(cli.relay_client, "take_bounties") as take:
-            run_async(cli._bounty_cycle(client, storage))
+            status = run_async(cli._bounty_cycle(client, storage))
             take.assert_not_called()
+        assert status == "blocked"
+
+    def test_cycle_returns_worked_with_rate_to_spare(self):
+        import infinite_craft_cli.cli as cli
+
+        _relay_on(cli)
+        client = make_mock_client()  # mock limiter reports 60 free
+        client.pair.return_value = MockElement("Dust", "")
+        storage = make_mock_storage()
+        bounties = [{"kind": "pair", "first": "Earth", "second": "Wind"}]
+        with patch.object(cli.relay_client, "take_bounties", return_value=bounties), \
+             patch.object(cli.relay_client, "contribute", return_value=1):
+            status = run_async(cli._bounty_cycle(client, storage))
+        # Full batch served with rate left → the worker will poll again now.
+        assert status == "worked"
+
+    def test_cycle_blocked_when_rate_limited_claims_nothing(self):
+        import infinite_craft_cli.cli as cli
+
+        _relay_on(cli)
+        client = make_mock_client()
+        # Window drained → no slot available.
+        client._rate_limiter.chrome_snapshot.return_value = (0, 60, 500)
+        storage = make_mock_storage()
+        with patch.object(cli.relay_client, "take_bounties") as take:
+            status = run_async(cli._bounty_cycle(client, storage))
+            take.assert_not_called()  # don't claim work we can't do
+        assert status == "blocked"
+
+    def test_cycle_returns_empty_when_board_empty(self):
+        import infinite_craft_cli.cli as cli
+
+        _relay_on(cli)
+        client = make_mock_client()
+        storage = make_mock_storage()
+        with patch.object(cli.relay_client, "take_bounties", return_value=[]):
+            status = run_async(cli._bounty_cycle(client, storage))
+        assert status == "empty"
+
+    def test_cycle_stops_serving_when_rate_runs_out_midbatch(self):
+        import infinite_craft_cli.cli as cli
+
+        _relay_on(cli)
+        client = make_mock_client()
+        client.pair.return_value = MockElement("Dust", "")
+        # First availability check True (serve pair 1), then drained.
+        client._rate_limiter.chrome_snapshot.side_effect = [
+            (60, 60, 1000),  # cycle entry gate
+            (60, 60, 1000),  # before pair 1 → serve
+            (0, 60, 500),    # before pair 2 → stop
+        ]
+        storage = make_mock_storage()
+        bounties = [
+            {"kind": "pair", "first": "Earth", "second": "Wind"},
+            {"kind": "pair", "first": "Fire", "second": "Water"},
+        ]
+        with patch.object(cli.relay_client, "take_bounties", return_value=bounties), \
+             patch.object(cli.relay_client, "contribute", return_value=1):
+            status = run_async(cli._bounty_cycle(client, storage))
+        assert client.pair.await_count == 1  # only the first, then backed off
+        assert status == "blocked"
 
     def test_worker_preempted_by_running_command(self):
         import infinite_craft_cli.cli as cli

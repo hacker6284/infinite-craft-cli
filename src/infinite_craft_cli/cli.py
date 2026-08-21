@@ -1017,31 +1017,46 @@ def _bounty_preempted() -> bool:
     )
 
 
-async def _bounty_cycle(client, storage) -> None:
-    """One poll-and-serve pass (extracted for testing).
+def _fleet_slot_available(client) -> bool:
+    """True if a rate slot is free right now (won't block on acquire)."""
+    left, _max, _frac = client._rate_limiter.chrome_snapshot()
+    return left > 0
+
+
+async def _bounty_cycle(client, storage) -> str:
+    """One poll-and-serve pass. Returns a status the worker paces on:
+      "worked"       — served the batch fully with rate to spare (poll again now)
+      "empty"        — no work on the board (idle-poll)
+      "blocked"      — preempted or out of rate (back off to idle-poll)
+      "unreachable"  — relay dropped (idle-poll)
 
     Every bounty — pair or review — is answered by a FRESH neal call, never
-    from local cache. This makes each contribution an independent neal
-    sighting (so it counts toward peer review) and closes the only path by
-    which a poisoned local-cache entry could be re-propagated into the hive.
-    The relay refuses us whenever any session on our IP is running, so this
-    can never contest a household's own runs."""
+    from local cache: each contribution is an independent neal sighting (so it
+    counts toward peer review) and a poisoned local entry can never be
+    re-propagated into the hive. The relay refuses us whenever any session on
+    our IP is running, so this can never contest a household's own runs.
+    Serving never *blocks* on a rate slot — it checks availability first and
+    backs off to polling when the window is drained."""
     global _bounties_worked, _bounty_progress
     if _bounty_preempted():
-        return
+        return "blocked"
+    if not _fleet_slot_available(client):
+        return "blocked"  # rate-limited — don't even claim work we can't do
     items = await asyncio.to_thread(relay_client.take_bounties, 5)
     if items is None:
         _relay_mark_unreachable()
-        return
+        return "unreachable"
     _relay_apply_hive(client)
     if not items:
-        return
+        return "empty"
     done = 0
+    status = "worked"
     _bounty_progress = (0, len(items))
     _paint_queue_panel(force=True)
     try:
         for it in items:
-            if _bounty_preempted():
+            if _bounty_preempted() or not _fleet_slot_available(client):
+                status = "blocked"  # stop before we'd block on a slot
                 break
             a_name = it.get("first") or ""
             b_name = it.get("second") or ""
@@ -1052,8 +1067,10 @@ async def _bounty_cycle(client, storage) -> None:
                 res = await client.pair(a_name, b_name, fleet=True)
             except NealRateLimited:
                 _trip_cooldown()
+                status = "blocked"
                 break
             except RateLimitCancelled:
+                status = "blocked"
                 break
             except Exception:
                 continue
@@ -1064,6 +1081,7 @@ async def _bounty_cycle(client, storage) -> None:
             added = await asyncio.to_thread(relay_client.contribute, [entry])
             if added is None:
                 _relay_mark_unreachable()
+                status = "unreachable"
                 break
             done += 1
             _bounties_worked += 1
@@ -1072,15 +1090,24 @@ async def _bounty_cycle(client, storage) -> None:
     finally:
         _bounty_progress = None
         _paint_queue_panel(force=True)
+    return status
 
 
 async def _bounty_worker(client, storage) -> None:
-    """Serve the hive while idle at the prompt. Polls every ~10s (the poll
-    doubles as the presence heartbeat)."""
+    """Serve the hive while idle at the prompt. Eager while there's work and
+    rate to spare — after finishing a batch it re-checks the board immediately
+    instead of idling a full poll interval, so a long-idle client uses its
+    whole rate budget for the fleet rather than ~half. Falls back to the 10s
+    poll (which doubles as the presence heartbeat) when the board is empty or
+    the rate window is drained."""
     while True:
-        await asyncio.sleep(craft.bounty_poll_interval_ms() / 1000.0)
+        status = "blocked"
         with contextlib.suppress(Exception):
-            await _bounty_cycle(client, storage)
+            status = await _bounty_cycle(client, storage)
+        if status == "worked":
+            await asyncio.sleep(0)  # yield to the loop, then serve again now
+            continue
+        await asyncio.sleep(craft.bounty_poll_interval_ms() / 1000.0)
 
 
 def _request_skip_current() -> bool:

@@ -803,17 +803,28 @@ function bountyPreempted() {
 }
 
 let bountyTimer = null;
+
+function fleetSlotAvailable() {
+  return rateChromeSnapshot().remaining > 0;
+}
+
+// One poll-and-serve pass. Returns a status the scheduler paces on:
+// "worked" (served fully, rate to spare → poll again now), "empty",
+// "blocked" (preempted or out of rate), "unreachable". Serving never blocks
+// on a rate slot — it checks availability first and backs off to polling.
 async function bountyTick() {
-  if (bountyPreempted()) return;
+  if (bountyPreempted() || !fleetSlotAvailable()) return "blocked";
   const data = await relayFetch(`/api/bounties?limit=5`, null, 4000);
-  if (!data || !Array.isArray(data.bounties) || !data.bounties.length) return;
+  if (data == null) { relayMarkUnreachable(); return "unreachable"; }
+  if (!Array.isArray(data.bounties) || !data.bounties.length) return "empty";
   const items = data.bounties;
   let done = 0;
+  let status = "worked";
   bountyProgress = [0, items.length];
   updateChrome();
   try {
     for (const it of items) {
-      if (bountyPreempted()) break;
+      if (bountyPreempted() || !fleetSlotAvailable()) { status = "blocked"; break; }
       const aName = it.first, bName = it.second;
       if (!aName || !bName) continue;
       const key = pairKey(aName, bName);
@@ -824,7 +835,7 @@ async function bountyTick() {
       try {
         res = await apiPair(aName, bName, true);
       } catch (e) {
-        if (String(e && e.message).includes("429")) break;
+        if (String(e && e.message).includes("429")) { status = "blocked"; break; }
         continue;
       }
       pairCache.set(key, res);
@@ -837,7 +848,7 @@ async function bountyTick() {
         { entries: [[ka, kb, res ? res.text : null, res ? res.emoji : ""]] },
         8000
       );
-      if (added == null) break;
+      if (added == null) { status = "unreachable"; break; }
       relayContributed += added.added || 0;
       done++;
       bountiesWorked++;
@@ -848,11 +859,27 @@ async function bountyTick() {
     bountyProgress = null;
     updateChrome();
   }
+  return status;
+}
+
+// Self-scheduling (setTimeout, not setInterval) so cycles never overlap:
+// after a fully-served batch, poll again immediately to drain the board while
+// rate lasts; otherwise wait a poll interval (which doubles as the presence
+// heartbeat).
+function scheduleBountyTick() {
+  bountyTick()
+    .then((status) => {
+      const delay = status === "worked" ? 0 : Number(bountyPollIntervalMs());
+      bountyTimer = setTimeout(scheduleBountyTick, delay);
+    })
+    .catch(() => {
+      bountyTimer = setTimeout(scheduleBountyTick, Number(bountyPollIntervalMs()));
+    });
 }
 
 function startBountyWorker() {
-  if (bountyTimer) clearInterval(bountyTimer);
-  bountyTimer = setInterval(() => { bountyTick().catch(() => {}); }, Number(bountyPollIntervalMs()));
+  if (bountyTimer) clearTimeout(bountyTimer);
+  scheduleBountyTick();
 }
 
 /** Ping (wakes a spun-down free instance), then re-seed the hive once per
