@@ -87,15 +87,17 @@ class TestCachedPairRelayTier:
         with patch.object(cli.relay_client, "lookup", return_value={}), patch.object(
             cli.relay_client, "contribute", return_value=1
         ) as contrib:
-            result = run_async(
-                cli._cached_pair(client, storage, MockElement("Fire"), MockElement("Water"))
-            )
-            # contribute is fire-and-forget; drain background tasks
-            async def drain():
+            # contribute is fire-and-forget on the running loop — drain it
+            # INSIDE the same loop, or it dies with the loop (CI caught this).
+            async def scenario():
+                result = await cli._cached_pair(
+                    client, storage, MockElement("Fire"), MockElement("Water")
+                )
                 for t in list(cli._relay_bg_tasks):
                     await t
+                return result
 
-            run_async(drain()) if cli._relay_bg_tasks else None
+            result = run_async(scenario())
         assert result.name == "Steam"
         client.pair.assert_awaited_once()
         assert contrib.called
