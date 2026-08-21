@@ -187,3 +187,54 @@ class TestChromeSnapshot:
     def test_chrome_snapshot_zero_limit(self):
         limiter = RateLimiter(max_requests=0)
         assert limiter.chrome_snapshot() == (0, 0, 1000)
+
+
+class TestHiveExtensions:
+    def test_effective_max_splits_and_restores(self):
+        limiter = RateLimiter(max_requests=60)
+        assert limiter.base_max == 60
+        limiter.set_effective_max(30)
+        left, maximum, _f = limiter.chrome_snapshot()
+        assert maximum == 30
+        # Restore never exceeds base.
+        limiter.set_effective_max(999)
+        assert limiter.chrome_snapshot()[1] == 60
+        # Never below 1.
+        limiter.set_effective_max(0)
+        assert limiter.chrome_snapshot()[1] == 1
+
+    def test_effective_max_actually_gates_acquire(self):
+        async def run():
+            limiter = RateLimiter(max_requests=60)
+            limiter.set_effective_max(2)
+            await limiter.acquire()
+            await limiter.acquire()
+            # Third acquire must now block (window full at the split budget).
+            with pytest.raises(RateLimitCancelled):
+                await limiter.acquire(cancel_check=lambda: True)
+
+        asyncio.run(asyncio.wait_for(run(), timeout=5))
+
+    def test_fleet_slots_tracked_in_split_snapshot(self):
+        async def run():
+            limiter = RateLimiter(max_requests=60)
+            t1 = await limiter.acquire()
+            limiter.mark_fleet(t1)
+            await limiter.acquire()  # own spend, untagged
+            left, maximum, frac, fleet = limiter.chrome_snapshot_split()
+            assert maximum == 60
+            assert left == 58
+            assert fleet == 1
+
+        asyncio.run(asyncio.wait_for(run(), timeout=5))
+
+    def test_release_drops_fleet_tag(self):
+        async def run():
+            limiter = RateLimiter(max_requests=60)
+            t1 = await limiter.acquire()
+            limiter.mark_fleet(t1)
+            assert limiter.fleet_used() == 1
+            await limiter.release(t1)
+            assert limiter.fleet_used() == 0
+
+        asyncio.run(asyncio.wait_for(run(), timeout=5))

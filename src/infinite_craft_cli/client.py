@@ -8,6 +8,13 @@ from typing import Callable
 from infinite_craft_cli._sudo import craft
 from infinite_craft_cli.ratelimit import RateLimiter, RateLimitCancelled, RateLimitToken
 
+
+class NealRateLimited(Exception):
+    """neal.fun returned 429 — an hours-long IP ban, not a backoff signal.
+
+    Callers must stand down (cooldown) rather than retry; retrying while
+    banned risks extending the ban."""
+
 _BASE_URL = "https://neal.fun"
 _PAIR_ENDPOINT = "/api/infinite-craft/pair"
 _IMPERSONATE = "chrome120"
@@ -140,10 +147,14 @@ class InfiniteCraftClient:
             await self._session.close()
             self._session = None
 
-    async def pair(self, first_name: str, second_name: str) -> Element:
+    async def pair(self, first_name: str, second_name: str, *, fleet: bool = False) -> Element:
         """Combine two elements via the API. Returns the resulting Element.
 
         Returns Element(name=None) if the combination produces nothing.
+        ``fleet=True`` tags the consumed rate slot as hive-bounty spend
+        (rendered gold in the rate bar). Raises NealRateLimited on a 429 —
+        neal's 429 is an hours-long IP ban, so callers must stand down,
+        never retry.
         """
         token: RateLimitToken = await self._rate_limiter.acquire(
             cancel_check=self._cancel_check,
@@ -153,6 +164,8 @@ class InfiniteCraftClient:
         if self._cancel_check and self._cancel_check():
             await self._rate_limiter.release(token)
             raise RateLimitCancelled()
+        if fleet:
+            self._rate_limiter.mark_fleet(token)
 
         resp = await self._session.get(
             _PAIR_ENDPOINT,
@@ -163,6 +176,8 @@ class InfiniteCraftClient:
             # Explicit: this matched curl_cffi's library default only by luck.
             timeout=craft.fetch_timeout_ms() / 1000.0,
         )
+        if resp.status_code == 429:
+            raise NealRateLimited()
         resp.raise_for_status()
         data = resp.json()
 

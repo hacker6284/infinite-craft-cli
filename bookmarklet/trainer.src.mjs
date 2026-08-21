@@ -42,6 +42,10 @@ import {
   auto_approve_outcome as autoApproveOutcome,
   relay_toggle_outcome as relayToggleOutcome,
   relay_reseed_entries as relayReseedEntries,
+  rate_bar_split_segments as rateBarSplitSegments,
+  effective_rate_limit as effectiveRateLimit,
+  cooldown_duration_ms as cooldownDurationMs,
+  bounty_poll_interval_ms as bountyPollIntervalMs,
   bulk_confirm_required as bulkConfirmRequired,
   rate_status_note as rateStatusNote,
   script_parse as scriptParse,
@@ -112,6 +116,18 @@ let relayReachable = null; // null = not yet pinged (warming)
 let relayHits = 0;
 let relayContributed = 0;
 let relaySeeded = false;
+// Presence identity + same-IP arbitration (relay-fed)
+const relaySessionId =
+  (typeof crypto !== "undefined" && crypto.randomUUID && crypto.randomUUID().slice(0, 16)) ||
+  String(Math.random()).slice(2, 18);
+let rateLimitEffective = 0; // 0 = full budget; >0 = split share from the hive
+// 429 cooldown: neal's 429 is an hours-long IP ban — stand down completely.
+let cooldownUntil = 0; // epoch ms
+let cooldownStrikes = 0;
+// Bounty worker (serve the hive while idle)
+let bountiesWorked = 0;
+let bountyProgress = null; // [done, batch] while serving
+const fleetTimestamps = []; // rate slots lent to bounty work (gold in bar)
 
 // DOM refs — initialized in initBrowserUI() so module evaluation is Node-safe
 let output, input, body, toggle, stopBtn, queueEl, rateEl, jobEl, promptEl;
@@ -569,6 +585,9 @@ function pruneRateTimestamps(now = Date.now()) {
     timestamps.shift();
     freed = true;
   }
+  while (fleetTimestamps.length && fleetTimestamps[0] <= now - RATE_WINDOW) {
+    fleetTimestamps.shift();
+  }
   if (freed) lastSlotFreedAt = now;
 }
 
@@ -591,18 +610,25 @@ function nextSlotFracMilli(now = Date.now()) {
 /** @returns {{ remaining: number, max: number, oldestFracMilli: number }} */
 function rateChromeSnapshot(now = Date.now()) {
   pruneRateTimestamps(now);
-  const remaining = rateSlotsLeft(timestamps.length, RATE_LIMIT);
-  return { remaining, max: RATE_LIMIT, oldestFracMilli: nextSlotFracMilli(now) };
+  const max = rateMax();
+  const remaining = rateSlotsLeft(timestamps.length, max);
+  return {
+    remaining,
+    max,
+    oldestFracMilli: nextSlotFracMilli(now),
+    fleetUsed: fleetTimestamps.length,
+  };
 }
 
-function acquireRate() {
+function acquireRate(fleet = false) {
   return new Promise((resolve, reject) => {
     function tryAcquire() {
       if (cancelled) { reject(new Error("Cancelled")); return; }
       const now = Date.now();
       pruneRateTimestamps(now);
-      if (timestamps.length < RATE_LIMIT) {
+      if (timestamps.length < rateMax()) {
         timestamps.push(now);
+        if (fleet) fleetTimestamps.push(now);
         updateChrome();
         resolve();
       } else {
@@ -655,22 +681,71 @@ function relayActive() {
   return relayUserOn && relayReachable === true;
 }
 
+function cooling() {
+  return Date.now() < cooldownUntil;
+}
+
+function tripCooldown() {
+  cooldownStrikes++;
+  cooldownUntil = Date.now() + Number(cooldownDurationMs(cooldownStrikes));
+  const resume = new Date(cooldownUntil).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  print(red(`429 from neal.fun — standing down until ~${resume}`) + dim(" (the ban is IP-wide and lasts hours; hive lookups still work)"));
+  updateChrome();
+}
+
+function relayPresenceState() {
+  if (cooling()) return "cooled";
+  if (currentPairCommand) return "running";
+  if (bountyProgress !== null) return "serving";
+  return "idle";
+}
+
+function relayHeaders() {
+  const h = {
+    "Content-Type": "application/json",
+    "x-ic-session": relaySessionId,
+    "x-ic-state": relayPresenceState(),
+  };
+  if (cooling()) h["x-ic-cooled-until"] = String(cooldownUntil);
+  return h;
+}
+
+/** Fold the hive envelope into local state: split the per-IP budget by
+    spending peers; adopt a sibling session's 429 cooldown. */
+function relayApplyHive(data) {
+  const hive = data && data.hive;
+  if (!hive) return;
+  const peers = Number(hive.peers) || 0;
+  rateLimitEffective = peers > 1 ? Number(effectiveRateLimit(RATE_LIMIT, peers)) : 0;
+  const cu = Number(hive.cooledUntil) || 0;
+  if (cu > Date.now() && cu > cooldownUntil) {
+    cooldownUntil = cu;
+    updateChrome();
+  }
+}
+
+function rateMax() {
+  return rateLimitEffective > 0 ? Math.min(rateLimitEffective, RATE_LIMIT) : RATE_LIMIT;
+}
+
 async function relayFetch(path, payload, timeoutMs) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeoutMs);
   try {
     const opts =
       payload == null
-        ? { signal: ctl.signal }
+        ? { signal: ctl.signal, headers: relayHeaders() }
         : {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: relayHeaders(),
             body: JSON.stringify(payload),
             signal: ctl.signal,
           };
     const resp = await fetch(RELAY_URL + path, opts);
     if (!resp.ok) return null;
-    return await resp.json();
+    const data = await resp.json();
+    relayApplyHive(data);
+    return data;
   } catch {
     return null;
   } finally {
@@ -698,6 +773,69 @@ function relayContribute(entries) {
   relayFetch("/api/contribute", { entries }, 8000).then((d) => {
     if (d && d.added) relayContributed += d.added;
   });
+}
+
+// ── bounty worker: serve the hive while idle ─────────────────────────
+function bountyPreempted() {
+  return !!(
+    currentPairCommand ||
+    currentIbCommand ||
+    pairQueue.length ||
+    ibQueue.length ||
+    cooling() ||
+    !relayActive()
+  );
+}
+
+let bountyTimer = null;
+async function bountyTick() {
+  if (bountyPreempted()) return;
+  const data = await relayFetch(`/api/bounties?limit=5`, null, 4000);
+  if (!data || !Array.isArray(data.bounties) || !data.bounties.length) return;
+  const items = data.bounties;
+  let done = 0;
+  bountyProgress = [0, items.length];
+  updateChrome();
+  try {
+    for (const it of items) {
+      if (bountyPreempted()) break;
+      const aName = it.first, bName = it.second;
+      if (!aName || !bName) continue;
+      const key = pairKey(aName, bName);
+      let res;
+      if (it.kind !== "review" && pairCache.has(key)) {
+        res = pairCache.get(key);
+      } else {
+        try {
+          res = await apiPair(aName, bName, true);
+        } catch (e) {
+          if (String(e && e.message).includes("429")) break;
+          continue;
+        }
+        pairCache.set(key, res);
+      }
+      const [ka, kb] = pairKeyKernel(aName, bName);
+      const added = await relayFetch(
+        "/api/contribute",
+        { entries: [[ka, kb, res ? res.text : null, res ? res.emoji : ""]] },
+        8000
+      );
+      if (added == null) break;
+      relayContributed += added.added || 0;
+      done++;
+      bountiesWorked++;
+      bountyProgress = [done, items.length];
+      updateChrome();
+    }
+  } finally {
+    bountyProgress = null;
+    updateChrome();
+  }
+}
+
+function startBountyWorker() {
+  if (bountyTimer) clearInterval(bountyTimer);
+  bountyTimer = setInterval(() => { bountyTick().catch(() => {}); }, Number(bountyPollIntervalMs()));
 }
 
 /** Ping (wakes a spun-down free instance), then re-seed the hive once per
@@ -730,11 +868,13 @@ async function relayWarmup() {
   relaySeeded = true;
 }
 
-async function apiPair(firstName, secondName) {
+async function apiPair(firstName, secondName, fleet = false) {
   if (cancelled) throw new Error("Cancelled");
   const key = pairKey(firstName, secondName);
-  if (pairCache.has(key)) return pairCache.get(key);
-  if (relayActive()) {
+  // Review bounties must re-ask neal — a cached answer is exactly what a
+  // review is meant to independently verify.
+  if (!fleet && pairCache.has(key)) return pairCache.get(key);
+  if (!fleet && relayActive()) {
     const found = await relayLookup([[firstName, secondName]]);
     if (found && found[key] !== undefined) {
       const result = relayResultToCache(found[key]);
@@ -743,7 +883,8 @@ async function apiPair(firstName, secondName) {
       return result;
     }
   }
-  await acquireRate();
+  if (cooling()) throw new Error("429 cooldown");
+  await acquireRate(fleet);
   if (cancelled) throw new Error("Cancelled");
   const url = `/api/infinite-craft/pair?first=${encodeURIComponent(firstName)}&second=${encodeURIComponent(secondName)}`;
   let resp;
@@ -753,9 +894,14 @@ async function apiPair(firstName, secondName) {
     const guard = attemptSignal(FETCH_TIMEOUT_MS);
     try {
       resp = await fetch(url, { signal: guard.signal });
+      // 429 is an hours-long IP ban, never a retry candidate: stand down.
+      if (resp.status === 429) { tripCooldown(); throw new Error("429 cooldown"); }
       // Body read shares the attempt guard so a stalled body times out too.
       if (resp.ok) { json = await resp.json(); break; }
-    } catch (e) { /* retry */ } finally {
+    } catch (e) {
+      if (String(e && e.message).includes("429 cooldown")) throw e;
+      /* retry */
+    } finally {
       guard.done();
     }
     if (!pairShouldRetry(attempt)) break;
@@ -929,13 +1075,21 @@ function doRelay(arg) {
       : relayReachable === null
         ? yellow("warming up")
         : red("unreachable");
-  const counters = `${green(String(relayHits))} served from hive, ${relayContributed} contributed`;
+  const counters = `${green(String(relayHits))} served from hive, ${relayContributed} contributed, ${yellow(String(bountiesWorked))} bounties worked`;
+  const extras = [];
+  if (rateLimitEffective > 0) {
+    extras.push(`budget split to ${rateLimitEffective}/min (other sessions on your IP)`);
+  }
+  if (cooling()) {
+    extras.push(red(`429 cooldown until ~${new Date(cooldownUntil).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`));
+  }
+  const extra = extras.length ? "\n  " + extras.join("\n  ") : "";
   if (kind === "on") {
-    print(`  Relay ${green("on")} (${conn}) — ${counters}.`);
+    print(`  Relay ${green("on")} (${conn}) — ${counters}.${extra}`);
   } else if (kind === "off") {
     print(`  Relay ${yellow("off")} — pairs go straight to neal.fun.`);
   } else if (kind === "show_on") {
-    print(`  Relay is ${green("on")} (${conn}) — ${counters}.`);
+    print(`  Relay is ${green("on")} (${conn}) — ${counters}.${extra}`);
   } else {
     print(`  Relay is ${yellow("off")}.`);
   }
@@ -991,25 +1145,57 @@ function prioritizePairs(pairs) {
 //     — whether to emit the default `[n/total] result` line; default: print
 //       only when the result is new or hits the target
 //   skipSummary — omit the final "Done: N new…" line (crawl gens use their own)
+async function hiveSweep(pairs) {
+  // Batch-lookup locally-missing pairs against the hive; merge hits.
+  if (!relayActive()) return 0;
+  const missing = pairs.filter(([a, b]) => !pairCache.has(pairKey(a.text, b.text)));
+  if (!missing.length) return 0;
+  const found = await relayLookup(missing.map(([a, b]) => [a.text, b.text]));
+  if (!found) return 0;
+  let merged = 0;
+  for (const [a, b] of missing) {
+    const key = pairKey(a.text, b.text);
+    const v = found[key];
+    if (v === undefined || pairCache.has(key)) continue;
+    pairCache.set(key, relayResultToCache(v));
+    relayHits++;
+    merged++;
+  }
+  return merged;
+}
+
 async function runPairsInner(pairs, opts = {}) {
-  if (pairs.length > 1 && relayActive()) {
+  if (pairs.length > 1) {
     // One hive sweep for the whole batch: anything any user has already
     // tried becomes a local cache hit before the first rate-limit slot is
     // spent, and the cache-first prioritization below promotes it.
-    const missing = pairs.filter(([a, b]) => !pairCache.has(pairKey(a.text, b.text)));
-    if (missing.length) {
-      const found = await relayLookup(missing.map(([a, b]) => [a.text, b.text]));
-      if (found) {
-        for (const [a, b] of missing) {
-          const v = found[pairKey(a.text, b.text)];
-          if (v === undefined) continue;
-          pairCache.set(pairKey(a.text, b.text), relayResultToCache(v));
-          relayHits++;
+    await hiveSweep(pairs);
+  }
+  if (relayActive()) {
+    // Overflow beyond ~two windows of local budget goes on the bounty
+    // board; idle users elsewhere fill the shared cache while we grind our
+    // own share, and the periodic re-sweep below absorbs their results.
+    const missNames = pairs
+      .filter(([a, b]) => !pairCache.has(pairKey(a.text, b.text)))
+      .map(([a, b]) => [a.text, b.text]);
+    const snap = rateChromeSnapshot();
+    const horizon = snap.remaining + snap.max;
+    if (missNames.length > horizon) {
+      const tail = missNames.slice(horizon, horizon + 500);
+      relayFetch("/api/bounties", { pairs: tail }, 8000).then((d) => {
+        if (!d) return;
+        for (const [key, v] of Object.entries(d.results || {})) {
+          if (!pairCache.has(key)) {
+            pairCache.set(key, relayResultToCache(v));
+            relayHits++;
+          }
         }
-      }
+        if (d.posted) print(dim(`  🐝 posted ${d.posted} bounties to the hive`));
+      });
     }
   }
   pairs = prioritizePairs(pairs);
+  let lastResweep = Date.now();
   let done = 0, newCount = 0, nothingCount = 0, errors = 0;
   const total = pairs.length;
   const onResult = opts.onResult;
@@ -1018,6 +1204,19 @@ async function runPairsInner(pairs, opts = {}) {
   for (let i = 0; i < pairs.length; i++) {
     const [a, b] = pairs[i];
     if (cancelled) { print("  " + yellow("Cancelled.")); break; }
+    if (cooling()) {
+      print("  " + red(`429 cooldown — ${pairs.length - i} pairs skipped.`));
+      break;
+    }
+    // While the local budget is drained, other users may be filling our
+    // posted bounties — re-sweep the tail so their results land free.
+    if (relayActive() && Date.now() - lastResweep > 20000) {
+      const snap = rateChromeSnapshot();
+      if (snap.remaining <= 0) {
+        await hiveSweep(pairs.slice(i));
+        lastResweep = Date.now();
+      }
+    }
     // Bump progress when the pair *starts* so chrome never sits at 0/N
     // while a fetch (or rate-limit wait) is in flight.
     setLastPair(a.text, b.text);
@@ -2193,16 +2392,16 @@ function clearLaneProgress(lane) {
   updateChrome();
 }
 
-function rateBarHtml(remaining, max, oldestFracMilli) {
-  const [leftFilled, rightFilled] = rateBarFills(
-    remaining, max, oldestFracMilli, RATE_BAR_LEFT, RATE_BAR_RIGHT
+function rateBarHtml(remaining, max, oldestFracMilli, fleetUsed = 0) {
+  const [left, cyan, gold, dark] = rateBarSplitSegments(
+    remaining, fleetUsed, max, oldestFracMilli, RATE_BAR_LEFT, RATE_BAR_RIGHT
   );
-  const left = rateBarSegment(leftFilled, RATE_BAR_LEFT);
-  const right = rateBarSegment(rightFilled, RATE_BAR_RIGHT);
-  // No separator: purple next-slot wait (left 1/2) + cyan capacity (right 1/2).
+  // Purple next-slot wait · cyan remaining · honey ▒ fleet-spent · dark own.
   return (
     `<span class="ict-rate-bar ict-rate-bar-age">${left}</span>` +
-    `<span class="ict-rate-bar ict-rate-bar-cap">${right}</span>` +
+    `<span class="ict-rate-bar ict-rate-bar-cap">${cyan}</span>` +
+    `<span class="ict-rate-bar ict-rate-bar-fleet">${gold}</span>` +
+    `<span class="ict-rate-bar ict-rate-bar-dark">${dark}</span>` +
     ` <span class="ict-rate-num">${remaining}/${max}</span>`
   );
 }
@@ -2211,25 +2410,34 @@ function updateChrome() {
   if (!rateEl || !jobEl || !queueEl) return;
 
   // Permanent rate line: segmented bar + optional last pair (pair lane only).
-  const { remaining, max, oldestFracMilli } = rateChromeSnapshot();
+  const { remaining, max, oldestFracMilli, fleetUsed } = rateChromeSnapshot();
   const rateNote = rateStatusNote(remaining);
+  const hiveHtml = relayHits > 0
+    ? ` <span class="ict-rate-sep">·</span> <span class="ict-rate-hive"><span class="ict-bee">🐝</span> +${relayHits}</span>`
+    : "";
+  const servingHtml = bountyProgress !== null
+    ? ` <span class="ict-rate-sep">·</span> <span class="ict-rate-hive">🐝 serving</span>`
+    : "";
+  const coolHtml = cooling()
+    ? ` <span class="ict-rate-sep">·</span> <span class="ict-rate-cool">429 cooldown ~${esc(new Date(cooldownUntil).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }))}</span>`
+    : "";
   const noteHtml = rateNote
     ? ` <span class="ict-rate-sep">·</span> <span class="ict-rate-note">${esc(rateNote)}</span>`
     : "";
-  const ratePrefix = `<span class="ict-rate-label">rate</span> ${rateBarHtml(remaining, max, oldestFracMilli)}` + noteHtml;
+  const ratePrefix = `<span class="ict-rate-label">rate</span> ${rateBarHtml(remaining, max, oldestFracMilli, fleetUsed)}` + hiveHtml + servingHtml + coolHtml + noteHtml;
   if (currentPairCommand && lastPairA != null && lastPairB != null) {
     // Width-aware: measure leftover cells after painting the rate segment once.
     rateEl.innerHTML = ratePrefix + ` <span class="ict-rate-sep">·</span> <span class="ict-rate-pair"></span>`;
     const pairSpan = rateEl.querySelector(".ict-rate-pair");
     const totalPx = rateEl.clientWidth || 320;
-    const ageW = rateEl.querySelector(".ict-rate-bar-age")?.offsetWidth || 0;
-    const capW = rateEl.querySelector(".ict-rate-bar-cap")?.offsetWidth || 0;
-    const usedPx = (rateEl.querySelector(".ict-rate-label")?.offsetWidth || 0)
-      + ageW + capW
-      + (rateEl.querySelector(".ict-rate-num")?.offsetWidth || 0)
-      + (rateEl.querySelector(".ict-rate-sep")?.offsetWidth || 0)
-      + (rateEl.querySelector(".ict-rate-note")?.offsetWidth || 0)
-      + 16;
+    // Sum every rendered bar segment (age/cap/fleet/dark) plus the chrome
+    // around it — segment count varies with hive state, so measure them all.
+    let barW = 0;
+    rateEl.querySelectorAll(".ict-rate-bar").forEach((el) => { barW += el.offsetWidth; });
+    let chromeW = 0;
+    rateEl.querySelectorAll(".ict-rate-label, .ict-rate-num, .ict-rate-sep, .ict-rate-note, .ict-rate-hive, .ict-rate-cool")
+      .forEach((el) => { chromeW += el.offsetWidth; });
+    const usedPx = barW + chromeW + 16;
     const charPx = 7.2; // monospace ~13px font
     const avail = Math.max(8, Math.floor((totalPx - usedPx) / charPx));
     if (pairSpan) pairSpan.textContent = rateFormatPairForWidth(lastPairA, lastPairB, avail);
@@ -2527,6 +2735,13 @@ function initBrowserUI() {
     #ict-rate .ict-rate-bar{letter-spacing:0}
     #ict-rate .ict-rate-bar-age{color:#7c4dff}
     #ict-rate .ict-rate-bar-cap{color:#00bcd4}
+    #ict-rate .ict-rate-bar-fleet{color:#ffb300}
+    #ict-rate .ict-rate-bar-dark{color:#33405e}
+    #ict-rate .ict-rate-hive{color:#ffb300}
+    #ict-rate .ict-rate-cool{color:#ff6b6b}
+    #ict-rate .ict-bee{display:inline-block;animation:ict-bee-pulse 1.6s ease-in-out infinite;transform-origin:60% 60%}
+    @keyframes ict-bee-pulse{0%,68%,100%{transform:scale(1)}76%{transform:scale(1.22);filter:drop-shadow(0 0 5px rgba(255,179,0,.8))}}
+    @media (prefers-reduced-motion: reduce){#ict-rate .ict-bee{animation:none}}
     #ict-rate .ict-rate-num{color:#e0e0e0;margin-left:2px}
     #ict-rate .ict-rate-sep{color:#555;margin:0 4px}
     #ict-rate .ict-rate-pair{color:#e0e0e0}
@@ -2673,6 +2888,7 @@ function initBrowserUI() {
     rebuildRecipeIndex();
     startPageSync();
     relayWarmup();
+    startBountyWorker();
     output.innerHTML = "";
     print(bold(cyan("=== Infinite Craft Trainer ===")) + dim(`  v${TRAINER_VERSION}`));
     print(`  Active save: ${bold(esc(saveName))} (id=${_saveId})`);

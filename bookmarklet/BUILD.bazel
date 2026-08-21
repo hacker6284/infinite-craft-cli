@@ -12,6 +12,9 @@ sudo_js_library(
     name = "_sudo",
     lib = "//sudo:craft",
     entry = "craft.sudo",
+    # //relay vendors a committed copy of this tree (Render deploys from git
+    # with no build step); relay:sudo_freshness_test diffs against it.
+    visibility = ["//relay:__pkg__"],
 )
 
 # The trainer's version, stamped from the same STABLE_VERSION that names the

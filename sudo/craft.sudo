@@ -2506,6 +2506,89 @@ export func rate_bar_fills(
             right_filled = right_width
     return (left_filled, right_filled)
 
+// Hive split of the capacity half: cyan = remaining, gold ▒ = slots spent
+// serving fleet bounties, dark ░ = own spend. Gold gets a minimum of one
+// cell whenever any fleet spend exists (small spend must stay visible) and
+// never crowds out remaining's cells.
+export func rate_bar_fills_split(
+    remaining: int,
+    fleet_used: int,
+    max_requests: int,
+    frac_milli: int,
+    left_width: int,
+    right_width: int
+) -> (int, int, int)
+    left_filled, cyan_filled = rate_bar_fills(remaining, max_requests, frac_milli, left_width, right_width)
+    gold_filled = 0
+    if right_width > 0 and max_requests > 0 and fleet_used > 0
+        fu = fleet_used
+        if fu > max_requests
+            fu = max_requests
+        gold_filled = (fu * right_width + max_requests / 2) / max_requests
+        if gold_filled < 1
+            gold_filled = 1
+        if gold_filled > right_width - cyan_filled
+            gold_filled = right_width - cyan_filled
+        if gold_filled < 0
+            gold_filled = 0
+    return (left_filled, cyan_filled, gold_filled)
+
+// The four bar segments as glyph runs (hosts wrap colors only):
+// (purple left, cyan remaining, gold ▒ fleet, dark ░ own-spent).
+// ▒ = U+2592 (9618).
+export func rate_bar_split_segments(
+    remaining: int,
+    fleet_used: int,
+    max_requests: int,
+    frac_milli: int,
+    left_width: int,
+    right_width: int
+) -> (text, text, text, text)
+    left_filled, cyan_filled, gold_filled = rate_bar_fills_split(
+        remaining, fleet_used, max_requests, frac_milli, left_width, right_width)
+    dark = right_width - cyan_filled - gold_filled
+    if dark < 0
+        dark = 0
+    return (
+        rate_bar_segment(left_filled, left_width),
+        repeat_char(9608, cyan_filled),
+        repeat_char(9618, gold_filled),
+        repeat_char(9617, dark)
+    )
+
+// Same-IP budget split: peers actively spending neal slots (including self)
+// divide the per-IP window evenly. Alone (or unknown) → full budget;
+// never below 1 so a crowded IP still crawls rather than starves.
+export func effective_rate_limit(max_requests: int, spending_peers: int) -> int
+    if spending_peers <= 1
+        return max_requests
+    eff = max_requests / spending_peers
+    if eff < 1
+        return 1
+    return eff
+
+// 429 cooldown: neal's 429 is a multi-hour IP ban, not a rate signal.
+// First strike 2h, doubling per repeat strike, capped at 8h. A client in
+// cooldown makes zero neal requests (hive lookups are still fine) and the
+// relay broadcasts the state to every session on the IP.
+export func cooldown_duration_ms(strikes: int) -> int
+    s = strikes
+    if s < 1
+        s = 1
+    if s > 3
+        s = 3
+    ms = 7200000
+    i = 1
+    while i < s
+        ms = ms * 2
+        i = i + 1
+    return ms
+
+// Idle bounty poll cadence (fast per design review: idle clients should
+// pick up work promptly; the GET doubles as the presence heartbeat).
+export func bounty_poll_interval_ms() -> int
+    return 10000
+
 // Glyph segment for rate bars: clamp filled to [0, width], then █ filled + ░ empty.
 // Hosts keep ANSI/HTML wrappers; kernel owns clamp + glyph construction.
 // █ = U+2588 (9608), ░ = U+2591 (9617).
@@ -3790,6 +3873,42 @@ test "queue lane and target pure rules"
     assert rate_bar_segment(0, 4) == "░░░░"
     assert rate_bar_segment(4, 4) == "████"
     assert rate_bar_segment(2, 4) == "██░░"
+    // Hive split: 28 remaining, 13 lent to fleet, 19 own-spent (of 60).
+    lf2, cy, gl = rate_bar_fills_split(28, 13, 60, 333, 9, 9)
+    assert lf2 == 3
+    assert cy == 4
+    assert gl == 2
+    // No fleet spend → identical to the plain fills, zero gold.
+    lf3, cy3, gl3 = rate_bar_fills_split(43, 0, 60, 1000, 9, 9)
+    assert gl3 == 0
+    assert cy3 == 6
+    // Tiny fleet spend stays visible: 1 slot rounds up to one gold cell.
+    lf4, cy4, gl4 = rate_bar_fills_split(50, 1, 60, 1000, 9, 9)
+    assert gl4 == 1
+    // Gold never crowds a full bar: all remaining → no room, gold clamps.
+    lf5, cy5, gl5 = rate_bar_fills_split(60, 5, 60, 1000, 9, 9)
+    assert cy5 == 9
+    assert gl5 == 0
+    // Segments compose to exactly the right width with ▒ for gold.
+    seg_l, seg_c, seg_g, seg_d = rate_bar_split_segments(28, 13, 60, 333, 9, 9)
+    assert seg_c == "████"
+    assert seg_g == "▒▒"
+    assert seg_d == "░░░"
+    assert seg_c.length + seg_g.length + seg_d.length == 9
+
+test "effective_rate_limit and cooldown policy"
+    assert effective_rate_limit(60, 0) == 60
+    assert effective_rate_limit(60, 1) == 60
+    assert effective_rate_limit(60, 2) == 30
+    assert effective_rate_limit(60, 3) == 20
+    assert effective_rate_limit(60, 7) == 8
+    assert effective_rate_limit(2, 5) == 1
+    assert cooldown_duration_ms(0) == 7200000
+    assert cooldown_duration_ms(1) == 7200000
+    assert cooldown_duration_ms(2) == 14400000
+    assert cooldown_duration_ms(3) == 28800000
+    assert cooldown_duration_ms(9) == 28800000
+    assert bounty_poll_interval_ms() == 10000
     assert rate_bar_segment(-3, 4) == "░░░░"
     assert rate_bar_segment(99, 4) == "████"
     assert rate_bar_segment(0, 0) == ""

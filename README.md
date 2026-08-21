@@ -171,12 +171,41 @@ a rate-limit slot is committed only after both cache tiers miss, and fresh
 results are contributed back automatically. Bulk runs sweep the whole batch
 against the hive in one request before spending their first slot.
 
+**Bounty board.** When a bulk run overflows your own rate budget, the extra
+pairs go on a shared board. Idle clients elsewhere pick them up *within their
+own rate limit* and drop the results into the cache, which your run re-sweeps
+and absorbs for free — so the neal.fun rate limit is pooled across willing
+users instead of stranding your backlog. Working bounties is on by default and
+symmetric: while you're idle at the prompt, your client serves the hive too.
+
+**Peer review.** A cache entry is trusted only after a second, independent
+client re-asks neal.fun and gets the same answer (review bounties never accept
+a cached answer — that would defeat the check). A conflicting claim against an
+unreviewed entry drops it and re-opens the pair, so the network self-heals
+around a bad result rather than trusting last-writer.
+
+**Same-IP fairness.** The relay sees each client's public IP and tells everyone
+how many sessions on that IP are actively spending neal budget; each client
+divides its per-IP window by that count. Two laptops on one home Wi-Fi each
+settle to half the limit *before* hitting a 429, not after. Bounty work is
+offered only to IPs where nobody is running, so serving the hive never contests
+your own household's runs.
+
+**429 = stand down.** neal.fun's 429 is an hours-long IP ban, not a backoff
+signal, so a client that trips one stops making neal requests entirely (hive
+lookups still work) and broadcasts the cooldown to every session on its IP.
+
 The tier is on by default and fails open — if the relay is down or cold, the
-CLI just talks to neal.fun as before. `/relay` toggles it per session;
-`IC_RELAY=off` disables it at startup; `IC_RELAY_URL` points at a different
-relay. The relay keeps its cache in RAM and is re-seeded by clients from their
-own recipe stores on connect (plus an optional Upstash Redis snapshot across
-restarts), so a cold instance refills within minutes.
+CLI just talks to neal.fun as before. `/relay` toggles it and `/relay status`
+shows connection, hits/contributions/bounties, the current budget split, and
+any cooldown. `IC_RELAY=off` disables it at startup; `IC_RELAY_URL` points at a
+different relay. The relay keeps its cache in RAM and is re-seeded by clients
+from their own recipe stores on connect (plus an optional Upstash Redis
+snapshot across restarts), so a cold instance refills within minutes.
+
+The rate bar shows all of this: a pulsing 🐝 counter beside the bar for pairs
+served to you by the hive (they cost no slots), honey-gold cells inside the bar
+for slots you've lent to bounty work, and a cooldown note when you're banned.
 
 ## Data storage
 

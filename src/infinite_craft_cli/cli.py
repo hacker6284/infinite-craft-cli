@@ -36,6 +36,7 @@ from infinite_craft_cli.element import Element
 from infinite_craft_cli import relay as relay_client
 from infinite_craft_cli.client import (
     InfiniteCraftClient,
+    NealRateLimited,
     fetch_json,
     ib_get,
 )
@@ -200,6 +201,13 @@ def _reset_test_state() -> None:
     _relay_seeded = False
     _relay_warmup_task = None
     _relay_bg_tasks.clear()
+    global _cooldown_until, _cooldown_strikes, _bounty_task
+    global _bounties_worked, _bounty_progress
+    _cooldown_until = 0.0
+    _cooldown_strikes = 0
+    _bounty_task = None
+    _bounties_worked = 0
+    _bounty_progress = None
     _script_new_reg = []
     _confirm_reason = ""
     _skip_summary_shown = False
@@ -386,6 +394,7 @@ async def _cached_pair(client, storage, a, b):
         if found is None:
             _relay_mark_unreachable()
         else:
+            _relay_apply_hive(client)
             hit = found.get(f"{key[0]}\0{key[1]}")
             if hit is not None:
                 r, e = hit
@@ -395,6 +404,8 @@ async def _cached_pair(client, storage, a, b):
                 if r is not None:
                     _record_recipes_batch([(r, a.name, b.name)])
                 return result
+    if _cooling():
+        raise NealRateLimited()
     for attempt in range(craft.pair_retry_max_attempts()):
         _raise_if_cancelled()
         try:
@@ -402,6 +413,9 @@ async def _cached_pair(client, storage, a, b):
             break
         except RateLimitCancelled:
             raise CommandCancelled() from None
+        except NealRateLimited:
+            _trip_cooldown()
+            raise
         except Exception:
             if not craft.pair_should_retry(attempt):
                 raise
@@ -745,6 +759,60 @@ _relay_contributed: int = 0  # entries the relay hadn't seen, from us
 _relay_seeded: bool = False  # one re-seed upload per session
 _relay_warmup_task: asyncio.Task | None = None
 _relay_bg_tasks: set = set()
+# 429 cooldown: neal's 429 is an hours-long IP ban. While cooling, zero neal
+# requests (hive lookups still fine); the state is broadcast via the relay so
+# every session on this IP stands down too.
+_cooldown_until: float = 0.0  # epoch seconds
+_cooldown_strikes: int = 0
+# Bounty worker (serve the hive while idle at the prompt)
+_bounty_task: asyncio.Task | None = None
+_bounties_worked: int = 0
+_bounty_progress: tuple[int, int] | None = None  # (done, batch) while serving
+
+
+def _cooling() -> bool:
+    return time.time() < _cooldown_until
+
+
+def _trip_cooldown() -> None:
+    """A genuine 429 arrived: stand down for hours (doubling per strike)."""
+    global _cooldown_until, _cooldown_strikes
+    _cooldown_strikes += 1
+    _cooldown_until = time.time() + craft.cooldown_duration_ms(_cooldown_strikes) / 1000.0
+    resume = time.strftime("%H:%M", time.localtime(_cooldown_until))
+    _repl_print_lines(
+        f"  {_color('429 from neal.fun — standing down until ~' + resume, RED)} "
+        f"(the ban is IP-wide and lasts hours; hive lookups still work)"
+    )
+
+
+def _relay_presence() -> tuple[str, int]:
+    """State provider for relay headers: what this session is doing."""
+    if _cooling():
+        return ("cooled", int(_cooldown_until * 1000))
+    if _current_command:
+        return ("running", 0)
+    if _bounty_progress is not None:
+        return ("serving", 0)
+    return ("idle", 0)
+
+
+relay_client.state_provider = _relay_presence
+
+
+def _relay_apply_hive(client) -> None:
+    """Fold the latest hive envelope into local state: split the per-IP
+    budget by spending peers, and adopt a sibling session's cooldown."""
+    global _cooldown_until
+    peers = int(relay_client.last_hive.get("peers") or 0)
+    if client is not None:
+        limiter = client._rate_limiter
+        limiter.set_effective_max(
+            craft.effective_rate_limit(limiter.base_max, max(1, peers))
+        )
+    cu = int(relay_client.last_hive.get("cooledUntil") or 0) / 1000.0
+    if cu > time.time() and cu > _cooldown_until:
+        _cooldown_until = cu
 _target_hit_lock = asyncio.Lock()
 # Confirm chrome reason (e.g. "331 pairs"); keys live only on the prompt.
 _confirm_reason: str = ""
@@ -831,6 +899,58 @@ def _relay_spawn_warmup(storage) -> None:
     _relay_warmup_task = loop.create_task(_relay_warmup(storage))
 
 
+def _merge_hive_results(found: dict, pair_names: list[tuple[str, str]]) -> int:
+    """Insert relay lookup hits into the local pair cache. Returns merges."""
+    global _relay_hits
+    merged = 0
+    for a_name, b_name in pair_names:
+        ka, kb = craft.pair_key(a_name, b_name)
+        if (ka, kb) in _pair_cache:
+            continue
+        v = found.get(f"{ka}\0{kb}")
+        if v is None:
+            continue
+        r, e = v
+        _pair_cache[(ka, kb)] = Element(name=r, emoji=e or "", is_first_discovery=False)
+        _relay_hits += 1
+        merged += 1
+        if r is not None:
+            _record_recipes_batch([(r, a_name, b_name)])
+    return merged
+
+
+async def _hive_sweep(client, pairs) -> int:
+    """Batch-lookup every locally-missing pair against the hive; merge hits.
+
+    ``pairs`` is [(ElementA, ElementB), ...]. Returns merged-hit count."""
+    if not _relay_active():
+        return 0
+    missing = [
+        (a.name, b.name)
+        for (a, b) in pairs
+        if craft.pair_key(a.name, b.name) not in _pair_cache
+    ]
+    if not missing:
+        return 0
+    found = await asyncio.to_thread(relay_client.lookup, missing)
+    if found is None:
+        _relay_mark_unreachable()
+        return 0
+    _relay_apply_hive(client)
+    return _merge_hive_results(found, missing)
+
+
+def _relay_spawn_bg(coro) -> None:
+    """Track a fire-and-forget relay task (or drop it with no loop)."""
+    try:
+        task = asyncio.get_running_loop().create_task(coro)
+    except RuntimeError:
+        coro.close()
+        return
+    _relay_bg_tasks.add(task)
+    task.add_done_callback(_relay_bg_tasks.discard)
+
+
 def _relay_contribute_bg(a_name: str, b_name: str, result) -> None:
     """Fire-and-forget: share a fresh neal.fun result with the hive."""
     if not _relay_active():
@@ -844,12 +964,80 @@ def _relay_contribute_bg(a_name: str, b_name: str, result) -> None:
         if added:
             _relay_contributed += added
 
-    try:
-        task = asyncio.get_running_loop().create_task(run())
-    except RuntimeError:
-        return
-    _relay_bg_tasks.add(task)
-    task.add_done_callback(_relay_bg_tasks.discard)
+    _relay_spawn_bg(run())
+
+
+def _bounty_preempted() -> bool:
+    """Any user activity preempts fleet work instantly."""
+    return bool(
+        _current_command
+        or _current_ib_command
+        or list(_command_queue)
+        or list(_ib_command_queue)
+        or _cooling()
+        or not _relay_active()
+    )
+
+
+async def _bounty_worker(client, storage) -> None:
+    """Serve the hive while idle at the prompt.
+
+    Polls the board every 10s (the poll doubles as the presence heartbeat);
+    the relay refuses us whenever any session on our IP is running, so this
+    can never contest a household's own runs. Review bounties always re-ask
+    neal (never answered from local cache — that's the point of a review);
+    pair bounties may be answered from local cache for free."""
+    global _bounties_worked, _bounty_progress
+    while True:
+        await asyncio.sleep(craft.bounty_poll_interval_ms() / 1000.0)
+        if _bounty_preempted():
+            continue
+        items = await asyncio.to_thread(relay_client.take_bounties, 5)
+        if items is None:
+            _relay_mark_unreachable()
+            continue
+        _relay_apply_hive(client)
+        if not items:
+            continue
+        done = 0
+        _bounty_progress = (0, len(items))
+        _paint_queue_panel(force=True)
+        try:
+            for it in items:
+                if _bounty_preempted():
+                    break
+                a_name = it.get("first") or ""
+                b_name = it.get("second") or ""
+                if not a_name or not b_name:
+                    continue
+                key = craft.pair_key(a_name, b_name)
+                if it.get("kind") != "review" and key in _pair_cache:
+                    res = _pair_cache[key]
+                else:
+                    try:
+                        res = await client.pair(a_name, b_name, fleet=True)
+                    except NealRateLimited:
+                        _trip_cooldown()
+                        break
+                    except RateLimitCancelled:
+                        break
+                    except Exception:
+                        continue
+                    _pair_cache[key] = res
+                    if res.name is not None:
+                        _record_recipes_batch([(res.name, a_name, b_name)])
+                entry = (key[0], key[1], res.name, res.emoji or "")
+                added = await asyncio.to_thread(relay_client.contribute, [entry])
+                if added is None:
+                    _relay_mark_unreachable()
+                    break
+                done += 1
+                _bounties_worked += 1
+                _bounty_progress = (done, len(items))
+                _paint_queue_panel(force=True)
+        finally:
+            _bounty_progress = None
+            _paint_queue_panel(force=True)
 
 
 def _request_skip_current() -> bool:
@@ -1871,26 +2059,29 @@ def _rate_bar_colored(
     remaining: int,
     maximum: int,
     frac_milli: int = 1000,
+    fleet_used: int = 0,
     *,
     colored: bool = True,
     left_width: int = _RATE_BAR_LEFT,
     right_width: int = _RATE_BAR_RIGHT,
 ) -> str:
-    """Segmented bar: left age + right remaining capacity.
+    """Segmented bar: left age + right capacity, hive-aware.
 
-    When colored=True (default), magenta next-slot wait + cyan capacity.
-    When colored=False, plain ASCII segments (no ANSI) for /queue status.
+    Capacity half: cyan = remaining, gold ▒ = slots lent to hive bounties,
+    dark ░ = own spend. colored=False gives plain glyphs for /queue status.
     ``frac_milli`` is thousandths progress [0, 1000] from chrome_snapshot.
     """
-    left_filled, right_filled = craft.rate_bar_fills(
-        remaining, maximum, frac_milli, left_width, right_width
+    left_part, cyan_part, gold_part, dark_part = craft.rate_bar_split_segments(
+        remaining, fleet_used, maximum, frac_milli, left_width, right_width
     )
-    left_part = craft.rate_bar_segment(left_filled, left_width)
-    right_part = craft.rate_bar_segment(right_filled, right_width)
     if not colored:
-        return left_part + right_part
-    # MAGENTA reads as purple in most terminals; cyan matches the trainer.
-    return _color(left_part, MAGENTA) + _color(right_part, CYAN)
+        return left_part + cyan_part + gold_part + dark_part
+    # MAGENTA reads as purple in most terminals; cyan matches the trainer;
+    # YELLOW is the terminal's honey-gold.
+    out = _color(left_part, MAGENTA) + _color(cyan_part, CYAN)
+    if gold_part:
+        out += _color(gold_part, YELLOW)
+    return out + dark_part
 
 
 def _awaiting_bulk_confirm_setup() -> bool:
@@ -2026,35 +2217,11 @@ async def _combine_pairs(client, storage, pairs: list[tuple], collect: dict | No
     (ingredient-usage score descending, pair-key tie-break). This is the
     single choke point, so permute/cross/with/exhaust and each crawl
     generation all get the same ordering."""
-    global _relay_hits
-    if len(pairs) > 1 and _relay_active():
+    if len(pairs) > 1:
         # One hive sweep for the whole batch: anything any user has already
         # tried becomes a local cache hit before we spend a single neal slot,
         # and the cache-first prioritization below promotes it to the front.
-        missing = [
-            (a, b)
-            for (a, b) in pairs
-            if craft.pair_key(a.name, b.name) not in _pair_cache
-        ]
-        if missing:
-            found = await asyncio.to_thread(
-                relay_client.lookup, [(a.name, b.name) for a, b in missing]
-            )
-            if found is None:
-                _relay_mark_unreachable()
-            else:
-                for a, b in missing:
-                    ka, kb = craft.pair_key(a.name, b.name)
-                    v = found.get(f"{ka}\0{kb}")
-                    if v is None:
-                        continue
-                    r, e = v
-                    _pair_cache[(ka, kb)] = Element(
-                        name=r, emoji=e or "", is_first_discovery=False
-                    )
-                    _relay_hits += 1
-                    if r is not None:
-                        _record_recipes_batch([(r, a.name, b.name)])
+        await _hive_sweep(client, pairs)
     if len(pairs) > 1:
         pair_elements = {e.name: e for pair in pairs for e in pair}
         pair_tuples = craft.prioritize_pairs_boundary(
@@ -2073,6 +2240,33 @@ async def _combine_pairs(client, storage, pairs: list[tuple], collect: dict | No
             [f"{ka}\0{kb}" for (ka, kb) in _pair_cache.keys()],
         )
         pairs = _pairs_from_boundary(pair_tuples, pair_elements.values())
+    if _relay_active():
+        # Overflow beyond ~two windows of local budget goes on the bounty
+        # board: idle users elsewhere work it into the shared cache while we
+        # grind our own share, and the periodic re-sweep below absorbs their
+        # results as free local hits.
+        miss_names = [
+            (a.name, b.name)
+            for (a, b) in pairs
+            if craft.pair_key(a.name, b.name) not in _pair_cache
+        ]
+        left_now, max_now, _fm = client._rate_limiter.chrome_snapshot()
+        horizon = left_now + max_now
+        if len(miss_names) > horizon:
+            tail = miss_names[horizon:]
+
+            async def post_tail():
+                resp = await asyncio.to_thread(relay_client.post_bounties, tail)
+                if resp is None:
+                    return
+                _merge_hive_results(resp.get("results") or {}, tail)
+                posted = resp.get("posted") or 0
+                if posted:
+                    _repl_print_lines(
+                        _color(f"  🐝 posted {posted} bounties to the hive", DIM)
+                    )
+
+            _relay_spawn_bg(post_tail())
     total = len(pairs)
     new_count = 0
     nothing_count = 0
@@ -2091,6 +2285,10 @@ async def _combine_pairs(client, storage, pairs: list[tuple], collect: dict | No
         try:
             result = await _cached_pair(client, storage, a, b)
         except CommandCancelled:
+            return
+        except NealRateLimited:
+            # Cooldown message already printed by _trip_cooldown (or the
+            # gate found an active cooldown); the batch loop stops the run.
             return
         except Exception as e:
             done_count += 1
@@ -2146,9 +2344,24 @@ async def _combine_pairs(client, storage, pairs: list[tuple], collect: dict | No
                     return
 
     # Process in batches of API_CONCURRENCY to avoid overwhelming the rate limiter
+    last_resweep = time.monotonic()
     for i in range(0, len(pairs), API_CONCURRENCY):
         if _cancelled:
             break
+        if _cooling():
+            skipped = total - done_count
+            _repl_print_lines(
+                f"  {_color(f'429 cooldown — {skipped} pairs skipped.', RED)}"
+            )
+            break
+        # While the local budget is drained, other users may be filling our
+        # posted bounties: re-sweep the remaining pairs so their results
+        # land as free cache hits instead of future neal spend.
+        if _relay_active() and time.monotonic() - last_resweep > 20:
+            left_rs, _m, _f = client._rate_limiter.chrome_snapshot()
+            if left_rs <= 0:
+                await _hive_sweep(client, pairs[i:])
+                last_resweep = time.monotonic()
         batch = pairs[i : i + API_CONCURRENCY]
         # Show the first pair of each batch immediately (before the fetch).
         if batch:
@@ -2876,15 +3089,27 @@ def do_relay(arg: str, storage) -> str:
         conn = _color("unreachable", RED)
     counters = (
         f"{_color(str(_relay_hits), GREEN)} served from hive, "
-        f"{_relay_contributed} contributed"
+        f"{_relay_contributed} contributed, "
+        f"{_color(str(_bounties_worked), YELLOW)} bounties worked"
     )
+    peers = int(relay_client.last_hive.get("peers") or 0)
+    extras = []
+    if peers > 1:
+        extras.append(
+            f"{peers} sessions spending on this IP — budget split to "
+            f"{craft.effective_rate_limit(API_RATE_LIMIT, peers)}/min each"
+        )
+    if _cooling():
+        resume = time.strftime("%H:%M", time.localtime(_cooldown_until))
+        extras.append(_color(f"429 cooldown until ~{resume}", RED))
+    extra_line = ("\n  " + "\n  ".join(extras)) if extras else ""
     if kind == "on":
-        return f"  Relay {_color('on', GREEN)} ({conn}) — {counters}."
+        return f"  Relay {_color('on', GREEN)} ({conn}) — {counters}.{extra_line}"
     if kind == "off":
         return f"  Relay {_color('off', YELLOW)} — pairs go straight to neal.fun."
     if kind == "show_on":
         return (
-            f"  Relay is {_color('on', GREEN)} ({conn}) — {counters}.\n"
+            f"  Relay is {_color('on', GREEN)} ({conn}) — {counters}.{extra_line}\n"
             f"  {_color(relay_client.relay_url(), DIM)}"
         )
     return f"  Relay is {_color('off', YELLOW)}."
@@ -2927,11 +3152,14 @@ def _validate_command_line(line: str) -> str | None:
 def do_queue_status() -> str:
     """Describe the current command queue (pair + IB lanes)."""
     if _active_client is None:
-        left, maximum, frac_milli = (60, 60, 1000)
+        left, maximum, frac_milli, fleet_used = (60, 60, 1000, 0)
     else:
-        left, maximum, frac_milli = _active_client._rate_limiter.chrome_snapshot()
+        left, maximum, frac_milli, fleet_used = (
+            _active_client._rate_limiter.chrome_snapshot_split()
+        )
     rate_line = (
-        f"  rate {_rate_bar_colored(left, maximum, frac_milli, colored=False)} {left}/{maximum}"
+        f"  rate {_rate_bar_colored(left, maximum, frac_milli, fleet_used, colored=False)}"
+        f" {left}/{maximum}"
     )
     pair_q = list(_command_queue)
     ib_q = list(_ib_command_queue)
@@ -2982,14 +3210,23 @@ def _format_queue_display() -> str:
 
     # --- Permanent rate line (always) ---
     if _active_client is None:
-        left, maximum, frac_milli = (60, 60, 1000)
+        left, maximum, frac_milli, fleet_used = (60, 60, 1000, 0)
     else:
-        left, maximum, frac_milli = _active_client._rate_limiter.chrome_snapshot()
-    bar = _rate_bar_colored(left, maximum, frac_milli)
+        left, maximum, frac_milli, fleet_used = (
+            _active_client._rate_limiter.chrome_snapshot_split()
+        )
+    bar = _rate_bar_colored(left, maximum, frac_milli, fleet_used)
     rate_prefix = f"  {_color('rate', DIM)} {bar} {left}/{maximum}"
+    if _relay_hits > 0:
+        rate_prefix += f" {_color('·', DIM)} {_color(f'🐝 +{_relay_hits}', YELLOW)}"
+    if _bounty_progress is not None:
+        rate_prefix += f" {_color('·', DIM)} {_color('🐝 serving', YELLOW)}"
     note = craft.rate_status_note(left)
     if note:
         rate_prefix += f" {_color('·', DIM)} {_color(note, YELLOW)}"
+    if _cooling():
+        resume = time.strftime("%H:%M", time.localtime(_cooldown_until))
+        rate_prefix += f" {_color('·', DIM)} {_color(f'429 cooldown ~{resume}', RED)}"
     pair_part = ""
     if _current_command and _last_pair is not None:
         a, b = _last_pair
@@ -2999,6 +3236,15 @@ def _format_queue_display() -> str:
             f" {_color('·', DIM)} {_sanitize_queue_line(craft.rate_format_pair_for_width(a, b, avail))}"
         )
     content.append(rate_prefix + pair_part)
+
+    # --- Hive line (serving bounties while idle) ---
+    if _bounty_progress is not None:
+        bk, bn = _bounty_progress
+        content.append(
+            f"  {_color('🐝', YELLOW)} {_color('hive', DIM)}     "
+            f"{_color(f'fulfilling bounties [{bk}/{bn}]', YELLOW)} "
+            f"{_color('any input pauses instantly', DIM)}"
+        )
 
     # --- Job lines (pair and/or IB may run concurrently) ---
     running = _current_command
@@ -3960,6 +4206,8 @@ async def interactive_mode():
             _active_client = client
             _rate_ticker_task = asyncio.create_task(_rate_ticker_loop())
             _relay_spawn_warmup(storage)
+            global _bounty_task
+            _bounty_task = asyncio.create_task(_bounty_worker(client, storage))
             starters = "  ".join(format_element(e) for e in storage.get_all()[:4])
             _repl_print_lines(f"  Starting elements: {starters}")
             total = len(storage.get_all())
@@ -4063,6 +4311,11 @@ async def interactive_mode():
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await _rate_ticker_task
             _rate_ticker_task = None
+        if _bounty_task is not None:
+            _bounty_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await _bounty_task
+            _bounty_task = None
         _active_client = None
         await _cancel_and_await_worker()
         _teardown_tty_and_chrome()

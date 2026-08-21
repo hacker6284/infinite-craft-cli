@@ -27,6 +27,15 @@
 // for peer review (bounty board, phase 3).
 
 import http from "node:http";
+// The shared sudo kernel (generated JS backend, vendored under relay/_sudo
+// because Render deploys straight from git with no build step; a CI
+// freshness test diffs it against the Bazel output). Canonicalization and
+// sanitization MUST come from here — hand-rolled mirrors are exactly the
+// divergence class that bit us in stress finding F2.
+import {
+  pair_key as pairKeyKernel,
+  sanitize_element_name as sanitizeKernel,
+} from "./_sudo/craft.mjs";
 
 const PORT = Number(process.env.PORT || 8790);
 const MAX_ENTRIES = Number(process.env.RELAY_MAX_ENTRIES || 1_500_000);
@@ -54,10 +63,98 @@ const UPSTASH_URL = envStr(process.env.UPSTASH_REDIS_REST_URL).replace(/\/+$/, "
 const UPSTASH_TOKEN = envStr(process.env.UPSTASH_REDIS_REST_TOKEN);
 const SNAP_KEY = "pairs";
 
-/** key "<a>\0<b>" → { r: string|null, e: string, c: number } */
+/** key "<a>\0<b>" → { r: string|null, e: string, c: number, rv: boolean }
+    c = independent identical claims; rv = peer-reviewed (c >= 2). */
 const entries = new Map();
 /** keys written since the last successful snapshot flush */
 const dirty = new Set();
+/** keys deleted since the last flush (mismatch healing) — need HDEL */
+const deletedDirty = new Set();
+
+// ── presence: who is on each public IP, and in what state ────────────
+// ip → Map<session, {state, at}>. Fed by x-ic-session/x-ic-state headers on
+// every API call; entries expire after PRESENCE_TTL. "running"/"serving"
+// count as spending the IP's neal budget; the count is returned to every
+// caller so clients split the per-IP window without talking to each other.
+const PRESENCE_TTL_MS = 180_000;
+const presence = new Map();
+// ip → epoch-ms until which the IP is cooling down (one session tripped a
+// neal 429 — an IP-scoped, hours-long ban). Broadcast to all sessions.
+const ipCooldown = new Map();
+
+// ── bounty board ─────────────────────────────────────────────────────
+// key → {first, second, at, claimedBy, claimedAt}. Posted by rate-limited
+// clients; offered only to callers whose IP is fully idle and not cooling.
+const bounties = new Map();
+const MAX_BOUNTIES = 10_000;
+const BOUNTY_TTL_MS = 15 * 60_000;
+const CLAIM_TTL_MS = 90_000;
+const MAX_POST = 500; // bounties per POST
+const REVIEW_PENDING_MAX = 100_000; // review backlog memory bound
+// Unreviewed entries awaiting a peer re-ask of neal (c == 1). Offered to
+// idle clients when no pair bounties are open. key → claim {by, at} | null.
+const reviewPending = new Map();
+
+function callerIp(req) {
+  const fwd = req.headers["x-forwarded-for"];
+  if (typeof fwd === "string" && fwd.length) return fwd.split(",")[0].trim();
+  return req.socket.remoteAddress || "?";
+}
+
+function touchPresence(req, now) {
+  const session = envStr(req.headers["x-ic-session"] || "");
+  if (!session) return;
+  const state = envStr(req.headers["x-ic-state"] || "idle");
+  const ip = callerIp(req);
+  let bySession = presence.get(ip);
+  if (!bySession) {
+    bySession = new Map();
+    presence.set(ip, bySession);
+  }
+  bySession.set(session.slice(0, 64), { state, at: now });
+  if (state === "cooled") {
+    const until = Number(envStr(req.headers["x-ic-cooled-until"] || "")) || 0;
+    const prev = ipCooldown.get(ip) || 0;
+    if (until > prev) ipCooldown.set(ip, until);
+  }
+}
+
+function ipSnapshot(req, now) {
+  const ip = callerIp(req);
+  const bySession = presence.get(ip);
+  let spending = 0;
+  let running = 0;
+  if (bySession) {
+    for (const [session, info] of bySession) {
+      if (now - info.at > PRESENCE_TTL_MS) {
+        bySession.delete(session);
+        continue;
+      }
+      if (info.state === "running" || info.state === "serving") spending++;
+      if (info.state === "running") running++;
+    }
+    if (bySession.size === 0) presence.delete(ip);
+  }
+  let cooledUntil = ipCooldown.get(ip) || 0;
+  if (cooledUntil <= now) {
+    ipCooldown.delete(ip);
+    cooledUntil = 0;
+  }
+  return { spending, running, cooledUntil };
+}
+
+/** The hive envelope attached to every API response: what the caller's IP
+    looks like right now, so clients can split budget and stand down. */
+function hiveEnvelope(req, now) {
+  const snap = ipSnapshot(req, now);
+  return { peers: snap.spending, cooledUntil: snap.cooledUntil };
+}
+
+function pruneBounties(now) {
+  for (const [key, b] of bounties) {
+    if (now - b.at > BOUNTY_TTL_MS) bounties.delete(key);
+  }
+}
 const bootAt = Date.now();
 const snapshot = {
   enabled: Boolean(UPSTASH_URL && UPSTASH_TOKEN),
@@ -66,45 +163,24 @@ const snapshot = {
   lastErr: null,
 };
 
-// ── canonicalization ─────────────────────────────────────────────────
-// Must agree with the kernel's pair_key: code-POINT lexicographic order
-// (Python str compare), not JS's default UTF-16 code-unit order — they
-// differ once astral characters appear in names.
-export function lexCompareCodepoints(a, b) {
-  const ia = a[Symbol.iterator]();
-  const ib = b[Symbol.iterator]();
-  for (;;) {
-    const na = ia.next();
-    const nb = ib.next();
-    if (na.done && nb.done) return 0;
-    if (na.done) return -1;
-    if (nb.done) return 1;
-    const ca = na.value.codePointAt(0);
-    const cb = nb.value.codePointAt(0);
-    if (ca !== cb) return ca < cb ? -1 : 1;
-  }
-}
-
+// ── canonicalization: kernel-owned ───────────────────────────────────
 export function pairKey(a, b) {
-  return lexCompareCodepoints(a, b) <= 0 ? a + "\0" + b : b + "\0" + a;
+  const [ka, kb] = pairKeyKernel(a, b);
+  return ka + "\0" + kb;
 }
 
-// Storage normalization, mirroring the kernel's sanitize_element_name:
-// strip, drop C0 controls / DEL / C1 controls / U+2028 / U+2029.
+// Kernel storage normalization plus a relay-only DoS length bound,
+// measured in CODE POINTS so astral-heavy names get the same budget as
+// ASCII — real game names are far shorter than 200 either way.
 export function sanitizeName(raw) {
   if (typeof raw !== "string") return "";
-  let out = "";
+  const out = sanitizeKernel(raw);
   let cps = 0;
-  for (const ch of raw.trim()) {
-    const cp = ch.codePointAt(0);
-    if (cp < 0x20 || (cp >= 0x7f && cp <= 0x9f) || cp === 0x2028 || cp === 0x2029) continue;
-    out += ch;
+  for (const _ch of out) {
     cps += 1;
+    if (cps > MAX_NAME) return "";
   }
-  // Length bound is relay-only DoS hygiene (the kernel imposes none) and is
-  // measured in CODE POINTS so astral-heavy names get the same budget as
-  // ASCII — real game names are far shorter than 200 either way.
-  return cps > MAX_NAME ? "" : out;
+  return out;
 }
 
 function sanitizeEmoji(raw) {
@@ -146,24 +222,106 @@ export function doContribute(list) {
     const key = pairKey(a, b);
     const prev = entries.get(key);
     if (prev) {
-      // First write wins; an independent identical claim is a confirmation
-      // (the raw material for phase-3 peer review), a conflicting one is
-      // recorded nowhere — peer review, not last-write, resolves disputes.
       if (prev.r === r) {
+        // Independent identical claim = a peer review passing: one
+        // confirmation (per design review) flips the entry to reviewed.
         prev.c += 1;
+        if (prev.c >= 2 && !prev.rv) {
+          prev.rv = true;
+          reviewPending.delete(key);
+        }
         dirty.add(key);
+      } else if (!prev.rv) {
+        // Conflicting claim against an UNREVIEWED entry: neal is
+        // deterministic, so one of the two claims is wrong — drop the
+        // entry and re-open the pair as a bounty so the network
+        // re-derives it fresh (self-healing beats bookkeeping).
+        entries.delete(key);
+        dirty.delete(key);
+        deletedDirty.add(key);
+        reviewPending.delete(key);
+        if (bounties.size < MAX_BOUNTIES && !bounties.has(key)) {
+          bounties.set(key, { first: a, second: b, at: Date.now(), claimedBy: "", claimedAt: 0 });
+        }
       }
+      // Conflicts against a reviewed entry are ignored: 2+ independent
+      // neal sightings beat a lone dissenter.
       dupes++;
       continue;
     }
     // At capacity: skip the insert but keep scanning — confirmations for
     // already-present keys later in the batch must still land.
     if (entries.size >= MAX_ENTRIES) continue;
-    entries.set(key, { r, e, c: 1 });
+    entries.set(key, { r, e, c: 1, rv: false });
     dirty.add(key);
+    if (reviewPending.size < REVIEW_PENDING_MAX) reviewPending.set(key, null);
+    bounties.delete(key); // a fresh result fulfills any open bounty
     added++;
   }
   return { added, dupes, total: entries.size };
+}
+
+// ── bounty ops ───────────────────────────────────────────────────────
+export function doPostBounties(pairs, now) {
+  // Pairs already cached come straight back as results (no bounty needed);
+  // the rest go on the board.
+  const results = {};
+  let posted = 0;
+  let m = 0;
+  for (const p of pairs) {
+    if (m++ >= MAX_POST) break;
+    if (!Array.isArray(p) || p.length < 2) continue;
+    const a = sanitizeName(p[0]);
+    const b = sanitizeName(p[1]);
+    if (!a || !b) continue;
+    const key = pairKey(a, b);
+    const hit = entries.get(key);
+    if (hit) {
+      results[key] = { r: hit.r, e: hit.e };
+      continue;
+    }
+    if (bounties.has(key) || bounties.size >= MAX_BOUNTIES) continue;
+    bounties.set(key, { first: a, second: b, at: now, claimedBy: "", claimedAt: 0 });
+    posted++;
+  }
+  return { results, posted, open: bounties.size };
+}
+
+export function doTakeBounties(limit, session, snap, now) {
+  // Eligibility: the caller's whole IP must be idle (no running session)
+  // and not cooling down — bounty work must never contest a household's
+  // own runs or a banned IP.
+  if (snap.cooledUntil > now) return { bounties: [], reason: "cooled" };
+  if (snap.running > 0) return { bounties: [], reason: "ip-active" };
+  pruneBounties(now);
+  const out = [];
+  const cap = Math.max(1, Math.min(limit || 5, 20));
+  for (const [key, b] of bounties) {
+    if (out.length >= cap) break;
+    if (b.claimedBy && now - b.claimedAt <= CLAIM_TTL_MS) continue;
+    b.claimedBy = session || "?";
+    b.claimedAt = now;
+    out.push({ kind: "pair", first: b.first, second: b.second });
+  }
+  // Idle capacity beyond open bounties goes to peer review: re-ask neal
+  // about unreviewed entries. The expected answer is never shared — the
+  // reviewer's independent contribute confirms or heals the entry.
+  if (out.length < cap) {
+    for (const [key, claim] of reviewPending) {
+      if (out.length >= cap) break;
+      const entry = entries.get(key);
+      if (!entry || entry.rv) {
+        reviewPending.delete(key);
+        continue;
+      }
+      if (claim && now - claim.at <= CLAIM_TTL_MS) continue;
+      const i = key.indexOf("\0");
+      if (i < 0) continue;
+      reviewPending.set(key, { by: session || "?", at: now });
+      out.push({ kind: "review", first: key.slice(0, i), second: key.slice(i + 1) });
+    }
+  }
+  return { bounties: out };
 }
 
 // ── Upstash snapshot (optional backstop) ─────────────────────────────
@@ -191,7 +349,12 @@ async function snapshotLoad() {
       try {
         const v = JSON.parse(flat[i + 1]);
         if (!entries.has(flat[i]) && entries.size < MAX_ENTRIES) {
-          entries.set(flat[i], { r: v.r ?? null, e: v.e || "", c: v.c || 1 });
+          const c = v.c || 1;
+          const rv = !!v.rv || c >= 2;
+          entries.set(flat[i], { r: v.r ?? null, e: v.e || "", c, rv });
+          if (!rv && reviewPending.size < REVIEW_PENDING_MAX) {
+            reviewPending.set(flat[i], null);
+          }
           snapshot.loaded++;
         }
       } catch {
@@ -202,7 +365,19 @@ async function snapshotLoad() {
 }
 
 async function snapshotFlush() {
-  if (!snapshot.enabled || dirty.size === 0) return;
+  if (!snapshot.enabled) return;
+  if (deletedDirty.size) {
+    const gone = [...deletedDirty];
+    for (let i = 0; i < gone.length; i += 400) {
+      await upstash([["HDEL", SNAP_KEY, ...gone.slice(i, i + 400)]]);
+    }
+    for (const k of gone) deletedDirty.delete(k);
+  }
+  if (dirty.size === 0) {
+    snapshot.lastOkAt = Date.now();
+    snapshot.lastErr = null;
+    return;
+  }
   const keys = [...dirty];
   const FIELDS_PER_HSET = 200;
   const HSETS_PER_CALL = 10;
@@ -292,12 +467,14 @@ function readBody(req) {
 export function makeServer() {
   return http.createServer(async (req, res) => {
     const url = new URL(req.url, "http://relay");
+    const now = Date.now();
     try {
       if (req.method === "OPTIONS") {
         res.writeHead(204, CORS);
         res.end();
         return;
       }
+      if (url.pathname.startsWith("/api/")) touchPresence(req, now);
       if (req.method === "GET" && url.pathname === "/health") {
         send(res, 200, { ok: true, entries: entries.size });
         return;
@@ -305,11 +482,15 @@ export function makeServer() {
       if (req.method === "GET" && url.pathname === "/api/stats") {
         send(res, 200, {
           entries: entries.size,
-          uptimeSec: Math.floor((Date.now() - bootAt) / 1000),
+          reviewed: [...entries.values()].filter((v) => v.rv).length,
+          reviewBacklog: reviewPending.size,
+          openBounties: bounties.size,
+          ipsPresent: presence.size,
+          uptimeSec: Math.floor((now - bootAt) / 1000),
           snapshot: {
             enabled: snapshot.enabled,
             loaded: snapshot.loaded,
-            pendingFlush: dirty.size,
+            pendingFlush: dirty.size + deletedDirty.size,
             lastOkAt: snapshot.lastOkAt,
             lastErr: snapshot.lastErr,
           },
@@ -322,7 +503,7 @@ export function makeServer() {
           send(res, 400, { error: "expected { pairs: [[first, second], ...] }" });
           return;
         }
-        send(res, 200, doLookup(body.pairs));
+        send(res, 200, { ...doLookup(body.pairs), hive: hiveEnvelope(req, now) });
         return;
       }
       if (req.method === "POST" && url.pathname === "/api/contribute") {
@@ -333,7 +514,27 @@ export function makeServer() {
           });
           return;
         }
-        send(res, 200, doContribute(body.entries));
+        send(res, 200, { ...doContribute(body.entries), hive: hiveEnvelope(req, now) });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/bounties") {
+        const body = JSON.parse(await readBody(req));
+        if (!body || !Array.isArray(body.pairs)) {
+          send(res, 400, { error: "expected { pairs: [[first, second], ...] }" });
+          return;
+        }
+        pruneBounties(now);
+        send(res, 200, { ...doPostBounties(body.pairs, now), hive: hiveEnvelope(req, now) });
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/bounties") {
+        const limit = Number(url.searchParams.get("limit") || "5");
+        const session = envStr(req.headers["x-ic-session"] || "");
+        const snap = ipSnapshot(req, now);
+        send(res, 200, {
+          ...doTakeBounties(limit, session, snap, now),
+          hive: { peers: snap.spending, cooledUntil: snap.cooledUntil },
+        });
         return;
       }
       send(res, 404, { error: "not found" });
@@ -348,6 +549,11 @@ export function makeServer() {
 export function _resetForTests() {
   entries.clear();
   dirty.clear();
+  deletedDirty.clear();
+  presence.clear();
+  ipCooldown.clear();
+  bounties.clear();
+  reviewPending.clear();
 }
 
 const isMain = process.argv[1] && import.meta.url.endsWith(process.argv[1].split("/").pop());

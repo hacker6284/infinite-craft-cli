@@ -1,0 +1,1244 @@
+// The sudo JavaScript runtime. Shipped alongside generated modules by sudoc.
+// Implements the semantics pinned in spec/language.md: i64 with explicit
+// Overflow traps (BigInt + range check), floor division with trapping, IEEE
+// float edges, value-semantic deep copies, deep structural equality, and
+// hashable key encodings so Lists (and anything structural) can be Map keys /
+// Set elements. sudo `int` is always BigInt; sudo `float` is always number.
+
+const I64_MIN = -(2n ** 63n);
+const I64_MAX = 2n ** 63n - 1n;
+
+export class SudoTrap extends Error {
+    /** A defined runtime fault (spec §8). Kind is one of the closed set. */
+    constructor(kind, detail = "") {
+        super(detail ? `${kind}: ${detail}` : kind);
+        this.name = "SudoTrap";
+        this.kind = kind;
+        this.detail = detail;
+    }
+}
+
+/** Trap Overflow when a result leaves the 64-bit range (spec §4.1). */
+export function chk(x) {
+    if (x < I64_MIN || x > I64_MAX) {
+        throw new SudoTrap("Overflow");
+    }
+    return x;
+}
+
+/** Floor division (toward -∞); traps DivByZero and MIN/-1 Overflow. */
+export function div(a, b) {
+    if (b === 0n) {
+        throw new SudoTrap("DivByZero");
+    }
+    if (a === I64_MIN && b === -1n) {
+        throw new SudoTrap("Overflow");
+    }
+    // JS BigInt `/` truncates toward zero; convert to floor.
+    let q = a / b;
+    const r = a % b;
+    if (r !== 0n && (a < 0n) !== (b < 0n)) {
+        q -= 1n;
+    }
+    return q;
+}
+
+/** Floor modulo (sign of divisor). */
+export function mod_i64(a, b) {
+    if (b === 0n) {
+        throw new SudoTrap("DivByZero");
+    }
+    // JS BigInt `%` has sign of dividend; convert to floor mod.
+    let r = a % b;
+    if (r !== 0n && (a < 0n) !== (b < 0n)) {
+        r += b;
+    }
+    return r;
+}
+
+export function abs_i64(x) {
+    return chk(x < 0n ? -x : x);
+}
+
+export function neg(x) {
+    return chk(-x);
+}
+
+export function fdiv(a, b) {
+    if (b === 0.0) {
+        if (a === 0.0 || Number.isNaN(a)) {
+            return NaN;
+        }
+        // copysign(inf, a) * copysign(1, b)
+        const sa = Object.is(a, -0) || a < 0 ? -1 : 1;
+        const sb = Object.is(b, -0) || b < 0 ? -1 : 1;
+        return sa * sb * Infinity;
+    }
+    return a / b;
+}
+
+export function fmin(a, b) {
+    if (Number.isNaN(a) || Number.isNaN(b)) {
+        return NaN;
+    }
+    if (a === b) {
+        // min(-0.0, 0.0) == -0.0
+        const sa = Object.is(a, -0) || (a < 0 && !Object.is(a, 0)) ? -1 : 1;
+        const sb = Object.is(b, -0) || (b < 0 && !Object.is(b, 0)) ? -1 : 1;
+        // Prefer the one with the more-negative sign bit when equal in magnitude.
+        if (Object.is(a, -0) || Object.is(b, -0)) {
+            return Object.is(a, -0) ? a : b;
+        }
+        return sa < sb ? a : b;
+    }
+    return a < b ? a : b;
+}
+
+export function fmax(a, b) {
+    if (Number.isNaN(a) || Number.isNaN(b)) {
+        return NaN;
+    }
+    if (a === b) {
+        if (Object.is(a, -0) || Object.is(b, -0)) {
+            return Object.is(a, -0) ? b : a;
+        }
+        return a;
+    }
+    return a > b ? a : b;
+}
+
+export function floor(x) {
+    if (Number.isNaN(x) || !Number.isFinite(x)) {
+        return x;
+    }
+    return Math.floor(x);
+}
+
+export function ceil(x) {
+    if (Number.isNaN(x) || !Number.isFinite(x)) {
+        return x;
+    }
+    return Math.ceil(x);
+}
+
+/** Ties away from zero (spec §4.3), not JS Math.round (half toward +Inf).
+ *  Truncates first, then compares the fractional distance to 0.5 —
+ *  never adds 0.5 before rounding, which would double-round values
+ *  just below a half boundary (e.g. 0.49999999999999994) up past the
+ *  tie. Also preserves the sign of a zero result/input (round(-0.0)
+ *  must stay -0.0). */
+export function round_half_away(x) {
+    if (Number.isNaN(x) || !Number.isFinite(x)) {
+        return x;
+    }
+    if (x === 0) {
+        return x;
+    }
+    const t = x >= 0 ? floor(x) : ceil(x);
+    const d = Math.abs(x - t);
+    if (d < 0.5) {
+        return t;
+    }
+    return t + (x < 0 ? -1 : 1);
+}
+
+export function sqrt(x) {
+    if (Number.isNaN(x) || x < 0.0) {
+        return NaN;
+    }
+    return Math.sqrt(x);
+}
+
+export function int_of(x) {
+    if (Number.isNaN(x) || !Number.isFinite(x)) {
+        throw new SudoTrap("InvalidConvert", "NaN or infinity to int");
+    }
+    const t = Math.trunc(x);
+    // Convert then range-check in BigInt space (robust for huge finite doubles).
+    const bi = BigInt(t);
+    if (bi < I64_MIN || bi > I64_MAX) {
+        throw new SudoTrap("InvalidConvert", "float out of int range");
+    }
+    return bi;
+}
+
+// ---- Option / Result -------------------------------------------------------
+
+export class Some {
+    constructor(value) {
+        this.value = value;
+    }
+}
+
+export class NoneOpt {
+    constructor() {}
+}
+
+export const NONE = new NoneOpt();
+
+export class Ok {
+    constructor(value) {
+        this.value = value;
+    }
+}
+
+export class Err {
+    constructor(error) {
+        this.error = error;
+    }
+}
+
+export function is_some(o) {
+    return o instanceof Some;
+}
+
+export function is_ok(r) {
+    return r instanceof Ok;
+}
+
+export function is_err(r) {
+    return r instanceof Err;
+}
+
+export function is_none(o) {
+    return o instanceof NoneOpt;
+}
+
+export function unwrap(o) {
+    if (o instanceof Some) {
+        return o.value;
+    }
+    if (o instanceof Ok) {
+        return o.value;
+    }
+    throw new SudoTrap("UnwrapFailed");
+}
+
+export function get_or(o, default_) {
+    if (o instanceof Some) {
+        return o.value;
+    }
+    if (o instanceof Ok) {
+        return o.value;
+    }
+    return default_;
+}
+
+// ---- value semantics -------------------------------------------------------
+//
+// Every mutable composite (list including text, record, map, set) is a
+// copy-on-write handle. `dup` is an O(1) share. A write forks that object
+// if it has a second referent. Forking a parent `_uniq`s by `dup`ing each
+// child so their rc records the new alias. Tuples stay plain immutable
+// arrays; Option/Result/enums have no in-place mutation path.
+
+let _DUP_COUNTING = false;
+const _DUP_STATS = { list: 0, leaves: 0, list_by_len: Object.create(null), tuple: 0 };
+
+export function reset_dup_stats() {
+    _DUP_COUNTING = true;
+    _DUP_STATS.list = 0;
+    _DUP_STATS.leaves = 0;
+    _DUP_STATS.list_by_len = Object.create(null);
+    _DUP_STATS.tuple = 0;
+}
+
+export function dup_stats() {
+    return {
+        list: _DUP_STATS.list,
+        leaves: _DUP_STATS.leaves,
+        list_by_len: { ..._DUP_STATS.list_by_len },
+        tuple: _DUP_STATS.tuple,
+    };
+}
+
+function _count_list_dup(n) {
+    if (!_DUP_COUNTING) {
+        return;
+    }
+    _DUP_STATS.list += 1;
+    const key = String(n);
+    _DUP_STATS.list_by_len[key] = (_DUP_STATS.list_by_len[key] || 0) + 1;
+}
+
+export class CowList {
+    /** Copy-on-write list. Two wrappers may share one backing array. */
+    constructor(data, box) {
+        if (box) {
+            this._box = box;
+        } else if (Array.isArray(data)) {
+            this._box = { d: data, rc: 1 };
+        } else if (data == null) {
+            this._box = { d: [], rc: 1 };
+        } else {
+            this._box = { d: Array.from(data), rc: 1 };
+        }
+    }
+
+    share() {
+        this._box.rc += 1;
+        return new CowList(undefined, this._box);
+    }
+
+    _uniq() {
+        if (this._box.rc > 1) {
+            this._box.rc -= 1;
+            this._box = { d: this._box.d.map(dup), rc: 1 };
+        }
+    }
+
+    get length() {
+        return this._box.d.length;
+    }
+
+    [Symbol.iterator]() {
+        return this._box.d[Symbol.iterator]();
+    }
+
+    push(v) {
+        this._uniq();
+        return this._box.d.push(v);
+    }
+
+    concat(other) {
+        const od = other instanceof CowList ? other._box.d : other;
+        return new CowList(this._box.d.map(dup).concat(Array.from(od, dup)));
+    }
+
+    slice() {
+        // Snapshot for `for-in`: share so a later write forks the original.
+        return this.share();
+    }
+
+    map(fn) {
+        return this._box.d.map(fn);
+    }
+}
+
+export function lst(xs) {
+    if (xs == null) {
+        return new CowList();
+    }
+    if (xs instanceof CowList) {
+        return xs;
+    }
+    return new CowList(Array.isArray(xs) ? xs : Array.from(xs));
+}
+
+const COW_REC_HANDLER = {
+    get(target, prop) {
+        if (prop === "_box" || prop === "_sudo_share" || prop === "_sudo_uniq") {
+            const v = target[prop];
+            return typeof v === "function" ? v.bind(target) : v;
+        }
+        return target._box.d[prop];
+    },
+    set(target, prop, value) {
+        if (prop === "_box") {
+            target._box = value;
+            return true;
+        }
+        target._sudo_uniq();
+        target._box.d[prop] = value;
+        return true;
+    },
+};
+
+export class CowRec {
+    /** Copy-on-write record. `dup` is O(1) share; a field write forks. */
+    constructor(obj, box) {
+        this._box = box || { d: obj, rc: 1 };
+        return new Proxy(this, COW_REC_HANDLER);
+    }
+
+    _sudo_share() {
+        this._box.rc += 1;
+        return new CowRec(undefined, this._box);
+    }
+
+    _sudo_uniq() {
+        if (this._box.rc > 1) {
+            this._box.rc -= 1;
+            const old = this._box.d;
+            const fields = old.constructor._sudoFields || [];
+            const neu = new old.constructor(...fields.map((f) => dup(old[f])));
+            this._box = { d: neu, rc: 1 };
+        }
+    }
+}
+
+export function rec(obj) {
+    if (obj instanceof CowRec) {
+        return obj;
+    }
+    if (obj && obj.constructor && obj.constructor._sudoKind && obj.constructor._sudoKind[0] === "r") {
+        const fields = obj.constructor._sudoFields || [];
+        const cloned = new obj.constructor(...fields.map((f) => dup(obj[f])));
+        return new CowRec(cloned);
+    }
+    return obj;
+}
+
+function asRec(obj) {
+    return obj instanceof CowRec ? obj : rec(obj);
+}
+
+export function field_mut(obj, name) {
+    obj = asRec(obj);
+    const shared = obj._box.rc > 1;
+    obj._sudo_uniq();
+    if (shared) {
+        obj._box.d[name] = dup(obj._box.d[name]);
+    }
+    return obj._box.d[name];
+}
+
+function _elems(a) {
+    return a instanceof CowList ? a._box.d : a;
+}
+
+export function dup(v) {
+    if (v instanceof CowList) {
+        _count_list_dup(v.length);
+        return v.share();
+    }
+    if (v instanceof CowRec) {
+        return v._sudo_share();
+    }
+    if (Array.isArray(v)) {
+        if (_DUP_COUNTING) {
+            _DUP_STATS.tuple += 1;
+        }
+        return v.map(dup);
+    }
+    if (v instanceof SudoMap) {
+        return v.share();
+    }
+    if (v instanceof SudoSet) {
+        return v.share();
+    }
+    if (v instanceof Some) {
+        return new Some(dup(v.value));
+    }
+    if (v instanceof Ok) {
+        return new Ok(dup(v.value));
+    }
+    if (v instanceof Err) {
+        return new Err(dup(v.error));
+    }
+    // Bare records wrap; enum variants still reconstruct (no in-place mutation).
+    if (v && typeof v === "object" && v.constructor && v.constructor._sudoKind) {
+        if (v.constructor._sudoKind[0] === "r") {
+            return rec(v);
+        }
+        const cls = v.constructor;
+        const fields = cls._sudoFields || [];
+        return new cls(...fields.map((f) => dup(v[f])));
+    }
+    if (
+        _DUP_COUNTING &&
+        (typeof v === "bigint" || typeof v === "number" || typeof v === "boolean" || v == null)
+    ) {
+        _DUP_STATS.leaves += 1;
+    }
+    return v;
+}
+
+/**
+ * Deep structural equality with IEEE float semantics (NaN != NaN).
+ * Walks structures explicitly — never relies on === for composites.
+ * Bool is JS boolean, int is BigInt; they never conflate, so no bool-vs-int
+ * identity branch is needed (unlike Python where bool is a subclass of int).
+ */
+export function eq(a, b) {
+    if (typeof a === "number" || typeof b === "number") {
+        return typeof a === "number" && typeof b === "number" && a === b;
+    }
+    if (typeof a === "boolean" || typeof b === "boolean") {
+        return a === b;
+    }
+    if (typeof a === "bigint" && typeof b === "bigint") {
+        return a === b;
+    }
+    if (a instanceof CowRec) {
+        a = a._box.d;
+    }
+    if (b instanceof CowRec) {
+        b = b._box.d;
+    }
+    if (a instanceof CowList) {
+        a = a._box.d;
+    }
+    if (b instanceof CowList) {
+        b = b._box.d;
+    }
+    if (Array.isArray(a) && Array.isArray(b)) {
+        if (a.length !== b.length) {
+            return false;
+        }
+        for (let i = 0; i < a.length; i++) {
+            if (!eq(a[i], b[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (a instanceof SudoMap && b instanceof SudoMap) {
+        if (a.size !== b.size) {
+            return false;
+        }
+        for (const [k, v] of a.pairs()) {
+            const other = b.get_opt(k);
+            if (other instanceof NoneOpt || !eq(v, other.value)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (a instanceof SudoSet && b instanceof SudoSet) {
+        if (a.size !== b.size) {
+            return false;
+        }
+        for (const x of a.items_list()) {
+            if (!b.has(x)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (a instanceof NoneOpt && b instanceof NoneOpt) {
+        return true;
+    }
+    if (a instanceof Some && b instanceof Some) {
+        return eq(a.value, b.value);
+    }
+    if (a instanceof Ok && b instanceof Ok) {
+        return eq(a.value, b.value);
+    }
+    if (a instanceof Err && b instanceof Err) {
+        return eq(a.error, b.error);
+    }
+    if (
+        a &&
+        b &&
+        typeof a === "object" &&
+        typeof b === "object" &&
+        a.constructor &&
+        a.constructor._sudoKind &&
+        b.constructor &&
+        b.constructor._sudoKind
+    ) {
+        if (a.constructor !== b.constructor) {
+            return false;
+        }
+        const fields = a.constructor._sudoFields || [];
+        for (const f of fields) {
+            if (!eq(a[f], b[f])) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Immutable, comparable encoding of a (hashable-typed) sudo value.
+ * Stringified so native Map/Set can key by structural equality.
+ * Floats are never valid map/set keys per backend-guide.md §4.8.
+ */
+export function key_form(v) {
+    return JSON.stringify(key_form_raw(v));
+}
+
+function key_form_raw(v) {
+    if (typeof v === "bigint") {
+        return ["i", v.toString()];
+    }
+    if (typeof v === "boolean") {
+        return ["b", v];
+    }
+    if (typeof v === "number") {
+        // Not expected as a key; encode stably if seen.
+        if (Number.isNaN(v)) {
+            return ["f", "NaN"];
+        }
+        if (!Number.isFinite(v)) {
+            return ["f", v > 0 ? "Inf" : "-Inf"];
+        }
+        if (Object.is(v, -0)) {
+            return ["f", "-0"];
+        }
+        return ["f", String(v)];
+    }
+    if (v instanceof CowRec) {
+        v = v._box.d;
+    }
+    if (v instanceof CowList) {
+        return ["a", v._box.d.map(key_form_raw)];
+    }
+    if (Array.isArray(v)) {
+        return ["a", v.map(key_form_raw)];
+    }
+    if (v instanceof Some) {
+        return ["Some", key_form_raw(v.value)];
+    }
+    if (v instanceof NoneOpt) {
+        return ["None"];
+    }
+    if (v instanceof Ok) {
+        return ["Ok", key_form_raw(v.value)];
+    }
+    if (v instanceof Err) {
+        return ["Err", key_form_raw(v.error)];
+    }
+    if (v && typeof v === "object" && v.constructor && v.constructor._sudoKind) {
+        const fields = v.constructor._sudoFields || [];
+        return [v.constructor.name, ...fields.map((f) => key_form_raw(v[f]))];
+    }
+    return ["?", String(v)];
+}
+
+// ---- containers ------------------------------------------------------------
+
+/** Bounds-check in BigInt space, then Number() for the array index. */
+function idx(a, i) {
+    const n = BigInt(a.length);
+    if (i < 0n || i >= n) {
+        throw new SudoTrap("OutOfBounds", `index ${i} of length ${a.length}`);
+    }
+    return Number(i);
+}
+
+export function at(a, i) {
+    return _elems(a)[idx(a, i)];
+}
+
+export function at_mut(a, i) {
+    const shared = a instanceof CowList && a._box.rc > 1;
+    if (a instanceof CowList) {
+        a._uniq();
+        const j = idx(a, i);
+        if (shared) {
+            a._box.d[j] = dup(a._box.d[j]);
+        }
+        return a._box.d[j];
+    }
+    return a[idx(a, i)];
+}
+
+export function put(a, i, v) {
+    if (a instanceof CowList) {
+        a._uniq();
+        a._box.d[idx(a, i)] = v;
+        return;
+    }
+    a[idx(a, i)] = v;
+}
+
+export function pop(a) {
+    if (a instanceof CowList) {
+        a._uniq();
+        a = a._box.d;
+    }
+    if (a.length === 0) {
+        throw new SudoTrap("OutOfBounds", "pop from empty list");
+    }
+    return a.pop();
+}
+
+export function insert(a, i, v) {
+    if (a instanceof CowList) {
+        a._uniq();
+        a = a._box.d;
+    }
+    const n = BigInt(a.length);
+    if (i < 0n || i > n) {
+        throw new SudoTrap("OutOfBounds", `insert at ${i} of length ${a.length}`);
+    }
+    a.splice(Number(i), 0, v);
+}
+
+export function remove_at(a, i) {
+    if (a instanceof CowList) {
+        a._uniq();
+        a = a._box.d;
+    }
+    const j = idx(a, i);
+    return a.splice(j, 1)[0];
+}
+
+export function swap(a, i, j) {
+    if (a instanceof CowList) {
+        a._uniq();
+        a = a._box.d;
+    }
+    const n = BigInt(a.length);
+    if (i < 0n || i >= n || j < 0n || j >= n) {
+        throw new SudoTrap("OutOfBounds", `swap ${i},${j} of length ${a.length}`);
+    }
+    const ii = Number(i);
+    const jj = Number(j);
+    const tmp = a[ii];
+    a[ii] = a[jj];
+    a[jj] = tmp;
+}
+
+function sort_key(x) {
+    if (typeof x === "number") {
+        if (Number.isNaN(x)) {
+            return [2, 0, 0];
+        }
+        const sign = Object.is(x, -0) || x < 0 ? -1 : 1;
+        return [1, x, sign];
+    }
+    // BigInt / other: compare via value; secondary 0.
+    return [1, x, 0];
+}
+
+/** Ascending stable sort; floats order NaN last, -0.0 before 0.0. */
+export function sort(a) {
+    if (a instanceof CowList) {
+        a._uniq();
+        a = a._box.d;
+    }
+    a.sort((x, y) => {
+        const kx = sort_key(x);
+        const ky = sort_key(y);
+        if (kx[0] !== ky[0]) {
+            return kx[0] < ky[0] ? -1 : 1;
+        }
+        // value compare
+        if (kx[1] < ky[1]) {
+            return -1;
+        }
+        if (kx[1] > ky[1]) {
+            return 1;
+        }
+        // sign tie-break for ±0
+        if (kx[2] < ky[2]) {
+            return -1;
+        }
+        if (kx[2] > ky[2]) {
+            return 1;
+        }
+        return 0;
+    });
+}
+
+export function filled(n, v) {
+    if (n < 0n) {
+        throw new SudoTrap("InvalidArg", `filled(${n})`);
+    }
+    // Cap to a safe Number length; n is non-negative BigInt within i64.
+    const count = Number(n);
+    const out = new Array(count);
+    for (let i = 0; i < count; i++) {
+        out[i] = dup(v);
+    }
+    return new CowList(out);
+}
+
+/** Text literal: already a list of Unicode scalar BigInt values from the IR. */
+export function text_from_scalars(scalars) {
+    return new CowList(scalars.slice());
+}
+
+/** Decode a compile-time-emitted JS string literal into Unicode scalar BigInts. */
+export function txt(s) {
+    const out = [];
+    for (const ch of s) {
+        out.push(BigInt(ch.codePointAt(0)));
+    }
+    return new CowList(out);
+}
+
+export class SudoMap {
+    /**
+     * Insertion-ordered (Map-backed) — order is unspecified by the language.
+     * Keys are stored by structural key_form so Lists and records can be keys;
+     * original key values are retained for iteration. Copy-on-write like
+     * CowList: `dup` is a share; a write forks the map.
+     */
+    constructor(box) {
+        this._box = box || { d: new Map(), rc: 1 };
+    }
+
+    share() {
+        this._box.rc += 1;
+        return new SudoMap(this._box);
+    }
+
+    _uniq() {
+        if (this._box.rc > 1) {
+            this._box.rc -= 1;
+            const next = new Map();
+            // Keys and values are children: share each so a later write
+            // through one map cannot leak into the other.
+            for (const [k, pair] of this._box.d) {
+                next.set(k, [dup(pair[0]), dup(pair[1])]);
+            }
+            this._box = { d: next, rc: 1 };
+        }
+    }
+
+    get _d() {
+        return this._box.d;
+    }
+
+    get size() {
+        return this._d.size;
+    }
+
+    has(k) {
+        return this._d.has(key_form(k));
+    }
+
+    get(k) {
+        const kf = key_form(k);
+        if (!this._d.has(kf)) {
+            throw new SudoTrap("KeyMissing");
+        }
+        return this._d.get(kf)[1];
+    }
+
+    set(k, v) {
+        this._uniq();
+        this._d.set(key_form(k), [dup(k), v]);
+    }
+
+    get_opt(k) {
+        const kf = key_form(k);
+        if (this._d.has(kf)) {
+            return new Some(this._d.get(kf)[1]);
+        }
+        return NONE;
+    }
+
+    delete(k) {
+        this._uniq();
+        const kf = key_form(k);
+        if (this._d.has(kf)) {
+            this._d.delete(kf);
+            return true;
+        }
+        return false;
+    }
+
+    keys_list() {
+        const out = [];
+        for (const [k] of this._d.values()) {
+            out.push(dup(k));
+        }
+        return new CowList(out);
+    }
+
+    values_list() {
+        const out = [];
+        for (const [, v] of this._d.values()) {
+            out.push(dup(v));
+        }
+        return new CowList(out);
+    }
+
+    pairs() {
+        const out = [];
+        for (const [k, v] of this._d.values()) {
+            out.push([k, v]);
+        }
+        return out;
+    }
+}
+
+export function map_at_mut(m, k) {
+    const shared = m._box.rc > 1;
+    m._uniq();
+    const kf = key_form(k);
+    if (!m._d.has(kf)) {
+        throw new SudoTrap("KeyMissing");
+    }
+    if (shared) {
+        const pair = m._d.get(kf);
+        m._d.set(kf, [pair[0], dup(pair[1])]);
+    }
+    return m._d.get(kf)[1];
+}
+
+export class SudoSet {
+    constructor(box) {
+        this._box = box || { d: new Map(), rc: 1 };
+    }
+
+    share() {
+        this._box.rc += 1;
+        return new SudoSet(this._box);
+    }
+
+    _uniq() {
+        if (this._box.rc > 1) {
+            this._box.rc -= 1;
+            const next = new Map();
+            for (const [k, v] of this._box.d) {
+                next.set(k, dup(v));
+            }
+            this._box = { d: next, rc: 1 };
+        }
+    }
+
+    get _d() {
+        return this._box.d;
+    }
+
+    get size() {
+        return this._d.size;
+    }
+
+    has(v) {
+        return this._d.has(key_form(v));
+    }
+
+    add(v) {
+        this._uniq();
+        const kf = key_form(v);
+        if (this._d.has(kf)) {
+            return false;
+        }
+        this._d.set(kf, dup(v));
+        return true;
+    }
+
+    remove(v) {
+        this._uniq();
+        const kf = key_form(v);
+        if (this._d.has(kf)) {
+            this._d.delete(kf);
+            return true;
+        }
+        return false;
+    }
+
+    items_list() {
+        const out = [];
+        for (const v of this._d.values()) {
+            out.push(dup(v));
+        }
+        return new CowList(out);
+    }
+}
+
+// ---- tests -----------------------------------------------------------------
+
+export function sudo_assert(cond, line) {
+    if (!cond) {
+        throw new SudoTrap("AssertFailed", `line ${line}`);
+    }
+}
+
+/**
+ * Canonical display serialization (lockstep.md §4). Diagnostic-only.
+ * Shape mirrors Python's canon for shared diagnostic value.
+ * Integral floats render as "N.0" to match Python's repr(1.0) more closely.
+ */
+export function canon(v) {
+    if (typeof v === "boolean") {
+        return v ? "true" : "false";
+    }
+    if (typeof v === "bigint") {
+        return v.toString();
+    }
+    if (typeof v === "number") {
+        let s;
+        if (Number.isNaN(v)) {
+            s = "NaN";
+        } else if (!Number.isFinite(v)) {
+            s = v > 0 ? "Inf" : "-Inf";
+        } else if (Object.is(v, -0)) {
+            s = "-0.0";
+        } else {
+            s = String(v);
+            // Force trailing .0 for integral floats (Python repr(1.0) == "1.0").
+            if (/^-?\d+$/.test(s)) {
+                s = s + ".0";
+            }
+        }
+        return `{"f": "${s}"}`;
+    }
+    if (v instanceof CowRec) {
+        v = v._box.d;
+    }
+    if (v instanceof CowList) {
+        return "[" + v._box.d.map(canon).join(", ") + "]";
+    }
+    if (Array.isArray(v)) {
+        return "[" + v.map(canon).join(", ") + "]";
+    }
+    if (v instanceof SudoMap) {
+        const pairs = v
+            .pairs()
+            .map(([k, x]) => `[${canon(k)}, ${canon(x)}]`)
+            .join(", ");
+        return `{"m": [${pairs}]}`;
+    }
+    if (v instanceof SudoSet) {
+        return `{"s": [${v.items_list().map(canon).join(", ")}]}`;
+    }
+    if (v instanceof Some) {
+        return `{"e": "Option.Some", "v": [${canon(v.value)}]}`;
+    }
+    if (v instanceof NoneOpt) {
+        return `{"e": "Option.None"}`;
+    }
+    if (v instanceof Ok) {
+        return `{"e": "Result.Ok", "v": [${canon(v.value)}]}`;
+    }
+    if (v instanceof Err) {
+        return `{"e": "Result.Err", "v": [${canon(v.error)}]}`;
+    }
+    if (v && typeof v === "object" && v.constructor && v.constructor._sudoKind) {
+        const [kind, name] = v.constructor._sudoKind;
+        const fields = v.constructor._sudoFields || [];
+        const vals = fields.map((f) => canon(v[f])).join(", ");
+        if (vals) {
+            return `{"${kind}": "${name}", "v": [${vals}]}`;
+        }
+        return `{"${kind}": "${name}"}`;
+    }
+    return String(v);
+}
+
+export function sudo_assert_eq(l, r, line) {
+    if (!eq(l, r)) {
+        throw new SudoTrap("AssertFailed", `line ${line}: ${canon(l)} != ${canon(r)}`);
+    }
+}
+
+/**
+ * Run every test; print TAP-ish lines; return exit code.
+ * `tests` is an array of [name, fn] pairs in declaration order.
+ */
+export function run_tests(tests) {
+    let failures = 0;
+    for (let i = 0; i < tests.length; i++) {
+        const [name, fn] = tests[i];
+        try {
+            fn();
+            console.log(`ok ${i + 1} - ${name}`);
+        } catch (e) {
+            failures += 1;
+            if (e instanceof SudoTrap) {
+                const detail = e.detail ? `: ${e.detail}` : "";
+                console.log(`not ok ${i + 1} - ${name} [${e.kind}${detail}]`);
+            } else if (
+                e instanceof RangeError &&
+                typeof e.message === "string" &&
+                e.message.toLowerCase().includes("call stack")
+            ) {
+                console.log(`not ok ${i + 1} - ${name} [StackOverflow]`);
+            } else {
+                const msg = e && e.message ? e.message : String(e);
+                console.log(`not ok ${i + 1} - ${name} [Unknown: ${msg}]`);
+            }
+        }
+    }
+    console.log(`# ${tests.length - failures}/${tests.length} passed`);
+    return failures ? 1 : 0;
+}
+
+// ---- host boundary (lockstep.md §5.4) --------------------------------------
+
+export class SudoError extends Error {
+    /** A sudo Result Err surfaced to the host. */
+    constructor(payload) {
+        super(String(payload));
+        this.name = "SudoError";
+        this.payload = payload;
+    }
+}
+
+/** Host → internal int: number (safe integer) or bigint (i64-checked). */
+export function host_int(x) {
+    if (typeof x === "bigint") {
+        if (x < I64_MIN || x > I64_MAX) {
+            throw new RangeError("int out of 64-bit range");
+        }
+        return x;
+    }
+    if (typeof x === "number") {
+        if (!Number.isInteger(x)) {
+            throw new TypeError("expected an integer number");
+        }
+        if (!Number.isSafeInteger(x)) {
+            throw new RangeError("int exceeds Number.MAX_SAFE_INTEGER");
+        }
+        return BigInt(x);
+    }
+    throw new TypeError("expected number or bigint");
+}
+
+const MAX_SAFE_BI = BigInt(Number.MAX_SAFE_INTEGER);
+const MIN_SAFE_BI = -MAX_SAFE_BI;
+
+/** Internal BigInt → host number; throws if outside ±(2^53 − 1). */
+export function int_out(x) {
+    if (x < MIN_SAFE_BI || x > MAX_SAFE_BI) {
+        throw new RangeError("int exceeds Number.MAX_SAFE_INTEGER");
+    }
+    return Number(x);
+}
+
+export function host_float(x) {
+    if (typeof x !== "number") {
+        throw new TypeError("expected a number");
+    }
+    return x;
+}
+
+export function host_bool(x) {
+    if (typeof x !== "boolean") {
+        throw new TypeError("expected a boolean");
+    }
+    return x;
+}
+
+/**
+ * Host string → list of Unicode scalar BigInt values.
+ * Lone (unpaired) surrogates are InvalidConvert traps, not TypeErrors.
+ */
+export function host_text(s) {
+    if (typeof s !== "string") {
+        throw new TypeError("expected a string");
+    }
+    const out = [];
+    for (let i = 0; i < s.length; i++) {
+        const c = s.codePointAt(i);
+        if (c >= 0xD800 && c <= 0xDFFF) {
+            const hex = c.toString(16).toUpperCase().padStart(4, "0");
+            throw new SudoTrap(
+                "InvalidConvert",
+                `lone surrogate U+${hex} at index ${i}`,
+            );
+        }
+        out.push(BigInt(c));
+        if (c > 0xFFFF) {
+            i++;
+        }
+    }
+    return new CowList(out);
+}
+
+/** Internal scalar list → host string. */
+export function text_str(v) {
+    let s = "";
+    for (const c of v) {
+        s += String.fromCodePoint(Number(c));
+    }
+    return s;
+}
+
+export function host_list(x, conv) {
+    if (typeof x === "string" || typeof x?.[Symbol.iterator] !== "function") {
+        throw new TypeError("expected an iterable");
+    }
+    const out = [];
+    for (const v of x) {
+        out.push(conv(v));
+    }
+    return new CowList(out);
+}
+
+export function host_set(x, conv) {
+    if (typeof x === "string" || typeof x?.[Symbol.iterator] !== "function") {
+        throw new TypeError("expected an iterable");
+    }
+    const s = new SudoSet();
+    for (const v of x) {
+        s.add(conv(v));
+    }
+    return s;
+}
+
+export function host_map(x, kconv, vconv) {
+    const m = new SudoMap();
+    if (x instanceof Map) {
+        for (const [k, v] of x) {
+            m.set(kconv(k), vconv(v));
+        }
+    } else if (x && typeof x === "object") {
+        for (const k of Object.keys(x)) {
+            m.set(kconv(k), vconv(x[k]));
+        }
+    } else {
+        throw new TypeError("expected a Map or plain object");
+    }
+    return m;
+}
+
+export function host_tuple(x, n, convs) {
+    if (typeof x?.[Symbol.iterator] !== "function") {
+        throw new TypeError("expected an iterable");
+    }
+    const arr = Array.from(x);
+    if (arr.length !== n) {
+        throw new TypeError(`expected a ${n}-tuple, got length ${arr.length}`);
+    }
+    return arr.map((v, i) => convs[i](v));
+}
+
+export function out_option(o, conv) {
+    return o instanceof NoneOpt ? null : conv(o.value);
+}
+
+export function out_result(r, okconv, errconv) {
+    if (r instanceof Ok) {
+        return okconv(r.value);
+    }
+    throw new SudoError(errconv(r.error));
+}
+
+export function out_map(m, kconv, vconv) {
+    const out = new Map();
+    for (const [k, v] of m.pairs()) {
+        out.set(kconv(k), vconv(v));
+    }
+    return out;
+}
+
+export function out_set(s, conv) {
+    const out = new Set();
+    for (const v of s.items_list()) {
+        out.add(conv(v));
+    }
+    return out;
+}
+
+export function writeback_list(host, fresh, conv) {
+    host.length = 0;
+    for (const v of fresh) {
+        host.push(conv(v));
+    }
+}
+
+export function writeback_map(host, fresh, kconv, vconv) {
+    if (host instanceof Map) {
+        host.clear();
+        for (const [k, v] of fresh.pairs()) {
+            host.set(kconv(k), vconv(v));
+        }
+    } else if (host && typeof host === "object") {
+        for (const k of Object.keys(host)) {
+            delete host[k];
+        }
+        for (const [k, v] of fresh.pairs()) {
+            host[kconv(k)] = vconv(v);
+        }
+    } else {
+        throw new TypeError("expected a Map or plain object");
+    }
+}
+
+export function writeback_set(host, fresh, conv) {
+    host.clear();
+    for (const v of fresh.items_list()) {
+        host.add(conv(v));
+    }
+}

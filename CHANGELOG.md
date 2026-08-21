@@ -1,5 +1,39 @@
 # Changelog
 
+## [2.3.0] - 2026-08-21
+
+### Added
+- **Bounty board** — rate-limited bulk runs post their overflow pairs to
+  the relay; idle clients elsewhere work them within their own rate limit
+  into the shared cache, and the originating run re-sweeps and absorbs the
+  results for free. The neal.fun per-IP limit is now pooled across willing
+  users. Serving the hive while idle is on by default and symmetric.
+- **Peer review** — a cache entry becomes trusted only after a second
+  independent client re-asks neal and confirms it (review bounties always
+  hit neal, never local cache). A conflicting claim against an unreviewed
+  entry drops it and re-opens the pair, so the network self-heals rather
+  than trusting last-writer.
+- **Same-IP budget split** — the relay reports how many sessions on your
+  public IP are spending neal budget, and each client divides its per-IP
+  window by that count *proactively*. Two clients behind one router each
+  settle to their fair share before hitting a 429, not after. Bounty work
+  is offered only when no session on the IP is running.
+- **429 cooldown** — neal's 429 is treated as the hours-long IP ban it is:
+  the client stands down from all neal requests (hive lookups still work),
+  backs off with doubling strikes, and broadcasts the cooldown to every
+  session on its IP.
+- **Rate-bar hive indicators** — a pulsing 🐝 counter beside the bar for
+  pairs the hive served you (no slots spent), honey-gold `▒` cells inside
+  the bar for slots lent to bounty work, and a cooldown note when banned.
+  `/relay status` reports hits, contributions, bounties worked, the budget
+  split, and cooldown.
+
+### Changed
+- The relay now runs on the shared sudo kernel (vendored generated JS,
+  guarded by a freshness test) instead of hand-rolled canonicalization —
+  closing the kernel↔relay divergence class that the 2.2.0 stress round
+  flagged for name length.
+
 ## [2.2.0] - 2026-08-21
 
 ### Added

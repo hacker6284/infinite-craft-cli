@@ -68,6 +68,9 @@ def make_mock_client():
     # coroutine child (would break chrome paint unpack).
     limiter = MagicMock()
     limiter.chrome_snapshot.return_value = (60, 60, 1000)
+    limiter.chrome_snapshot_split.return_value = (60, 60, 1000, 0)
+    limiter.base_max = 60
+    limiter.fleet_used.return_value = 0
     client._rate_limiter = limiter
     return client
 
