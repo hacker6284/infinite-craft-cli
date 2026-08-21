@@ -97,6 +97,7 @@ const metrics = {
   healed: 0, // entries dropped by a conflicting claim
   bountiesPosted: 0,
   bountiesTaken: 0,
+  reviewsTaken: 0, // peer-review bounties handed to idle clients
 };
 // ip → epoch-ms until which the IP is cooling down (one session tripped a
 // neal 429 — an IP-scoped, hours-long ban). Broadcast to all sessions.
@@ -447,6 +448,7 @@ export function doTakeBounties(limit, session, snap, now) {
       const i = key.indexOf("\0");
       if (i < 0) continue;
       reviewPending.set(key, { by: session || "?", at: now });
+      metrics.reviewsTaken++;
       out.push({ kind: "review", first: key.slice(0, i), second: key.slice(i + 1) });
     }
   }
@@ -560,6 +562,7 @@ function dashboardHtml(s) {
     ["Confirmations", m.confirmed.toLocaleString()],
     ["Self-healed", m.healed.toLocaleString()],
     ["Bounties posted / taken", `${m.bountiesPosted.toLocaleString()} / ${m.bountiesTaken.toLocaleString()}`],
+    ["Reviews served", m.reviewsTaken.toLocaleString()],
     ["Snapshot", s.snapshot.enabled ? (s.snapshot.lastErr ? "error: " + s.snapshot.lastErr : "ok") : "disabled"],
     ["Uptime", `${Math.floor(s.uptimeSec / 3600)}h ${Math.floor((s.uptimeSec % 3600) / 60)}m`],
   ];

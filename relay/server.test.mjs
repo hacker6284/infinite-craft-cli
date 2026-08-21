@@ -375,3 +375,30 @@ test("no snapshot backend → no dirty/deleted accumulation (R6)", async () => {
     server.close();
   }
 });
+
+test("review bounties are counted in reviewsTaken (metrics undercount fix)", async () => {
+  _resetForTests();
+  const server = makeServer();
+  await new Promise((resolve) => server.listen(0, resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const H = (s, st) => ({ "Content-Type": "application/json", "x-ic-session": s, "x-ic-state": st });
+  try {
+    // Seed one unreviewed entry → it becomes a review bounty. No pair bounties.
+    await fetch(`${base}/api/contribute`, { method: "POST", headers: H("seed", "idle"), body: JSON.stringify({ entries: [["Fire", "Water", "Steam"]] }) });
+    let s = await (await fetch(`${base}/api/stats`)).json();
+    assert.equal(s.metrics.bountiesTaken, 0);
+    assert.equal(s.metrics.reviewsTaken, 0);
+    // An idle client polls → gets the review bounty (no pair bounties exist).
+    const take = await (await fetch(`${base}/api/bounties?limit=5`, { headers: H("helper", "idle") })).json();
+    assert.equal(take.bounties.length, 1);
+    assert.equal(take.bounties[0].kind, "review");
+    s = await (await fetch(`${base}/api/stats`)).json();
+    assert.equal(s.metrics.bountiesTaken, 0, "no pair bounty was served");
+    assert.equal(s.metrics.reviewsTaken, 1, "the review handout is now counted");
+    // Dashboard surfaces it.
+    const html = await (await fetch(`${base}/api/dashboard`)).text();
+    assert.ok(html.includes("Reviews served"));
+  } finally {
+    server.close();
+  }
+});
