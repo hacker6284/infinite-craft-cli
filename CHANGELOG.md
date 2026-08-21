@@ -1,5 +1,26 @@
 # Changelog
 
+## [2.1.1] - 2026-08-21
+
+### Fixed
+- **The GitHub Pages site was a release behind reality** — it still
+  documented the removed `+|` shorthand, told users to refresh the page
+  to see new elements (false since 1.10.0's live sync), and lacked
+  scripting, `/auto`, `/script`, `/lucky`, and the subsetting postfixes.
+  Rewritten to mirror the current `/help`.
+- **Documentation can no longer drift silently.** The kernel exports its
+  canonical command inventory (`known_slash_commands`), and a new test
+  asserts every command and key feature literal appears in all four
+  surfaces — README, CLI `/help`, trainer `/help`, and the Pages site —
+  plus negatives (no removed syntax, no stale tips). It immediately
+  caught README never documenting `/auto` and inconsistent postfix
+  spelling across surfaces; both fixed.
+- **Three test files were passing vacuously under Bazel** — `py_test`
+  runs files as `__main__`, and pytest files without a `pytest.main`
+  hook exit 0 without collecting anything. `test_script.py` (17 tests)
+  and the pre-existing `test_extension_loader.py` had never actually
+  executed. Hooks added; the full suite passes with caching disabled.
+
 ## [2.1.0] - 2026-08-21
 
 ### Added
