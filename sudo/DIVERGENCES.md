@@ -533,6 +533,8 @@ Supersession note: ruling 12's sorted-name generation order is the kernel's
 descending, sorted pair key on ties — so determinism survives: on an empty
 recipe index the prioritizer degrades exactly to pair-key order.
 
+| 18 | **Hive-mind relay policy is kernel-owned** (v2.3.0) — the shared-cache relay coordinates effects, but every *policy* value both hosts must agree on lives in the kernel and is called identically by CLI and trainer: `effective_rate_limit` (same-IP budget split), `cooldown_duration_ms` (429 stand-down schedule, 2h→4h→8h), `bounty_poll_interval_ms` (idle cadence + presence heartbeat), `rate_bar_fills_split`/`rate_bar_split_segments` (gold fleet-slot bar), `relay_reseed_entries` (re-seed payload), `relay_toggle_outcome` (`/relay` grammar, aliased to `auto_approve_outcome`). The relay server (`relay/server.mjs`) computes none of this — it only tracks `peers`/`cooledUntil` and returns them for hosts to apply. The relay itself runs on the kernel too (canonicalization/sanitization via a vendored generated copy under `relay/_sudo`, guarded by `relay:sudo_freshness_test`) | kernel decides, hosts + relay apply | both — no host-local policy math |
+
 ## Rulings summary
 
 | Source | Count | Status in kernel |

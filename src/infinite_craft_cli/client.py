@@ -15,6 +15,9 @@ class NealRateLimited(Exception):
     Callers must stand down (cooldown) rather than retry; retrying while
     banned risks extending the ban."""
 
+    def __init__(self, message: str = "neal.fun rate limit hit — cooling down (see /relay status)"):
+        super().__init__(message)
+
 _BASE_URL = "https://neal.fun"
 _PAIR_ENDPOINT = "/api/infinite-craft/pair"
 _IMPERSONATE = "chrome120"

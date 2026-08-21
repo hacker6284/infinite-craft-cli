@@ -243,16 +243,61 @@ class TestCooldown:
                 )
         client.pair.assert_not_awaited()
 
-    def test_strikes_double_the_duration(self):
+    def test_second_trip_while_cooling_is_a_noop(self):
+        """M1: concurrent 429s from one ban must not inflate the strike count."""
         import infinite_craft_cli.cli as cli
 
         cli._trip_cooldown()
-        first = cli._cooldown_until
-        # Force a second strike well after the first would matter.
+        first_until = cli._cooldown_until
+        assert cli._cooldown_strikes == 1
+        cli._trip_cooldown()  # still cooling → ignored
+        assert cli._cooldown_strikes == 1
+        assert cli._cooldown_until == first_until
+
+    def test_strikes_double_after_cooldown_expires(self):
+        import infinite_craft_cli.cli as cli
+
+        cli._trip_cooldown()
+        first_dur = cli._cooldown_until - cli.time.time()
+        # Simulate the first cooldown fully elapsing, then a new ban.
+        cli._cooldown_until = 0.0
         cli._trip_cooldown()
         assert cli._cooldown_strikes == 2
-        # 2h then 4h → the second window is longer.
-        assert (cli._cooldown_until - cli.time.time()) > (first - cli.time.time())
+        assert (cli._cooldown_until - cli.time.time()) > first_dur  # 2h → 4h
+
+    def test_adopted_cooldown_is_clamped_to_max(self):
+        """M2: a garbage relay can't park us offline past the 8h kernel max."""
+        import infinite_craft_cli.cli as cli
+
+        _relay_on(cli)
+        client = make_mock_client()
+        # Relay claims we're cooled until the year 9999.
+        cli.relay_client.last_hive["cooledUntil"] = 253402300799000
+        cli._relay_apply_hive(client)
+        max_ms = cli.craft.cooldown_duration_ms(3)
+        assert cli._cooling()
+        assert cli._cooldown_until <= cli.time.time() + max_ms / 1000.0 + 1
+
+    def test_effective_max_restored_on_relay_off_and_drop(self):
+        """M3: dropping the tier restores the full per-IP budget."""
+        import infinite_craft_cli.cli as cli
+        from infinite_craft_cli.ratelimit import RateLimiter
+
+        client = make_mock_client()
+        client._rate_limiter = RateLimiter(max_requests=60)
+        cli._active_client = client
+        client._rate_limiter.set_effective_max(20)
+        assert client._rate_limiter.chrome_snapshot()[1] == 20
+        # Relay goes unreachable → restore.
+        cli._relay_mark_unreachable()
+        assert client._rate_limiter.chrome_snapshot()[1] == 60
+        # Shrink again, then /relay off → restore.
+        client._rate_limiter.set_effective_max(15)
+        cli._relay_user_on = True
+        cli._relay_reachable = True
+        with patch.object(cli, "_relay_spawn_warmup"):
+            cli.do_relay("off", make_mock_storage())
+        assert client._rate_limiter.chrome_snapshot()[1] == 60
 
 
 class TestBudgetSplit:
@@ -360,3 +405,19 @@ class TestBountyWorker:
         assert cli._bounty_preempted() is True
         cli._current_command = ""
         assert cli._bounty_preempted() is False
+
+    def test_worker_preempted_while_cooling(self):
+        import infinite_craft_cli.cli as cli
+
+        _relay_on(cli)
+        cli._current_command = ""
+        assert cli._bounty_preempted() is False
+        cli._trip_cooldown()  # never serve the hive while banned
+        assert cli._bounty_preempted() is True
+
+    def test_worker_preempted_when_relay_off(self):
+        import infinite_craft_cli.cli as cli
+
+        cli._current_command = ""
+        cli._relay_user_on = False
+        assert cli._bounty_preempted() is True

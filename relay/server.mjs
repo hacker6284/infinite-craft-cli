@@ -35,7 +35,13 @@ import http from "node:http";
 import {
   pair_key as pairKeyKernel,
   sanitize_element_name as sanitizeKernel,
+  cooldown_duration_ms as cooldownDurationMs,
 } from "./_sudo/craft.mjs";
+
+// The longest cooldown the kernel will ever mint (3rd strike = 8h). Used to
+// clamp client-supplied cooled-until values so a bad/malicious client can't
+// park an IP offline forever.
+const MAX_COOLDOWN_MS = Number(cooldownDurationMs(3));
 
 const PORT = Number(process.env.PORT || 8790);
 const MAX_ENTRIES = Number(process.env.RELAY_MAX_ENTRIES || 1_500_000);
@@ -77,6 +83,9 @@ const deletedDirty = new Set();
 // count as spending the IP's neal budget; the count is returned to every
 // caller so clients split the per-IP window without talking to each other.
 const PRESENCE_TTL_MS = 180_000;
+const MAX_PRESENCE_IPS = 50_000;
+const MAX_SESSIONS_PER_IP = 64;
+const MAX_COOLDOWN_IPS = 50_000;
 const presence = new Map();
 
 // Lifetime counters for observability (/api/stats, /api/dashboard).
@@ -107,9 +116,24 @@ const REVIEW_PENDING_MAX = 100_000; // review backlog memory bound
 const reviewPending = new Map();
 
 function callerIp(req) {
+  // Render terminates TLS and sets X-Forwarded-For with the client IP as the
+  // leftmost entry (its documented format), so we read leftmost. That entry
+  // is client-spoofable; we do NOT rely on it for anything security-critical
+  // — it only groups sessions for the budget split, and the blast radius of a
+  // forged IP is bounded by the presence/cooldown caps and the cooled-until
+  // clamp below (a spoofer can't grow memory without bound or park an IP
+  // offline past MAX_COOLDOWN_MS).
   const fwd = req.headers["x-forwarded-for"];
   if (typeof fwd === "string" && fwd.length) return fwd.split(",")[0].trim();
   return req.socket.remoteAddress || "?";
+}
+
+// Evict the oldest key from a Map (insertion-order) to hold a size bound.
+function evictOldest(map, cap) {
+  while (map.size > cap) {
+    const first = map.keys().next().value;
+    map.delete(first);
+  }
 }
 
 function touchPresence(req, now) {
@@ -121,12 +145,20 @@ function touchPresence(req, now) {
   if (!bySession) {
     bySession = new Map();
     presence.set(ip, bySession);
+    evictOldest(presence, MAX_PRESENCE_IPS);
   }
   bySession.set(session.slice(0, 64), { state, at: now });
+  evictOldest(bySession, MAX_SESSIONS_PER_IP);
   if (state === "cooled") {
-    const until = Number(envStr(req.headers["x-ic-cooled-until"] || "")) || 0;
+    // Clamp a client-supplied cooldown to the kernel maximum so a bad value
+    // (or a skewed clock) can't park the IP offline indefinitely.
+    let until = Number(envStr(req.headers["x-ic-cooled-until"] || "")) || 0;
+    until = Math.min(until, now + MAX_COOLDOWN_MS);
     const prev = ipCooldown.get(ip) || 0;
-    if (until > prev) ipCooldown.set(ip, until);
+    if (until > prev) {
+      ipCooldown.set(ip, until);
+      evictOldest(ipCooldown, MAX_COOLDOWN_IPS);
+    }
   }
 }
 
@@ -165,6 +197,22 @@ function pruneBounties(now) {
   for (const [key, b] of bounties) {
     if (now - b.at > BOUNTY_TTL_MS) bounties.delete(key);
   }
+}
+
+// Global sweep of time-expiring tables so they shrink even for IPs/bounties
+// that never get queried again (lazy per-IP pruning alone can't reclaim a
+// silent client). Runs on a timer regardless of the snapshot backend.
+function pruneAll(now) {
+  for (const [ip, bySession] of presence) {
+    for (const [session, info] of bySession) {
+      if (now - info.at > PRESENCE_TTL_MS) bySession.delete(session);
+    }
+    if (bySession.size === 0) presence.delete(ip);
+  }
+  for (const [ip, until] of ipCooldown) {
+    if (until <= now) ipCooldown.delete(ip);
+  }
+  pruneBounties(now);
 }
 
 // Live sessions/IPs across the whole relay (expires stale entries as it goes).
@@ -265,7 +313,18 @@ export function doLookup(pairs) {
   return { results };
 }
 
-export function doContribute(list) {
+// `session` (the contributing client's id, "" for anonymous/direct calls)
+// gates peer-review independence: a confirmation only advances review when it
+// comes from a session other than the one that last advanced it, so a single
+// client can't self-confirm a poisoned result by contributing it twice.
+function markDirty(key) {
+  if (snapshot.enabled) dirty.add(key);
+}
+function markDeleted(key) {
+  if (snapshot.enabled) deletedDirty.add(key);
+}
+
+export function doContribute(list, session = "") {
   let added = 0;
   let dupes = 0;
   let n = 0;
@@ -282,15 +341,21 @@ export function doContribute(list) {
     const prev = entries.get(key);
     if (prev) {
       if (prev.r === r) {
-        // Independent identical claim = a peer review passing: one
-        // confirmation (per design review) flips the entry to reviewed.
-        prev.c += 1;
-        metrics.confirmed++;
-        if (prev.c >= 2 && !prev.rv) {
-          prev.rv = true;
-          reviewPending.delete(key);
+        // A matching claim confirms — but only an INDEPENDENT one (different
+        // session than the last confirmer) advances peer review. A repeat
+        // from the same session is counted as a dupe and ignored for review,
+        // so one client can't lock in its own result.
+        const independent = !session || session !== prev.by;
+        if (independent && !prev.rv) {
+          prev.c += 1;
+          prev.by = session;
+          metrics.confirmed++;
+          if (prev.c >= 2) {
+            prev.rv = true;
+            reviewPending.delete(key);
+          }
+          markDirty(key);
         }
-        dirty.add(key);
       } else if (!prev.rv) {
         // Conflicting claim against an UNREVIEWED entry: neal is
         // deterministic, so one of the two claims is wrong — drop the
@@ -298,7 +363,7 @@ export function doContribute(list) {
         // re-derives it fresh (self-healing beats bookkeeping).
         entries.delete(key);
         dirty.delete(key);
-        deletedDirty.add(key);
+        markDeleted(key);
         reviewPending.delete(key);
         metrics.healed++;
         if (bounties.size < MAX_BOUNTIES && !bounties.has(key)) {
@@ -313,8 +378,8 @@ export function doContribute(list) {
     // At capacity: skip the insert but keep scanning — confirmations for
     // already-present keys later in the batch must still land.
     if (entries.size >= MAX_ENTRIES) continue;
-    entries.set(key, { r, e, c: 1, rv: false });
-    dirty.add(key);
+    entries.set(key, { r, e, c: 1, rv: false, by: session });
+    markDirty(key);
     if (reviewPending.size < REVIEW_PENDING_MAX) reviewPending.set(key, null);
     bounties.delete(key); // a fresh result fulfills any open bounty
     metrics.contributed++;
@@ -415,7 +480,7 @@ async function snapshotLoad() {
         if (!entries.has(flat[i]) && entries.size < MAX_ENTRIES) {
           const c = v.c || 1;
           const rv = !!v.rv || c >= 2;
-          entries.set(flat[i], { r: v.r ?? null, e: v.e || "", c, rv });
+          entries.set(flat[i], { r: v.r ?? null, e: v.e || "", c, rv, by: v.by || "" });
           if (!rv && reviewPending.size < REVIEW_PENDING_MAX) {
             reviewPending.set(flat[i], null);
           }
@@ -532,7 +597,10 @@ function dashboardHtml(s) {
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
+  // The clients attach these on every request; without them here the browser
+  // trainer's cross-origin calls fail CORS preflight and the hive tier is
+  // silently disabled in the browser host.
+  "Access-Control-Allow-Headers": "Content-Type, x-ic-session, x-ic-state, x-ic-cooled-until",
   "Access-Control-Max-Age": "86400",
 };
 
@@ -617,7 +685,10 @@ export function makeServer() {
           });
           return;
         }
-        send(res, 200, { ...doContribute(body.entries), hive: hiveEnvelope(req, now) });
+        send(res, 200, {
+          ...doContribute(body.entries, envStr(req.headers["x-ic-session"] || "")),
+          hive: hiveEnvelope(req, now),
+        });
         return;
       }
       if (req.method === "POST" && url.pathname === "/api/bounties") {
@@ -666,6 +737,7 @@ if (isMain) {
     snapshot.lastErr = String(e && e.message ? e.message : e);
   });
   startSnapshotLoop();
+  setInterval(() => pruneAll(Date.now()), 60_000).unref();
   makeServer().listen(PORT, () => {
     console.log(
       `relay listening on :${PORT} — ${entries.size} entries` +

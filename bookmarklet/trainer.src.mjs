@@ -686,6 +686,8 @@ function cooling() {
 }
 
 function tripCooldown() {
+  // Concurrent 429s from a single ban must not inflate the strike count.
+  if (cooling()) return;
   cooldownStrikes++;
   cooldownUntil = Date.now() + Number(cooldownDurationMs(cooldownStrikes));
   const resume = new Date(cooldownUntil).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
@@ -717,10 +719,16 @@ function relayApplyHive(data) {
   if (!hive) return;
   const peers = Number(hive.peers) || 0;
   rateLimitEffective = peers > 1 ? Number(effectiveRateLimit(RATE_LIMIT, peers)) : 0;
-  const cu = Number(hive.cooledUntil) || 0;
-  if (cu > Date.now() && cu > cooldownUntil) {
-    cooldownUntil = cu;
-    updateChrome();
+  let cu = Number(hive.cooledUntil) || 0;
+  const now = Date.now();
+  if (cu > now) {
+    // Clamp a relay-reported cooldown to the kernel max (fail-open): a
+    // garbage or clock-skewed relay must never park us offline forever.
+    cu = Math.min(cu, now + Number(cooldownDurationMs(3)));
+    if (cu > cooldownUntil) {
+      cooldownUntil = cu;
+      updateChrome();
+    }
   }
 }
 
@@ -754,10 +762,16 @@ async function relayFetch(path, payload, timeoutMs) {
 }
 
 /** Batch lookup. Returns {key: {r, e}} (hits only) or null (unreachable). */
+function relayMarkUnreachable() {
+  relayReachable = false;
+  // Dropping the tier drops arbitration — restore the full per-IP budget.
+  rateLimitEffective = 0;
+}
+
 async function relayLookup(pairs) {
   const data = await relayFetch("/api/lookup", { pairs }, 4000);
   if (data == null) {
-    relayReachable = false;
+    relayMarkUnreachable();
     return null;
   }
   return data.results || {};
@@ -813,6 +827,9 @@ async function bountyTick() {
         continue;
       }
       pairCache.set(key, res);
+      // Record the recipe locally too (host parity: the Python bounty worker
+      // does this, so both hosts' recipe indexes stay in sync).
+      if (res) recordRecipe(res.text, aName, bName);
       const [ka, kb] = pairKeyKernel(aName, bName);
       const added = await relayFetch(
         "/api/contribute",
@@ -859,7 +876,7 @@ async function relayWarmup() {
       8000
     );
     if (d == null) {
-      relayReachable = false;
+      relayMarkUnreachable();
       return;
     }
     relayContributed += d.added || 0;
@@ -1067,7 +1084,8 @@ function doRelay(arg) {
     return;
   }
   relayUserOn = newState;
-  if (newState && relayReachable !== true) relayWarmup();
+  if (newState && relayReachable !== true) relayWarmup().catch(() => {});
+  if (!newState) rateLimitEffective = 0; // off → drop the budget split
   const conn =
     relayReachable === true
       ? green("connected")
@@ -1156,7 +1174,12 @@ async function hiveSweep(pairs) {
     const key = pairKey(a.text, b.text);
     const v = found[key];
     if (v === undefined || pairCache.has(key)) continue;
-    pairCache.set(key, relayResultToCache(v));
+    const cached = relayResultToCache(v);
+    pairCache.set(key, cached);
+    // Host parity: the Python _merge_hive_results records the recipe at
+    // sweep time, so a swept-then-never-processed pair (e.g. cancelled run)
+    // still lands in the recipe index identically in both hosts.
+    if (cached) recordRecipe(cached.text, a.text, b.text);
     relayHits++;
     merged++;
   }
@@ -1185,12 +1208,15 @@ async function runPairsInner(pairs, opts = {}) {
         if (!d) return;
         for (const [key, v] of Object.entries(d.results || {})) {
           if (!pairCache.has(key)) {
-            pairCache.set(key, relayResultToCache(v));
+            const cached = relayResultToCache(v);
+            pairCache.set(key, cached);
+            const sep = key.indexOf("\0");
+            if (cached && sep >= 0) recordRecipe(cached.text, key.slice(0, sep), key.slice(sep + 1));
             relayHits++;
           }
         }
         if (d.posted) print(dim(`  🐝 posted ${d.posted} bounties to the hive`));
-      });
+      }).catch(() => {});
     }
   }
   pairs = prioritizePairs(pairs);
@@ -2886,7 +2912,7 @@ function initBrowserUI() {
     rebuildIndexes();
     rebuildRecipeIndex();
     startPageSync();
-    relayWarmup();
+    relayWarmup().catch(() => {});
     startBountyWorker();
     output.innerHTML = "";
     print(bold(cyan("=== Infinite Craft Trainer ===")) + dim(`  v${TRAINER_VERSION}`));

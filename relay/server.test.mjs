@@ -330,3 +330,48 @@ test("stats metrics + dashboard render", async () => {
     server.close();
   }
 });
+
+test("peer review requires an independent session (R4)", async () => {
+  _resetForTests();
+  const server = makeServer();
+  await new Promise((resolve) => server.listen(0, resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const H = (s) => ({ "Content-Type": "application/json", "x-ic-session": s, "x-ic-state": "idle" });
+  const contribute = (s, entries) =>
+    fetch(`${base}/api/contribute`, { method: "POST", headers: H(s), body: JSON.stringify({ entries }) }).then((r) => r.json());
+  try {
+    // Same session contributes the same result twice (even the duplicate-in-
+    // one-request attack) → must NOT reach reviewed.
+    await contribute("attacker", [["Fire", "Water", "Poison"], ["Fire", "Water", "Poison"]]);
+    let s = await (await fetch(`${base}/api/stats`)).json();
+    assert.equal(s.reviewed, 0, "same-session duplicate must not self-review");
+    await contribute("attacker", [["Fire", "Water", "Poison"]]);
+    s = await (await fetch(`${base}/api/stats`)).json();
+    assert.equal(s.reviewed, 0, "same session again must still not review");
+    // A genuinely independent session confirms → now reviewed.
+    await contribute("honest", [["Fire", "Water", "Poison"]]);
+    s = await (await fetch(`${base}/api/stats`)).json();
+    assert.equal(s.reviewed, 1);
+  } finally {
+    server.close();
+  }
+});
+
+test("no snapshot backend → no dirty/deleted accumulation (R6)", async () => {
+  _resetForTests();
+  const server = makeServer();
+  await new Promise((resolve) => server.listen(0, resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const H = { "Content-Type": "application/json", "x-ic-session": "s", "x-ic-state": "idle" };
+  try {
+    // snapshot.enabled is false (no Upstash env). Contribute + heal must not
+    // grow the flush queues, or pendingFlush leaks forever on the free tier.
+    await fetch(`${base}/api/contribute`, { method: "POST", headers: H, body: JSON.stringify({ entries: [["Fire", "Water", "Steam"]] }) });
+    await fetch(`${base}/api/contribute`, { method: "POST", headers: { ...H, "x-ic-session": "s2" }, body: JSON.stringify({ entries: [["Fire", "Water", "Poison"]] }) }); // conflict → heal
+    const s = await (await fetch(`${base}/api/stats`)).json();
+    assert.equal(s.snapshot.enabled, false);
+    assert.equal(s.snapshot.pendingFlush, 0);
+  } finally {
+    server.close();
+  }
+});

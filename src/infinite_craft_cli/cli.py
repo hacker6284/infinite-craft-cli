@@ -380,7 +380,7 @@ def _raise_if_cancelled() -> None:
         raise CommandCancelled()
 
 
-async def _cached_pair(client, storage, a, b):
+async def _cached_pair(client, storage, a, b, *, skip_relay_lookup: bool = False):
     """Wrapper around client.pair that caches results by sorted element names.
 
     Cache tiers: local run cache → hive-mind relay → neal.fun. A neal slot
@@ -391,7 +391,9 @@ async def _cached_pair(client, storage, a, b):
     key = craft.pair_key(a.name, b.name)
     if key in _pair_cache:
         return _pair_cache[key]
-    if _relay_active():
+    # skip_relay_lookup: the caller (a bulk run) already swept this whole
+    # batch against the hive, so a per-pair lookup here would just re-miss.
+    if _relay_active() and not skip_relay_lookup:
         found = await asyncio.to_thread(relay_client.lookup, [(a.name, b.name)])
         if found is None:
             _relay_mark_unreachable()
@@ -779,6 +781,10 @@ def _cooling() -> bool:
 def _trip_cooldown() -> None:
     """A genuine 429 arrived: stand down for hours (doubling per strike)."""
     global _cooldown_until, _cooldown_strikes
+    # Concurrent pairs in one gather batch can each raise 429 from a single
+    # ban event — only the first counts as a strike, or the duration inflates.
+    if _cooling():
+        return
     _cooldown_strikes += 1
     _cooldown_until = time.time() + craft.cooldown_duration_ms(_cooldown_strikes) / 1000.0
     resume = time.strftime("%H:%M", time.localtime(_cooldown_until))
@@ -813,8 +819,14 @@ def _relay_apply_hive(client) -> None:
             craft.effective_rate_limit(limiter.base_max, max(1, peers))
         )
     cu = int(relay_client.last_hive.get("cooledUntil") or 0) / 1000.0
-    if cu > time.time() and cu > _cooldown_until:
-        _cooldown_until = cu
+    now = time.time()
+    if cu > now:
+        # Clamp a relay-reported cooldown to the kernel maximum: a garbage or
+        # clock-skewed relay must never be able to park us offline forever
+        # (fail-open). The relay clamps too, but never trust it blindly.
+        cu = min(cu, now + craft.cooldown_duration_ms(3) / 1000.0)
+        if cu > _cooldown_until:
+            _cooldown_until = cu
 _target_hit_lock = asyncio.Lock()
 # Confirm chrome reason (e.g. "331 pairs"); keys live only on the prompt.
 _confirm_reason: str = ""
@@ -852,14 +864,38 @@ def _relay_active() -> bool:
     return _relay_user_on and _relay_reachable is True
 
 
+def _relay_restore_budget() -> None:
+    """Return the limiter to its full per-IP budget. Called whenever the hive
+    tier stops arbitrating (relay unreachable, or /relay off) so a session
+    isn't left throttled to a split that no longer applies."""
+    if _active_client is not None:
+        _active_client._rate_limiter.set_effective_max(
+            _active_client._rate_limiter.base_max
+        )
+
+
 def _relay_mark_unreachable() -> None:
     global _relay_reachable
     _relay_reachable = False
+    _relay_restore_budget()
 
 
 async def _relay_warmup(storage) -> None:
     """Ping the relay (wakes a spun-down free instance), then re-seed the
-    hive once per session from this save's recipe store."""
+    hive once per session from this save's recipe store. Never raises — a
+    warmup failure must not surface as an unretrieved-task error."""
+    try:
+        await _relay_warmup_inner(storage)
+    except Exception:
+        _relay_reachable_false_safe()
+
+
+def _relay_reachable_false_safe() -> None:
+    global _relay_reachable
+    _relay_reachable = False
+
+
+async def _relay_warmup_inner(storage) -> None:
     global _relay_reachable, _relay_seeded, _relay_contributed
     health = await asyncio.to_thread(relay_client.ping)
     if health is None:
@@ -2263,15 +2299,20 @@ async def _combine_pairs(client, storage, pairs: list[tuple], collect: dict | No
             tail = miss_names[horizon:]
 
             async def post_tail():
-                resp = await asyncio.to_thread(relay_client.post_bounties, tail)
-                if resp is None:
-                    return
-                _merge_hive_results(resp.get("results") or {}, tail)
-                posted = resp.get("posted") or 0
-                if posted:
-                    _repl_print_lines(
-                        _color(f"  🐝 posted {posted} bounties to the hive", DIM)
-                    )
+                # Fire-and-forget: never let a relay hiccup surface as an
+                # unretrieved-task error.
+                try:
+                    resp = await asyncio.to_thread(relay_client.post_bounties, tail)
+                    if resp is None:
+                        return
+                    _merge_hive_results(resp.get("results") or {}, tail)
+                    posted = resp.get("posted") or 0
+                    if posted:
+                        _repl_print_lines(
+                            _color(f"  🐝 posted {posted} bounties to the hive", DIM)
+                        )
+                except Exception:
+                    pass
 
             _relay_spawn_bg(post_tail())
     total = len(pairs)
@@ -2290,7 +2331,7 @@ async def _combine_pairs(client, storage, pairs: list[tuple], collect: dict | No
         started_count += 1
         _set_lane_progress("pair", min(total, started_count), total)
         try:
-            result = await _cached_pair(client, storage, a, b)
+            result = await _cached_pair(client, storage, a, b, skip_relay_lookup=True)
         except CommandCancelled:
             return
         except NealRateLimited:
@@ -3088,6 +3129,9 @@ def do_relay(arg: str, storage) -> str:
     _relay_user_on = new_state
     if new_state and _relay_reachable is not True:
         _relay_spawn_warmup(storage)
+    if not new_state:
+        # Turning the tier off drops arbitration — restore the full budget.
+        _relay_restore_budget()
     if _relay_reachable is True:
         conn = _color("connected", GREEN)
     elif _relay_reachable is None:
@@ -4213,7 +4257,7 @@ async def interactive_mode():
             _active_client = client
             _rate_ticker_task = asyncio.create_task(_rate_ticker_loop())
             _relay_spawn_warmup(storage)
-            global _bounty_task
+            global _bounty_task, _relay_warmup_task
             _bounty_task = asyncio.create_task(_bounty_worker(client, storage))
             starters = "  ".join(format_element(e) for e in storage.get_all()[:4])
             _repl_print_lines(f"  Starting elements: {starters}")
@@ -4323,6 +4367,17 @@ async def interactive_mode():
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await _bounty_task
             _bounty_task = None
+        if _relay_warmup_task is not None:
+            _relay_warmup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await _relay_warmup_task
+            _relay_warmup_task = None
+        for _t in list(_relay_bg_tasks):
+            _t.cancel()
+        for _t in list(_relay_bg_tasks):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await _t
+        _relay_bg_tasks.clear()
         _active_client = None
         await _cancel_and_await_worker()
         _teardown_tty_and_chrome()
