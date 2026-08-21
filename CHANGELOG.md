@@ -1,5 +1,36 @@
 # Changelog
 
+## [2.4.0] - 2026-08-22
+
+### Added
+- **Rate-limited bulk runs now drain the hive instead of stalling.** When a
+  run is rate-limited on genuine misses, it no longer blocks waiting for a
+  neal slot — it re-sweeps the shared cache for the remaining pairs (anything
+  the fleet has filled lands as a free cache hit) and waits only until a slot
+  frees or the pair gets filled, so a scarce neal slot is spent only on pairs
+  the hive genuinely can't provide. Verified: a rate-limited pair resolving
+  from the hive in under a second instead of blocking ~60s.
+- **Eager bounty serving.** An idle client now serves the hive back-to-back
+  while it has work and rate to spare (re-checking the board immediately
+  instead of idling a full poll interval), so a long-idle client puts its
+  whole rate budget toward the fleet rather than ~half. Falls back to the 10s
+  poll when the board is empty or the window is drained, and never blocks on a
+  slot the next command might want.
+- **The hive bee pulses** on the rate bar each time the hive serves you a
+  batch of results (one-shot, so the browser's frequent chrome re-renders no
+  longer reset it before it fires), and the trainer now shows a `🐝 hive —
+  fulfilling bounties [x/y]` job row while serving, matching the CLI.
+- Relay `/api/stats` + dashboard count peer-review handouts (`reviewsTaken`),
+  which are the bulk of the current live workload.
+
+### Changed
+- **A client is never handed a bounty its own IP posted.** Same-IP clients
+  share one neal budget, so self-serving spends the exact rate the poster
+  would have — and it means a cancelled run's leftover bounties can't be
+  silently resumed by the poster's own idle worker. Other IPs may still finish
+  them (the results cache for everyone); the poster's cancel actually stops its
+  own work.
+
 ## [2.3.0] - 2026-08-21
 
 ### Added
