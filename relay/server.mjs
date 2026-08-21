@@ -82,7 +82,10 @@ const deletedDirty = new Set();
 // every API call; entries expire after PRESENCE_TTL. "running"/"serving"
 // count as spending the IP's neal budget; the count is returned to every
 // caller so clients split the per-IP window without talking to each other.
-const PRESENCE_TTL_MS = 180_000;
+// Live clients touch the relay at least every ~10s (bounty poll / run
+// traffic), so a 60s TTL keeps them fresh with a 6x margin while clearing a
+// phantom session (a closed tab that can't heartbeat) 3x faster than before.
+const PRESENCE_TTL_MS = 60_000;
 const MAX_PRESENCE_IPS = 50_000;
 const MAX_SESSIONS_PER_IP = 64;
 const MAX_COOLDOWN_IPS = 50_000;

@@ -120,9 +120,27 @@ let lastRenderedHits = 0; // for the one-shot bee pulse (fires when relayHits gr
 let relayContributed = 0;
 let relaySeeded = false;
 // Presence identity + same-IP arbitration (relay-fed)
-const relaySessionId =
-  (typeof crypto !== "undefined" && crypto.randomUUID && crypto.randomUUID().slice(0, 16)) ||
-  String(Math.random()).slice(2, 18);
+// Persist the session id in sessionStorage: it survives a reload of THIS tab
+// (so a reload doesn't leave a phantom "running"/"serving" session in the
+// relay's presence table that would count against you and halve your budget
+// to /30 for ~3 min) but stays unique PER tab (so two real tabs are correctly
+// counted as two clients sharing the IP budget). localStorage would be wrong
+// here — shared across tabs, it would collapse two clients into one.
+const relaySessionId = (() => {
+  const gen = () =>
+    (typeof crypto !== "undefined" && crypto.randomUUID && crypto.randomUUID().slice(0, 16)) ||
+    String(Math.random()).slice(2, 18);
+  try {
+    let id = sessionStorage.getItem("ic_relay_session");
+    if (!id) {
+      id = gen();
+      sessionStorage.setItem("ic_relay_session", id);
+    }
+    return id;
+  } catch {
+    return gen(); // sessionStorage blocked (private mode / sandbox) → per-load id
+  }
+})();
 let rateLimitEffective = 0; // 0 = full budget; >0 = split share from the hive
 // 429 cooldown: neal's 429 is an hours-long IP ban — stand down completely.
 let cooldownUntil = 0; // epoch ms
