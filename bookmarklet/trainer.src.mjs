@@ -2493,6 +2493,12 @@ function updateChrome() {
     const prog = ibJobTotal > 0 ? ` <span class="ict-job-prog">${ibJobDone}/${ibJobTotal}</span>` : "";
     jobParts.push(`<div class="ict-job-row"><span class="ict-job-mark">▶</span> <span class="ict-job-label">running</span> <span class="ict-job-cmd">${esc(currentIbCommand)}</span>${prog}</div>`);
   }
+  if (bountyProgress !== null) {
+    // Serving the hive — mirror the CLI's prominent job row (rate-line tag
+    // alone was too easy to miss).
+    const [bk, bn] = bountyProgress;
+    jobParts.push(`<div class="ict-job-row"><span class="ict-job-mark">🐝</span> <span class="ict-job-label">hive</span> <span class="ict-job-cmd">fulfilling bounties</span> <span class="ict-job-prog">${bk}/${bn}</span> <span class="ict-job-sep">·</span> <span class="ict-job-hint">any input pauses instantly</span></div>`);
+  }
   if (jobParts.length) {
     jobEl.style.display = "block";
     jobEl.innerHTML = jobParts.join("");
