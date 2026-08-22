@@ -609,11 +609,9 @@ class TestHiveWaitForSlots:
         a, b = MockElement("A"), MockElement("B")
         sync = AsyncMock()
         with patch.object(cli, "_hive_run_sync", new=sync), \
-             patch.object(cli.relay_client, "lookup", return_value={}) as look, \
              patch.object(cli, "_sleep_cancellable_async", new=AsyncMock(return_value=False)):
             run_async(cli._hive_wait_for_slots(client, [(a, b)], [(a, b)]))
-        sync.assert_awaited_once()  # exactly one sync, at the spend boundary
-        look.assert_called_once_with([("A", "B")])  # the per-beat batch probe
+        sync.assert_awaited_once()  # one wake → one full catch-up sync
 
     def test_exits_on_cooldown_mid_wait(self):
         import infinite_craft_cli.cli as cli
@@ -649,11 +647,15 @@ class TestHiveWaitForSlots:
         client._rate_limiter._timestamps = []
         a, b = MockElement("A"), MockElement("B")
         key = cli.craft.pair_key("A", "B")
-        fills = [{}, {f"{key[0]}\0{key[1]}": ("Fleet Thing", "🐝")}]
-        with patch.object(cli.relay_client, "lookup", side_effect=fills) as look, \
+        cli._run_posted_once = True  # keep the 🐝 line out of this test
+        fills = [
+            {"results": {}, "posted": 1},
+            {"results": {f"{key[0]}\0{key[1]}": ("Fleet Thing", "🐝")}, "posted": 0},
+        ]
+        with patch.object(cli.relay_client, "sync_bounties", side_effect=fills) as sync, \
              patch.object(cli, "_sleep_cancellable_async", new=AsyncMock(return_value=False)):
             run_async(cli._hive_wait_for_slots(client, [(a, b)], [(a, b)]))
-        assert look.call_count == 2  # probed each beat-wake
+        assert sync.call_count == 2  # the ONE full catch-up call, each wake
         got = cli._pair_cache.get(key)
         assert got is not None and got.name == "Fleet Thing"
         assert cli._relay_hits == 1  # the bee ticks live, mid-wait

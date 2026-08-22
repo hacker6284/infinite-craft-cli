@@ -1022,7 +1022,6 @@ async def _hive_wait_for_slots(client, batch, remaining) -> None:
     sync-before-spend — so a freed slot is never burned on a pair the
     fleet already answered. Cancellation and 429 cooldown exit
     immediately; the beat task keeps liveness flowing throughout."""
-    waited = False
     while not _cancelled and not _cooling() and _relay_active():
         misses = [
             p
@@ -1034,32 +1033,23 @@ async def _hive_wait_for_slots(client, batch, remaining) -> None:
         left, maximum, _f = client._rate_limiter.chrome_snapshot()
         if left >= len(misses) or (left >= 1 and left >= maximum):
             # Enough slots — or the window will never stretch further under
-            # the household split (review finding F4). Sync once before the
-            # spend if we actually waited.
-            if waited:
-                await _hive_run_sync(client, remaining)
+            # the household split (review finding F4). Every wait below
+            # synced on wake, so the spend is already fill-checked.
             return
         ts = client._rate_limiter._timestamps
         wait = 0.1
         if ts:
             wait = max(0.05, ts[0] + client._rate_limiter._window - time.monotonic())
-        # A fleet fill for THESE pairs is an event only the cache tier can
-        # show us: cap the sleep at the beat rhythm and probe just this
-        # batch's misses each wake, so a hive completion unblocks us in ~a
-        # beat — with zero slots spent — instead of stalling until the next
-        # local slot frees (3.0.1 field fix: rate-limited runs sat dark
-        # while their answers waited on the relay).
+        # Wake at the next slot free OR the next beat, whichever is sooner,
+        # and catch up on EVERYTHING outstanding in the one full sync (at
+        # zero slots that is a single request: re-offer the backlog, absorb
+        # every fill the hive has). A hive completion therefore unblocks us
+        # in ~a beat with zero slots spent (3.0.1 field fix: rate-limited
+        # runs sat dark while their answers waited on the relay).
         wait = min(wait, craft.beat_interval_ms() / 1000.0)
         if await _sleep_cancellable_async(wait):
             return  # cancelled
-        waited = True
-        miss_names = [(p[0].name, p[1].name) for p in misses]
-        found = await asyncio.to_thread(relay_client.lookup, miss_names)
-        if found is None:
-            _relay_mark_unreachable()
-            return
-        _relay_apply_hive(client)
-        _merge_hive_results(found, miss_names)
+        await _hive_run_sync(client, remaining)
 
 
 def _relay_spawn_bg(coro) -> None:

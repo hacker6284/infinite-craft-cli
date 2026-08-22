@@ -1292,18 +1292,15 @@ async function hiveRunSync(remaining) {
 // absorb hive fills so a freed slot is never burned on a pair the fleet
 // already answered. Matches the CLI's _hive_wait_for_slots.
 async function hiveWaitForSlots(pairEl, tail) {
-  let waited = false;
   while (!cancelled && !cooling() && relayActive()) {
     const key = pairKey(pairEl[0].text, pairEl[1].text);
     if (pairCache.has(key)) return; // filled by the fleet → free
-    if (rateChromeSnapshot().remaining >= 1) {
-      if (waited) await hiveRunSync(tail); // sync-before-spend
-      return;
-    }
-    // A fleet fill for THIS pair is an event only the cache tier can show
-    // us: cap the sleep at the beat rhythm and probe the pair each wake,
-    // so a hive completion unblocks us in ~a beat with zero slots spent
-    // (3.0.1 field fix; matches the CLI).
+    if (rateChromeSnapshot().remaining >= 1) return; // synced on every wake below
+    // Wake at the next slot free OR the next beat, whichever is sooner,
+    // and catch up on EVERYTHING outstanding via the one full sync (at
+    // zero slots: a single request that re-offers the backlog and absorbs
+    // every fill the hive has). A hive completion unblocks us in ~a beat
+    // with zero slots spent (3.0.1 field fix; matches the CLI).
     const wait = Math.min(
       timestamps.length
         ? Math.max(50, timestamps[0] + RATE_WINDOW - Date.now() + 10)
@@ -1315,10 +1312,7 @@ async function hiveWaitForSlots(pairEl, tail) {
     } catch {
       return; // cancelled
     }
-    waited = true;
-    const found = await relayLookup([[pairEl[0].text, pairEl[1].text]]);
-    if (found == null) return; // relayLookup marked the tier unreachable
-    mergeHiveResults(found);
+    await hiveRunSync(tail);
   }
 }
 
