@@ -1,5 +1,49 @@
 # Changelog
 
+## [2.5.0] - 2026-08-22
+
+### Added
+- **Bounty leases: demand is leased by heartbeat, not fire-and-forget.** A
+  rate-limited bulk run now re-affirms its overflow every 3s — re-posting the
+  still-unfilled slice beyond its live rate horizon (recomputed each beat, up
+  to 500 pairs) and absorbing any fleet-produced results in the same call.
+  Re-posting an open pair renews its lease rather than duplicating it, and a
+  leased bounty lapses ~10s after heartbeats stop — so cancelling a run
+  clears its board entries in seconds with no revoke call, while pre-2.5
+  clients' one-shot posts keep the old 15-minute TTL. This replaces the
+  one-shot post computed once at batch start, which under-fed the fleet on
+  big runs (500 pairs, posted once, never replenished) and stranded a
+  cancelled run's bounties for other IPs to spend real rate on. If the
+  posting run and the fleet ever derive the same pair twice, the duplicate
+  independent sighting counts as a peer-review confirmation — overlap is
+  review, not waste.
+- **Round-robin handout and hinted poll pacing.** The board hands work out
+  round-robin across posting sessions (oldest first within each), so a small
+  run is never starved behind a big one's slice; a per-session quota (600
+  open; renewals exempt) bounds any one poster. Idle workers pace their
+  polling on a relay hint: 2s while claimable-by-you work remains, the usual
+  10s otherwise (never sped up for bounties your own IP posted).
+- All lease policy is kernel-owned and applied identically by CLI, trainer,
+  and relay: `bounty_sync_plan`, `bounty_sync_interval_ms`,
+  `bounty_lease_ttl_ms`/`bounty_legacy_ttl_ms`, `bounty_session_quota`,
+  `bounty_claim_limit`, `bounty_poll_hint_ms`, `relay_retry_interval_ms`.
+
+### Fixed
+- **Idle clients no longer go permanently deaf after a relay nap.** One
+  failed relay call (routine while the spun-down free instance cold-starts)
+  marked the hive tier unreachable with no recovery path — both hosts
+  stopped serving bounties until a manual `/relay` toggle or restart, and
+  the blackout was fleet-wide self-reinforcing (nobody polls, so the relay
+  never wakes). While the tier is down, the idle loop now probes `/health`
+  every 60s and restores the tier on success; the probe doubles as the
+  wake-up call for the spun-down instance.
+- The trainer posted its bounty slice *before* pair prioritization while the
+  CLI posted *after* — the same batch put different work on the board
+  depending on the host. Both hosts now derive the slice from the
+  prioritized list via the same kernel plan.
+- Cancelling a batch in the trainer printed `Cancelled.` twice; it prints
+  once.
+
 ## [2.4.1] - 2026-08-22
 
 ### Fixed
