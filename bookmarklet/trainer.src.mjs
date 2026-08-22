@@ -46,6 +46,7 @@ import {
   effective_rate_limit as effectiveRateLimit,
   cooldown_duration_ms as cooldownDurationMs,
   bounty_poll_interval_ms as bountyPollIntervalMs,
+  relay_retry_interval_ms as relayRetryIntervalMs,
   bounty_sync_interval_ms as bountySyncIntervalMs,
   bounty_sync_plan as bountySyncPlan,
   bounty_claim_limit as bountyClaimLimit,
@@ -836,7 +837,23 @@ function fleetSlotAvailable() {
 // "worked" (served fully, rate to spare → poll again now), "empty",
 // "blocked" (preempted or out of rate), "unreachable". Serving never blocks
 // on a rate slot — it checks availability first and backs off to polling.
+// Un-deafen the hive tier: 'unreachable' was a one-way door (a single relay
+// nap — routine on a spin-down free instance — silenced serving until a
+// manual /relay toggle; 2.4.1 field bug). Probe /health on the kernel retry
+// cadence and restore on success; the ping doubles as the wake-up call for a
+// spun-down relay. Matches the CLI's _relay_retry_probe.
+let relayRetryAt = 0;
+async function relayRetryProbe() {
+  if (!relayUserOn || relayReachable !== false) return;
+  const now = Date.now();
+  if (now < relayRetryAt) return;
+  relayRetryAt = now + Number(relayRetryIntervalMs());
+  const health = await relayFetch("/health", null, 8000);
+  if (health != null && health.ok) relayReachable = true;
+}
+
 async function bountyTick() {
+  await relayRetryProbe();
   // Local refusals clear the hint: a stale fast pollMs must not spin a
   // blocked worker at 2s (review: spec finding 2; matches the CLI).
   if (bountyPreempted()) { bountyPollHintMs = 0; return "blocked"; }

@@ -819,3 +819,50 @@ class TestBountySyncHeartbeat:
             with pytest.raises(asyncio.CancelledError):
                 run_async(cli._bounty_worker(client, storage))
         assert sleeps[-1] == 2.0  # the hint, not the 10s kernel default
+
+class TestRelayRecovery:
+    """The 2.4.1 field bug: 'unreachable' was a one-way door, so one relay
+    nap silenced idle serving forever. The worker now probes /health on the
+    kernel retry cadence and restores the tier."""
+
+    def test_worker_probe_restores_tier(self):
+        import infinite_craft_cli.cli as cli
+        from unittest.mock import AsyncMock
+
+        cli._relay_user_on = True
+        cli._relay_reachable = False  # a past failure deafened the tier
+
+        async def fake_sleep(secs):
+            raise asyncio.CancelledError()  # one worker iteration
+
+        with patch.object(cli.relay_client, "ping", return_value={"ok": True}) as ping, \
+             patch.object(cli, "_bounty_cycle", new=AsyncMock(return_value="blocked")), \
+             patch("infinite_craft_cli.cli.asyncio.sleep", side_effect=fake_sleep):
+            with pytest.raises(asyncio.CancelledError):
+                run_async(cli._bounty_worker(make_mock_client(), make_mock_storage()))
+        ping.assert_called_once()
+        assert cli._relay_reachable is True
+
+    def test_failed_probe_stays_down_and_respects_cadence(self):
+        import infinite_craft_cli.cli as cli
+
+        cli._relay_user_on = True
+        cli._relay_reachable = False
+        with patch.object(cli.relay_client, "ping", return_value=None) as ping:
+            run_async(cli._relay_retry_probe())
+            assert cli._relay_reachable is False
+            # Second probe inside the retry window: no ping fired.
+            run_async(cli._relay_retry_probe())
+        ping.assert_called_once()
+
+    def test_no_probe_when_tier_healthy_or_user_off(self):
+        import infinite_craft_cli.cli as cli
+
+        with patch.object(cli.relay_client, "ping") as ping:
+            cli._relay_user_on = True
+            cli._relay_reachable = True
+            run_async(cli._relay_retry_probe())
+            cli._relay_user_on = False
+            cli._relay_reachable = False
+            run_async(cli._relay_retry_probe())
+        ping.assert_not_called()

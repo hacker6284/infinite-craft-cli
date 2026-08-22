@@ -209,6 +209,8 @@ def _reset_test_state() -> None:
     _bounties_worked = 0
     _bounty_progress = None
     _bounty_poll_ms = 0
+    global _relay_retry_at
+    _relay_retry_at = 0.0
     relay_client.last_hive["peers"] = 0
     relay_client.last_hive["cooledUntil"] = 0
     _script_new_reg = []
@@ -774,6 +776,7 @@ _bounty_task: asyncio.Task | None = None
 _bounties_worked: int = 0
 _bounty_progress: tuple[int, int] | None = None  # (done, batch) while serving
 _bounty_poll_ms: int = 0  # relay pacing hint for the idle worker (0 = none)
+_relay_retry_at: float = 0.0  # monotonic gate for the unreachable-recovery probe
 
 
 def _cooling() -> bool:
@@ -1186,6 +1189,26 @@ async def _bounty_cycle(client, storage) -> str:
     return status
 
 
+async def _relay_retry_probe() -> None:
+    """Un-deafen the hive tier: 'unreachable' was a one-way door (a single
+    relay nap — routine on a spin-down free instance — silenced serving until
+    a manual /relay toggle; 2.4.1 field bug). When the tier is user-on but
+    marked unreachable, probe /health on the kernel retry cadence and restore
+    on success. The ping doubles as the wake-up call for a spun-down relay,
+    which also breaks the fleet-wide blackout spiral (nobody polls → the
+    relay never wakes)."""
+    global _relay_reachable, _relay_retry_at
+    if not _relay_user_on or _relay_reachable is not False:
+        return
+    now = time.monotonic()
+    if now < _relay_retry_at:
+        return
+    _relay_retry_at = now + craft.relay_retry_interval_ms() / 1000.0
+    health = await asyncio.to_thread(relay_client.ping)
+    if health is not None:
+        _relay_reachable = True
+
+
 async def _bounty_worker(client, storage) -> None:
     """Serve the hive while idle at the prompt. Eager while there's work and
     rate to spare — after finishing a batch it re-checks the board immediately
@@ -1196,6 +1219,7 @@ async def _bounty_worker(client, storage) -> None:
     while True:
         status = "blocked"
         with contextlib.suppress(Exception):
+            await _relay_retry_probe()
             status = await _bounty_cycle(client, storage)
         if status == "worked":
             await asyncio.sleep(0)  # yield to the loop, then serve again now

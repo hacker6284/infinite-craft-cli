@@ -513,6 +513,11 @@ export function bounty_poll_hint_ms(open_bounties, eligible) {
     return _rt.int_out(_r);
 }
 
+export function relay_retry_interval_ms() {
+    const _r = _impl.relay_retry_interval_ms();
+    return _rt.int_out(_r);
+}
+
 export function hive_wait_tick_ms() {
     const _r = _impl.hive_wait_tick_ms();
     return _rt.int_out(_r);

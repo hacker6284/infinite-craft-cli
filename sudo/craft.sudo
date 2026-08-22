@@ -2642,6 +2642,13 @@ export func bounty_poll_hint_ms(open_bounties: int, eligible: bool) -> int
         return 2000
     return bounty_poll_interval_ms()
 
+// After a relay failure marks the hive tier unreachable, the idle loop
+// probes /health this often. The ping doubles as the wake-up call for a
+// spun-down free instance, so the fleet un-deafens itself instead of
+// staying silent until a manual /relay toggle (2.4.1 field bug).
+export func relay_retry_interval_ms() -> int
+    return 60000
+
 // Hive-aware rate wait: while a bulk run is rate-limited on genuine misses,
 // it re-checks rate/cache every tick and re-sweeps the hive for the tail
 // every interval — draining fleet-filled pairs for free instead of blocking
@@ -4021,6 +4028,7 @@ test "bounty lease policy"
     assert bounty_lease_ttl_ms() == 10000
     assert bounty_legacy_ttl_ms() == 900000
     assert bounty_session_quota() == 600
+    assert relay_retry_interval_ms() == 60000
 
 test "parse_query_filter parity"
     p, ex, on = parse_query_filter("!fire*")
