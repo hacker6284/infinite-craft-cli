@@ -1118,9 +1118,11 @@ async def _bounty_cycle(client, storage) -> str:
     backs off to polling when the window is drained."""
     global _bounties_worked, _bounty_progress, _bounty_poll_ms
     if _bounty_preempted():
+        _bounty_poll_ms = 0  # local refusal: a stale fast hint must not spin us
         return "blocked"
     left, _max, _frac = client._rate_limiter.chrome_snapshot()
     if left <= 0:
+        _bounty_poll_ms = 0
         return "blocked"  # rate-limited — don't even claim work we can't do
     # Claim only as many as we can actually serve this window, so we don't
     # lock bounties we'll abandon to their claim-TTL (review finding F3).
@@ -2411,10 +2413,6 @@ async def _combine_pairs(client, storage, pairs: list[tuple], collect: dict | No
     # entries lapse, so it must stop on every exit path.
     run_pos = [0]
     heartbeat: asyncio.Task | None = None
-    if _relay_active() and len(pairs) > 1:
-        heartbeat = asyncio.create_task(
-            _bounty_sync_heartbeat(client, pairs, run_pos)
-        )
     total = len(pairs)
     new_count = 0
     nothing_count = 0
@@ -2491,6 +2489,13 @@ async def _combine_pairs(client, storage, pairs: list[tuple], collect: dict | No
                 if stop:
                     return
 
+    # Start the heartbeat as the LAST step before the guarded loop: nothing
+    # may run between task creation and the try, or an exception there would
+    # leak a heartbeat that keeps renewing leases (review: spec finding 1).
+    if _relay_active() and len(pairs) > 1:
+        heartbeat = asyncio.create_task(
+            _bounty_sync_heartbeat(client, pairs, run_pos)
+        )
     # Process in batches of API_CONCURRENCY to avoid overwhelming the rate limiter
     try:
         for i in range(0, len(pairs), API_CONCURRENCY):

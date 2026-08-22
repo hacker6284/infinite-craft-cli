@@ -574,11 +574,16 @@ test("pollMs hints for eligible / empty / ip-active", () => {
   assert.equal(empty.pollMs, Number(bountyPollHintMs(0, true)));
   assert.equal(empty.pollMs, 10_000);
 
-  doPostBounties([["Open", "Board"]], now, "1.1.1.1", "poster");
-  const open = doTakeBounties(5, "t", idle, now, "8.8.8.8");
+  // pollMs paces on what remains claimable AFTER this handout (a worker
+  // that just claimed work re-polls instantly on the "worked" fast path).
+  doPostBounties([["Open", "Board"], ["Second", "One"]], now, "1.1.1.1", "poster");
+  const open = doTakeBounties(1, "t", idle, now, "8.8.8.8");
   assert.equal(open.bounties.length, 1);
   assert.equal(open.pollMs, Number(bountyPollHintMs(1, true)));
-  assert.equal(open.pollMs, 2_000);
+  assert.equal(open.pollMs, 2_000); // one still unclaimed → come back fast
+  const drained = doTakeBounties(5, "t2", idle, now, "8.8.8.8");
+  assert.equal(drained.bounties.length, 1);
+  assert.equal(drained.pollMs, 10_000); // board now fully claimed → slow poll
 
   // Refused while IP has a running session — hint is the idle interval.
   doPostBounties([["Still", "Open"]], now, "1.1.1.1", "poster2");
@@ -625,4 +630,21 @@ test("HTTP POST /api/bounties threads lease + session into renewals", async () =
   } finally {
     server.close();
   }
+});
+
+test("pollMs paces on claimable-by-caller, not board size", () => {
+  _resetForTests();
+  const now = Date.now();
+  // A session posts leased overflow from its home IP.
+  doPostBounties([["Aa", "Ab"], ["Ba", "Bb"]], now, "9.9.9.9", "sA", true);
+  const snap = { cooledUntil: 0, running: 0, spending: 0 };
+  // An idle sibling on the SAME IP can never claim these (same-IP
+  // exclusion) — it must get the slow hint, not hot-poll at 2s.
+  const sameIp = doTakeBounties(5, "sB", snap, now, "9.9.9.9");
+  assert.equal(sameIp.bounties.length, 0);
+  assert.equal(sameIp.pollMs, 10000);
+  // A foreign IP sees claimable work → fast hint while any remains.
+  const foreign = doTakeBounties(1, "sC", snap, now, "7.7.7.7");
+  assert.equal(foreign.bounties.length, 1);
+  assert.equal(foreign.pollMs, 2000); // one bounty still unclaimed
 });

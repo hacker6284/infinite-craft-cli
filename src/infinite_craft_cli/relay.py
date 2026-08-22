@@ -145,6 +145,8 @@ def sync_bounties(pairs: list[tuple[str, str]], lease: bool = True) -> dict | No
     try:
         data = _post_json(
             "/api/bounties",
+            # [:500] is a defensive mirror of kernel bounty_sync_plan's slice
+            # cap (and the relay's MAX_POST) — callers already slice by plan.
             {"pairs": [[a, b] for a, b in pairs[:500]], "lease": lease},
             CONTRIBUTE_TIMEOUT,
         )

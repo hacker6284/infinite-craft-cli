@@ -119,11 +119,34 @@ const ipCooldown = new Map();
 const bounties = new Map();
 const MAX_BOUNTIES = 10_000;
 const CLAIM_TTL_MS = 90_000;
-const MAX_POST = 500; // bounties per POST
+const MAX_POST = 500; // bounties per POST (mirrors kernel bounty_sync_plan's slice cap)
 const REVIEW_PENDING_MAX = 100_000; // review backlog memory bound
 // Unreviewed entries awaiting a peer re-ask of neal (c == 1). Offered to
 // idle clients when no pair bounties are open. key → claim {by, at} | null.
 const reviewPending = new Map();
+
+// Poster identity for quota + round-robin grouping: session-scoped when the
+// client sent one, IP-scoped otherwise.
+function posterKeyOf(b) {
+  return b.session || b.postedBy || "";
+}
+
+// One shape for every board insert — the lease fields (firstAt/session/
+// leased) stick at creation, so building the record in one place prevents
+// the two insert sites from drifting.
+function makeBounty(first, second, now, ip = "", session = "", leased = false) {
+  return {
+    first,
+    second,
+    at: now,
+    firstAt: now,
+    claimedBy: "",
+    claimedAt: 0,
+    postedBy: ip,
+    session,
+    leased,
+  };
+}
 
 function callerIp(req) {
   // Render terminates TLS and sets X-Forwarded-For with the client IP as the
@@ -379,19 +402,9 @@ export function doContribute(list, session = "") {
         metrics.healed++;
         if (bounties.size < MAX_BOUNTIES && !bounties.has(key)) {
           // Self-heal bounty: postedBy "" so anyone (including either
-          // disputing party) can re-derive it fresh. Legacy (non-leased).
-          const t = Date.now();
-          bounties.set(key, {
-            first: a,
-            second: b,
-            at: t,
-            firstAt: t,
-            claimedBy: "",
-            claimedAt: 0,
-            postedBy: "",
-            session: "",
-            leased: false,
-          });
+          // disputing party) can re-derive it fresh. Legacy (non-leased) —
+          // no poster exists to renew a lease on it.
+          bounties.set(key, makeBounty(a, b, Date.now()));
         }
       }
       // Conflicts against a reviewed entry are ignored: 2+ independent
@@ -429,7 +442,7 @@ export function doPostBounties(pairs, now, ip = "", session = "", lease = false)
     if (n !== undefined) return n;
     n = 0;
     for (const b of bounties.values()) {
-      if ((b.session || b.postedBy || "") === posterKey) n++;
+      if (posterKeyOf(b) === posterKey) n++;
     }
     posterOpen.set(posterKey, n);
     return n;
@@ -459,17 +472,7 @@ export function doPostBounties(pairs, now, ip = "", session = "", lease = false)
     const openForPoster = countOpen(posterKey);
     if (openForPoster >= quota) continue;
     if (bounties.size >= MAX_BOUNTIES) continue;
-    bounties.set(key, {
-      first: a,
-      second: b,
-      at: now,
-      firstAt: now,
-      claimedBy: "",
-      claimedAt: 0,
-      postedBy: ip,
-      session,
-      leased: !!lease,
-    });
+    bounties.set(key, makeBounty(a, b, now, ip, session, !!lease));
     metrics.bountiesPosted++;
     posted++;
     posterOpen.set(posterKey, openForPoster + 1);
@@ -500,7 +503,7 @@ export function doTakeBounties(limit, session, snap, now, ip = "") {
     // poster would have — and it means a cancelled run's leftover bounties
     // can't be silently resumed by the poster's own idle worker.
     if (b.postedBy && b.postedBy === ip) continue;
-    const pk = b.session || b.postedBy || "";
+    const pk = posterKeyOf(b);
     let g = groups.get(pk);
     if (!g) {
       g = [];
@@ -539,7 +542,12 @@ export function doTakeBounties(limit, session, snap, now, ip = "") {
       out.push({ kind: "review", first: key.slice(0, i), second: key.slice(i + 1) });
     }
   }
-  return { bounties: out, pollMs: Number(bountyPollHintMs(bounties.size, true)) };
+  // Pace the hint on what THIS caller could still claim (eligible, unclaimed,
+  // not same-IP) — board size alone would make a poster's own idle household
+  // hot-poll for bounties it can never take (review: spec finding 3). Reviews
+  // don't count: the backlog is effectively unbounded and reviews are filler.
+  const claimable = queues.reduce((n, q) => n + q.length, 0);
+  return { bounties: out, pollMs: Number(bountyPollHintMs(claimable, true)) };
 }
 
 // ── Upstash snapshot (optional backstop) ─────────────────────────────

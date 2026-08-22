@@ -837,9 +837,11 @@ function fleetSlotAvailable() {
 // "blocked" (preempted or out of rate), "unreachable". Serving never blocks
 // on a rate slot — it checks availability first and backs off to polling.
 async function bountyTick() {
-  if (bountyPreempted()) return "blocked";
+  // Local refusals clear the hint: a stale fast pollMs must not spin a
+  // blocked worker at 2s (review: spec finding 2; matches the CLI).
+  if (bountyPreempted()) { bountyPollHintMs = 0; return "blocked"; }
   const left = rateChromeSnapshot().remaining;
-  if (left <= 0) return "blocked";
+  if (left <= 0) { bountyPollHintMs = 0; return "blocked"; }
   // Claim only as many as we can serve this window (review finding F3).
   const data = await relayFetch(`/api/bounties?limit=${Number(bountyClaimLimit(left))}`, null, 4000);
   if (data == null) { relayMarkUnreachable(); return "unreachable"; }

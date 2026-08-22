@@ -772,6 +772,24 @@ class TestBountySyncHeartbeat:
 
     # ── idle worker pacing on the relay hint ─────────────────────────
 
+    def test_local_refusal_clears_stale_hint(self):
+        """A worker refused locally (preempted / no slots) must not keep
+        spinning on an old 2s hint — local refusals reset it to the default."""
+        import infinite_craft_cli.cli as cli
+
+        _relay_on(cli)
+        client = make_mock_client()
+        storage = make_mock_storage()
+        cli._bounty_poll_ms = 2000
+        cli._current_command = "/permute *"  # preempted
+        assert run_async(cli._bounty_cycle(client, storage)) == "blocked"
+        assert cli._bounty_poll_ms == 0
+        cli._current_command = ""
+        cli._bounty_poll_ms = 2000
+        client._rate_limiter.chrome_snapshot.return_value = (0, 60, 500)
+        assert run_async(cli._bounty_cycle(client, storage)) == "blocked"
+        assert cli._bounty_poll_ms == 0
+
     def test_cycle_stores_poll_hint(self):
         import infinite_craft_cli.cli as cli
 
