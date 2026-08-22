@@ -134,28 +134,39 @@ def stats() -> dict | None:
         return None
 
 
-def post_bounties(pairs: list[tuple[str, str]]) -> dict | None:
-    """Post rate-limited overflow pairs to the board. Pairs the hive already
+def sync_bounties(pairs: list[tuple[str, str]], lease: bool = True) -> dict | None:
+    """Demand heartbeat: lease (or renew) rate-limited overflow pairs.
+
+    Posting is renewing — an open bounty for the same pair just gets its
+    lease timestamp bumped, and leases lapse seconds after heartbeats stop,
+    so a cancelled run's board entries self-clear. Pairs the hive already
     knows come back in `results` (same shape as lookup) instead of posting.
-    Returns the response dict, or None when unreachable."""
+    Returns {"results", "posted", "renewed"}, or None when unreachable."""
     try:
         data = _post_json(
-            "/api/bounties", {"pairs": [[a, b] for a, b in pairs[:500]]}, CONTRIBUTE_TIMEOUT
+            "/api/bounties",
+            {"pairs": [[a, b] for a, b in pairs[:500]], "lease": lease},
+            CONTRIBUTE_TIMEOUT,
         )
         out = {}
         for key, v in (data.get("results") or {}).items():
             out[key] = (v.get("r"), v.get("e") or "")
-        return {"results": out, "posted": int(data.get("posted") or 0)}
+        return {
+            "results": out,
+            "posted": int(data.get("posted") or 0),
+            "renewed": int(data.get("renewed") or 0),
+        }
     except Exception:
         return None
 
 
-def take_bounties(limit: int = 5) -> list[dict] | None:
+def take_bounties(limit: int = 5) -> tuple[list[dict], int] | None:
     """Claim up to `limit` open bounties (pair or review kind) if our IP is
-    eligible (fully idle, not cooling). [] when refused or empty; None when
-    unreachable."""
+    eligible (fully idle, not cooling). Returns ``(items, poll_ms)`` where
+    poll_ms is the relay's pacing hint (0 = none); ``([], poll_ms)`` when
+    refused or empty; None when unreachable."""
     try:
         data = _get_json(f"/api/bounties?limit={int(limit)}", LOOKUP_TIMEOUT)
-        return list(data.get("bounties") or [])
+        return list(data.get("bounties") or []), int(data.get("pollMs") or 0)
     except Exception:
         return None

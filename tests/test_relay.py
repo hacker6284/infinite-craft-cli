@@ -353,7 +353,7 @@ class TestBountyWorker:
         storage = make_mock_storage()
         bounties = [{"kind": "pair", "first": "Earth", "second": "Wind"}]
 
-        with patch.object(cli.relay_client, "take_bounties", return_value=bounties), \
+        with patch.object(cli.relay_client, "take_bounties", return_value=(bounties, 0)), \
              patch.object(cli.relay_client, "contribute", return_value=1) as contrib:
             run_async(cli._bounty_cycle(client, storage))
 
@@ -378,7 +378,7 @@ class TestBountyWorker:
         bounties = [{"kind": "pair", "first": "Earth", "second": "Wind"}]
 
         contributed = []
-        with patch.object(cli.relay_client, "take_bounties", return_value=bounties), \
+        with patch.object(cli.relay_client, "take_bounties", return_value=(bounties, 0)), \
              patch.object(cli.relay_client, "contribute", side_effect=lambda e: contributed.extend(e) or 1):
             run_async(cli._bounty_cycle(client, storage))
 
@@ -406,7 +406,7 @@ class TestBountyWorker:
         client.pair.return_value = MockElement("Dust", "")
         storage = make_mock_storage()
         bounties = [{"kind": "pair", "first": "Earth", "second": "Wind"}]
-        with patch.object(cli.relay_client, "take_bounties", return_value=bounties), \
+        with patch.object(cli.relay_client, "take_bounties", return_value=(bounties, 0)), \
              patch.object(cli.relay_client, "contribute", return_value=1):
             status = run_async(cli._bounty_cycle(client, storage))
         # Full batch served with rate left → the worker will poll again now.
@@ -431,7 +431,7 @@ class TestBountyWorker:
         _relay_on(cli)
         client = make_mock_client()
         storage = make_mock_storage()
-        with patch.object(cli.relay_client, "take_bounties", return_value=[]):
+        with patch.object(cli.relay_client, "take_bounties", return_value=([], 0)):
             status = run_async(cli._bounty_cycle(client, storage))
         assert status == "empty"
 
@@ -452,7 +452,7 @@ class TestBountyWorker:
             {"kind": "pair", "first": "Earth", "second": "Wind"},
             {"kind": "pair", "first": "Fire", "second": "Water"},
         ]
-        with patch.object(cli.relay_client, "take_bounties", return_value=bounties), \
+        with patch.object(cli.relay_client, "take_bounties", return_value=(bounties, 0)), \
              patch.object(cli.relay_client, "contribute", return_value=1):
             status = run_async(cli._bounty_cycle(client, storage))
         assert client.pair.await_count == 1  # only the first, then backed off
@@ -545,7 +545,7 @@ class TestReviewFixes:
         client.pair.side_effect = RuntimeError("neal 503")  # generic outage
         storage = make_mock_storage()
         bounties = [{"kind": "pair", "first": "Earth", "second": "Wind"}]
-        with patch.object(cli.relay_client, "take_bounties", return_value=bounties), \
+        with patch.object(cli.relay_client, "take_bounties", return_value=(bounties, 0)), \
              patch.object(cli.relay_client, "contribute", return_value=1) as contrib:
             status = run_async(cli._bounty_cycle(client, storage))
         assert cli._bounties_worked == 0
@@ -562,10 +562,10 @@ class TestReviewFixes:
         client._rate_limiter.chrome_snapshot.return_value = (3, 60, 1000)
         client.pair.return_value = MockElement("X", "")
         storage = make_mock_storage()
-        with patch.object(cli.relay_client, "take_bounties", return_value=[]) as take, \
+        with patch.object(cli.relay_client, "take_bounties", return_value=([], 0)) as take, \
              patch.object(cli.relay_client, "contribute", return_value=1):
             run_async(cli._bounty_cycle(client, storage))
-        take.assert_called_once_with(3)  # min(5, left=3)
+        take.assert_called_once_with(3)  # kernel bounty_claim_limit(left=3)
 
     def test_worker_eager_polls_after_worked_then_backs_off(self):
         """Eager cadence: 'worked' → immediate re-poll (sleep 0); anything
@@ -619,3 +619,185 @@ class TestReviewFixes:
         assert ticks["n"] >= 2  # it actually looped-and-slept, then exited
 
 
+
+class TestBountySyncHeartbeat:
+    """The demand heartbeat: leases are renewed only while a run is alive,
+    so termination on every exit path is the load-bearing property — a
+    leaked heartbeat renews zombie bounties other users spend real rate on."""
+
+    def _pairs(self, n):
+        return [(MockElement(f"A{i}"), MockElement(f"B{i}")) for i in range(n)]
+
+    # ── the coroutine's own exit conditions ──────────────────────────
+
+    def test_heartbeat_stops_on_relay_drop(self):
+        import infinite_craft_cli.cli as cli
+
+        _relay_on(cli)
+        client = make_mock_client()  # limiter reports (60, 60) → horizon 120
+        pairs = self._pairs(130)  # 10 misses beyond the horizon
+        with patch.object(cli.relay_client, "sync_bounties", return_value=None) as sync:
+            run_async(cli._bounty_sync_heartbeat(client, pairs, [0]))
+        sync.assert_called_once()
+        assert cli._relay_reachable is False  # drop marked, tier restored
+
+    def test_heartbeat_syncs_exact_beyond_horizon_slice(self):
+        import infinite_craft_cli.cli as cli
+        from unittest.mock import AsyncMock
+
+        _relay_on(cli)
+        client = make_mock_client()
+        pairs = self._pairs(130)
+        resp = {"results": {}, "posted": 10, "renewed": 0}
+        with patch.object(cli.relay_client, "sync_bounties", return_value=resp) as sync, \
+             patch.object(cli, "_sleep_cancellable_async", new=AsyncMock(return_value=True)):
+            run_async(cli._bounty_sync_heartbeat(client, pairs, [0]))
+        sync.assert_called_once()
+        sent = sync.call_args.args[0]
+        # Exactly the prioritized tail past horizon = left + max = 120.
+        assert sent == [(f"A{i}", f"B{i}") for i in range(120, 130)]
+
+    def test_heartbeat_noop_when_misses_fit_horizon(self):
+        import infinite_craft_cli.cli as cli
+        from unittest.mock import AsyncMock
+
+        _relay_on(cli)
+        client = make_mock_client()
+        pairs = self._pairs(5)  # well inside the horizon
+        with patch.object(cli.relay_client, "sync_bounties") as sync, \
+             patch.object(cli, "_sleep_cancellable_async", new=AsyncMock(return_value=True)):
+            run_async(cli._bounty_sync_heartbeat(client, pairs, [0]))
+        sync.assert_not_called()
+
+    def test_heartbeat_exits_on_cooldown(self):
+        import infinite_craft_cli.cli as cli
+
+        _relay_on(cli)
+        client = make_mock_client()
+        cli._cooldown_until = cli.time.time() + 3600
+        with patch.object(cli.relay_client, "sync_bounties") as sync:
+            run_async(cli._bounty_sync_heartbeat(client, self._pairs(130), [0]))
+        sync.assert_not_called()
+
+    def test_one_shot_posting_is_gone(self):
+        import infinite_craft_cli.cli as cli
+
+        assert not hasattr(cli.relay_client, "post_bounties")
+
+    # ── _combine_pairs owns the task: cancelled on EVERY exit path ───
+
+    def _run_combine_with_fake_heartbeat(self, cli, client, storage, pairs,
+                                         expect_error=None):
+        state = {}
+
+        async def fake_hb(_client, _pairs, _run_pos):
+            state["started"] = True
+            try:
+                await asyncio.sleep(3600)  # would outlive any run
+            except asyncio.CancelledError:
+                state["cancelled"] = True
+                raise
+
+        with patch.object(cli, "_bounty_sync_heartbeat", new=fake_hb), \
+             patch.object(cli.relay_client, "lookup", return_value={}), \
+             patch.object(cli.relay_client, "contribute", return_value=1):
+            if expect_error is not None:
+                with pytest.raises(expect_error):
+                    run_async(cli._combine_pairs(client, storage, pairs))
+            else:
+                run_async(cli._combine_pairs(client, storage, pairs))
+        return state
+
+    def test_run_cancels_heartbeat_on_normal_completion(self):
+        import infinite_craft_cli.cli as cli
+
+        _relay_on(cli)
+        client = make_mock_client()
+        client.pair.return_value = MockElement("Steam", "")
+        storage = make_mock_storage()
+        state = self._run_combine_with_fake_heartbeat(
+            cli, client, storage, self._pairs(3)
+        )
+        assert state.get("started") and state.get("cancelled")
+
+    def test_run_cancels_heartbeat_on_user_cancel(self):
+        """Cancel before the first batch: the loop breaks without ever
+        yielding, so the heartbeat is cancelled before its body first runs —
+        assert the real property (no live heartbeat survives the run)."""
+        import infinite_craft_cli.cli as cli
+
+        _relay_on(cli)
+        client = make_mock_client()
+        client.pair.return_value = MockElement("Steam", "")
+        storage = make_mock_storage()
+        cli._cancelled = True  # cancel before the first batch
+
+        async def scenario():
+            with patch.object(cli.relay_client, "lookup", return_value={}), \
+                 patch.object(cli.relay_client, "contribute", return_value=1), \
+                 patch.object(cli.relay_client, "sync_bounties", return_value=None):
+                await cli._combine_pairs(client, storage, self._pairs(3))
+            return [
+                t for t in asyncio.all_tasks()
+                if not t.done() and "_bounty_sync_heartbeat" in repr(t)
+            ]
+
+        assert run_async(scenario()) == []
+
+    def test_run_cancels_heartbeat_on_429_cooldown(self):
+        import infinite_craft_cli.cli as cli
+        from infinite_craft_cli.client import NealRateLimited
+
+        _relay_on(cli)
+        client = make_mock_client()
+        client.pair.side_effect = NealRateLimited()
+        storage = make_mock_storage()
+        state = self._run_combine_with_fake_heartbeat(
+            cli, client, storage, self._pairs(3)
+        )
+        assert state.get("started") and state.get("cancelled")
+
+    def test_run_cancels_heartbeat_on_unexpected_exception(self):
+        import infinite_craft_cli.cli as cli
+
+        _relay_on(cli)
+        client = make_mock_client()
+        client.pair.return_value = MockElement("Steam", "")
+        storage = make_mock_storage()
+        storage.add.side_effect = RuntimeError("disk full")
+        state = self._run_combine_with_fake_heartbeat(
+            cli, client, storage, self._pairs(3), expect_error=RuntimeError
+        )
+        assert state.get("started") and state.get("cancelled")
+
+    # ── idle worker pacing on the relay hint ─────────────────────────
+
+    def test_cycle_stores_poll_hint(self):
+        import infinite_craft_cli.cli as cli
+
+        _relay_on(cli)
+        client = make_mock_client()
+        storage = make_mock_storage()
+        with patch.object(cli.relay_client, "take_bounties", return_value=([], 2500)):
+            status = run_async(cli._bounty_cycle(client, storage))
+        assert status == "empty"
+        assert cli._bounty_poll_ms == 2500
+
+    def test_worker_sleeps_poll_hint_when_idle(self):
+        import infinite_craft_cli.cli as cli
+        from unittest.mock import AsyncMock
+
+        client = make_mock_client()
+        storage = make_mock_storage()
+        cli._bounty_poll_ms = 2000
+        sleeps = []
+
+        async def fake_sleep(secs):
+            sleeps.append(secs)
+            raise asyncio.CancelledError()
+
+        with patch.object(cli, "_bounty_cycle", new=AsyncMock(return_value="empty")), \
+             patch("infinite_craft_cli.cli.asyncio.sleep", side_effect=fake_sleep):
+            with pytest.raises(asyncio.CancelledError):
+                run_async(cli._bounty_worker(client, storage))
+        assert sleeps[-1] == 2.0  # the hint, not the 10s kernel default
