@@ -767,3 +767,52 @@ class TestRunIdLifecycle:
         storage.add.side_effect = RuntimeError("disk full")
         self._run(cli, client, storage, self._pairs(3), expect_error=RuntimeError)
         assert cli._run_id == ""
+
+class TestStressRegressions:
+    """Regressions from the pre-release subagent stress round."""
+
+    def test_beat_worker_survives_malformed_beat_return(self):
+        """S6c: THE timer must survive a contract-violating beat() return —
+        a crash here would silently kill the hive tier for the session."""
+        import infinite_craft_cli.cli as cli
+
+        cli._relay_user_on = True
+        cli._relay_reachable = True
+        client = make_mock_client()
+        storage = make_mock_storage()
+        calls = {"n": 0}
+
+        async def fake_sleep(secs):
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise asyncio.CancelledError()
+
+        with patch.object(cli.relay_client, "beat", return_value={}) as beat, \
+             patch("infinite_craft_cli.cli.asyncio.sleep", side_effect=fake_sleep):
+            with pytest.raises(asyncio.CancelledError):
+                run_async(cli._beat_worker(client, storage))
+        assert beat.call_count == 2  # loop survived the bad return and beat again
+
+    def test_run_id_asserted_before_preprocessing(self):
+        """S7: the household gate keys off the runId in our beats, so the id
+        must ride from before the hive sweep/prioritization, not after."""
+        import infinite_craft_cli.cli as cli
+        from unittest.mock import AsyncMock
+
+        _relay_on(cli)
+        client = make_mock_client()
+        client.pair.return_value = MockElement("Steam", "")
+        storage = make_mock_storage()
+        seen = {}
+
+        async def spy_sweep(_client, _pairs):
+            seen["run_id_at_sweep"] = cli._run_id
+            return 0
+
+        pairs = [(MockElement(f"A{i}"), MockElement(f"B{i}")) for i in range(3)]
+        with patch.object(cli, "_hive_sweep", new=spy_sweep), \
+             patch.object(cli, "_hive_run_sync", new=AsyncMock()), \
+             patch.object(cli.relay_client, "contribute", return_value=1):
+            run_async(cli._combine_pairs(client, storage, pairs))
+        assert seen.get("run_id_at_sweep")  # non-empty during pre-processing
+        assert cli._run_id == ""  # and cleared after

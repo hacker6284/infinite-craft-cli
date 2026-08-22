@@ -1180,20 +1180,24 @@ async def _beat_worker(client, storage) -> None:
     an event."""
     global _relay_reachable
     while True:
-        if _relay_user_on:
-            cooled_ms = int(_cooldown_until * 1000) if _cooling() else 0
-            resp = await asyncio.to_thread(
-                relay_client.beat, not _cooling(), _run_id, cooled_ms
-            )
-            if resp is None:
-                if _relay_reachable is not False:
-                    _relay_mark_unreachable()
-            else:
-                if _relay_reachable is not True:
-                    _relay_reachable = True
-                _ok, work = resp
-                if work and not _bounty_preempted():
-                    with contextlib.suppress(Exception):
+        # The WHOLE body is armored: this task is the hive tier's only
+        # timer, and an exception here (e.g. a malformed beat response)
+        # would kill it silently for the rest of the session (stress
+        # finding S6c). CancelledError still passes — shutdown works.
+        with contextlib.suppress(Exception):
+            if _relay_user_on:
+                cooled_ms = int(_cooldown_until * 1000) if _cooling() else 0
+                resp = await asyncio.to_thread(
+                    relay_client.beat, not _cooling(), _run_id, cooled_ms
+                )
+                if resp is None:
+                    if _relay_reachable is not False:
+                        _relay_mark_unreachable()
+                else:
+                    if _relay_reachable is not True:
+                        _relay_reachable = True
+                    _ok, work = resp
+                    if work and not _bounty_preempted():
                         await _serve_hive(client, storage)
         await asyncio.sleep(craft.beat_interval_ms() / 1000.0)
 
@@ -2375,6 +2379,22 @@ async def _combine_pairs(client, storage, pairs: list[tuple], collect: dict | No
     (ingredient-usage score descending, pair-key tie-break). This is the
     single choke point, so permute/cross/with/exhaust and each crawl
     generation all get the same ordering."""
+    # Assert the run's identity BEFORE any pre-processing (hive sweep,
+    # prioritization): the household work-bit gate and the budget split key
+    # off the runId in our beats, so a sibling must never see this household
+    # as idle while a run is being prepared (stress finding S7). Clearing it
+    # in the finally IS cancellation — it must cover every path from here.
+    global _run_id, _run_seq, _run_posted_once
+    _run_seq += 1
+    _run_posted_once = False
+    _run_id = f"{relay_client.SESSION_ID}-{_run_seq}"
+    try:
+        await _combine_pairs_inner(client, storage, pairs, collect)
+    finally:
+        _run_id = ""
+
+
+async def _combine_pairs_inner(client, storage, pairs, collect):
     if len(pairs) > 1:
         # One hive sweep for the whole batch: anything any user has already
         # tried becomes a local cache hit before we spend a single neal slot,
@@ -2480,18 +2500,24 @@ async def _combine_pairs(client, storage, pairs: list[tuple], collect: dict | No
                 if stop:
                     return
 
-    # The run asserts an id from here on: every beat carries it, and the
-    # run's board entries live exactly as long as it keeps appearing. The
-    # finally clears it — that IS cancellation, on every exit path.
-    global _run_id, _run_seq, _run_posted_once
-    _run_seq += 1
-    _run_posted_once = False
     # Process in batches of API_CONCURRENCY to avoid overwhelming the rate limiter
-    try:
-        _run_id = f"{relay_client.SESSION_ID}-{_run_seq}"
-        if _relay_active() and len(pairs) > 1:
-            await _hive_run_sync(client, pairs)
-        for i in range(0, len(pairs), API_CONCURRENCY):
+    if _relay_active() and len(pairs) > 1:
+        await _hive_run_sync(client, pairs)
+    for i in range(0, len(pairs), API_CONCURRENCY):
+        if _cancelled:
+            break
+        if _cooling():
+            skipped = total - done_count
+            _repl_print_lines(
+                f"  {_color(f'429 cooldown — {skipped} pairs skipped.', RED)}"
+            )
+            break
+        batch = pairs[i : i + API_CONCURRENCY]
+        # Event-driven rate wait + sync-before-spend: sleep until slots
+        # free (no ticks), then absorb hive fills so a scarce neal slot
+        # is spent only on pairs the fleet genuinely hasn't provided.
+        if _relay_active():
+            await _hive_wait_for_slots(client, batch, pairs[i:])
             if _cancelled:
                 break
             if _cooling():
@@ -2500,29 +2526,10 @@ async def _combine_pairs(client, storage, pairs: list[tuple], collect: dict | No
                     f"  {_color(f'429 cooldown — {skipped} pairs skipped.', RED)}"
                 )
                 break
-            batch = pairs[i : i + API_CONCURRENCY]
-            # Event-driven rate wait + sync-before-spend: sleep until slots
-            # free (no ticks), then absorb hive fills so a scarce neal slot
-            # is spent only on pairs the fleet genuinely hasn't provided.
-            if _relay_active():
-                await _hive_wait_for_slots(client, batch, pairs[i:])
-                if _cancelled:
-                    break
-                if _cooling():
-                    skipped = total - done_count
-                    _repl_print_lines(
-                        f"  {_color(f'429 cooldown — {skipped} pairs skipped.', RED)}"
-                    )
-                    break
-            # Show the first pair of each batch immediately (before the fetch).
-            if batch:
-                _set_last_pair(batch[0][0].name, batch[0][1].name)
-            await asyncio.gather(*(process(a, b) for a, b in batch))
-    finally:
-        # Dropping the run id from our beats is what expires this run's
-        # board entries — the relay clears them beat_lapse_ms later, on
-        # every exit path, with no revoke call.
-        _run_id = ""
+        # Show the first pair of each batch immediately (before the fetch).
+        if batch:
+            _set_last_pair(batch[0][0].name, batch[0][1].name)
+        await asyncio.gather(*(process(a, b) for a, b in batch))
 
     if _cancelled:
         _repl_print_lines(

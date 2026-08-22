@@ -1313,25 +1313,28 @@ async function hiveWaitForSlots(pairEl, tail) {
 }
 
 async function runPairsInner(pairs, opts = {}) {
-  if (pairs.length > 1) {
-    // One hive sweep for the whole batch: anything any user has already
-    // tried becomes a local cache hit before the first rate-limit slot is
-    // spent, and the cache-first prioritization below promotes it.
-    await hiveSweep(pairs);
-  }
-  pairs = prioritizePairs(pairs);
-  // The run asserts an id from here on: every beat carries it, and the
-  // run's board entries live exactly as long as it keeps appearing. The
-  // finally clears it — that IS cancellation, on every exit path.
+  // Assert the run's identity BEFORE any pre-processing (hive sweep,
+  // prioritization): the household work-bit gate and the budget split key
+  // off the runId in our beats, so a sibling must never see this household
+  // as idle while a run is being prepared (stress finding S7). Clearing it
+  // in the finally IS cancellation — it covers every path from here.
   runSeq++;
   runPostedOnce = false;
+  runId = `${relaySessionId}-${runSeq}`;
   let done = 0, newCount = 0, nothingCount = 0, errors = 0;
-  const total = pairs.length;
+  let total = 0;
   const onResult = opts.onResult;
   const shouldPrint = opts.shouldPrint;
-  setLaneProgress("pair", 0, total);
   try {
-    runId = `${relaySessionId}-${runSeq}`;
+    if (pairs.length > 1) {
+      // One hive sweep for the whole batch: anything any user has already
+      // tried becomes a local cache hit before the first rate-limit slot is
+      // spent, and the cache-first prioritization below promotes it.
+      await hiveSweep(pairs);
+    }
+    pairs = prioritizePairs(pairs);
+    total = pairs.length;
+    setLaneProgress("pair", 0, total);
     if (relayActive() && pairs.length > 1) await hiveRunSync(pairs);
     for (let i = 0; i < pairs.length; i++) {
       const [a, b] = pairs[i];
