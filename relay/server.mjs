@@ -21,6 +21,16 @@
 //                           → { added, dupes, total }
 //                             (result null = "Nothing"; first write wins —
 //                              entries are never overwritten, only confirmed)
+//   POST /api/beat        → { nealOk, runId?, cooledUntil? }  (x-ic-session req'd)
+//                           → { ok, work }   — THE one client timer (~1s):
+//                             liveness in, a work bit out. Sessions, their
+//                             runs' bounties, their assignments, and their
+//                             place in the household budget split all lapse
+//                             beat_lapse_ms after the last beat.
+//   GET  /api/work?limit=N → { work: [{kind, first, second}, ...] }
+//                             (assigns pair bounties first, review filler
+//                              after; assignment sticks while the assignee
+//                              beats and reports nealOk)
 //
 // Entry values are { r: result|null, e: emoji, c: confirms }. `c` counts
 // independent contributions of the same (pair, result) — the raw material
@@ -36,10 +46,7 @@ import {
   pair_key as pairKeyKernel,
   sanitize_element_name as sanitizeKernel,
   cooldown_duration_ms as cooldownDurationMs,
-  bounty_lease_ttl_ms as bountyLeaseTtlMs,
-  bounty_legacy_ttl_ms as bountyLegacyTtlMs,
-  bounty_session_quota as bountySessionQuota,
-  bounty_poll_hint_ms as bountyPollHintMs,
+  beat_lapse_ms as beatLapseMs,
 } from "./_sudo/craft.mjs";
 
 // The longest cooldown the kernel will ever mint (3rd strike = 8h). Used to
@@ -81,19 +88,20 @@ const dirty = new Set();
 /** keys deleted since the last flush (mismatch healing) — need HDEL */
 const deletedDirty = new Set();
 
-// ── presence: who is on each public IP, and in what state ────────────
-// ip → Map<session, {state, at}>. Fed by x-ic-session/x-ic-state headers on
-// every API call; entries expire after PRESENCE_TTL. "running"/"serving"
-// count as spending the IP's neal budget; the count is returned to every
-// caller so clients split the per-IP window without talking to each other.
-// Live clients touch the relay at least every ~10s (bounty poll / run
-// traffic), so a 60s TTL keeps them fresh with a 6x margin while clearing a
-// phantom session (a closed tab that can't heartbeat) 3x faster than before.
-const PRESENCE_TTL_MS = 60_000;
-const MAX_PRESENCE_IPS = 50_000;
-const MAX_SESSIONS_PER_IP = 64;
+// ── beats: the one timer ─────────────────────────────────────────────
+// session id → { ip, at, nealOk, runId, workedAt }. Fed exclusively by
+// POST /api/beat. Everything liveness-shaped derives from these records
+// plus the single kernel threshold beat_lapse_ms — there are no other
+// protocol clocks.
+const BEAT_LAPSE_MS = Number(beatLapseMs());
+const MAX_SESSIONS = 100_000;
 const MAX_COOLDOWN_IPS = 50_000;
-const presence = new Map();
+const sessions = new Map();
+
+function liveSession(id, now) {
+  const s = sessions.get(id);
+  return s && now - s.at <= BEAT_LAPSE_MS ? s : null;
+}
 
 // Lifetime counters for observability (/api/stats, /api/dashboard).
 const metrics = {
@@ -103,7 +111,6 @@ const metrics = {
   confirmed: 0, // duplicate-confirmations that advanced review
   healed: 0, // entries dropped by a conflicting claim
   bountiesPosted: 0,
-  bountiesRenewed: 0,
   bountiesTaken: 0,
   reviewsTaken: 0, // peer-review bounties handed to idle clients
 };
@@ -112,40 +119,45 @@ const metrics = {
 const ipCooldown = new Map();
 
 // ── bounty board ─────────────────────────────────────────────────────
-// key → {first, second, at, firstAt, claimedBy, claimedAt, postedBy,
-// session, leased}. Posted by rate-limited clients; offered only to
-// callers whose IP is fully idle and not cooling. `leased` / `firstAt` /
-// `session` stick at creation; renewals only bump `at`.
+// key → { first, second, ip, session, runId, assignedTo }. A bounty is a
+// parallelization offer bound to a live run: it exists exactly as long as
+// its poster keeps asserting that runId in beats — no TTLs, no renewal
+// bookkeeping, no revoke call. Assignment sticks while the assignee beats
+// and reports nealOk; a lapsed or neal-blind assignee forfeits. The poster
+// keeps grinding its own list regardless, so reassignment is a speedup
+// concern, never a correctness one.
 const bounties = new Map();
 const MAX_BOUNTIES = 10_000;
-const CLAIM_TTL_MS = 90_000;
 const MAX_POST = 500; // bounties per POST (mirrors kernel bounty_sync_plan's slice cap)
 const REVIEW_PENDING_MAX = 100_000; // review backlog memory bound
 // Unreviewed entries awaiting a peer re-ask of neal (c == 1). Offered to
-// idle clients when no pair bounties are open. key → claim {by, at} | null.
+// idle clients when no pair bounties are open. key → { by } | null — the
+// assignment is liveness-scoped, exactly like pair bounties.
 const reviewPending = new Map();
 
-// Poster identity for quota + round-robin grouping: session-scoped when the
-// client sent one, IP-scoped otherwise.
-function posterKeyOf(b) {
-  return b.session || b.postedBy || "";
+function bountyExpired(b, now) {
+  const poster = liveSession(b.session, now);
+  return !poster || poster.runId !== b.runId;
 }
 
-// One shape for every board insert — the lease fields (firstAt/session/
-// leased) stick at creation, so building the record in one place prevents
-// the two insert sites from drifting.
-function makeBounty(first, second, now, ip = "", session = "", leased = false) {
-  return {
-    first,
-    second,
-    at: now,
-    firstAt: now,
-    claimedBy: "",
-    claimedAt: 0,
-    postedBy: ip,
-    session,
-    leased,
-  };
+// Claimable by this caller: poster's run still live, not from the caller's
+// own IP (household budget is shared), not in the hands of a live,
+// neal-capable worker.
+function bountyClaimable(b, callerSession, callerIp_, now) {
+  if (bountyExpired(b, now)) return false;
+  if (b.ip && b.ip === callerIp_) return false;
+  if (b.assignedTo && b.assignedTo !== callerSession) {
+    const a = liveSession(b.assignedTo, now);
+    if (a && a.nealOk) return false;
+  }
+  return true;
+}
+
+function householdRunning(ip, now) {
+  for (const s of sessions.values()) {
+    if (s.ip === ip && now - s.at <= BEAT_LAPSE_MS && s.runId) return true;
+  }
+  return false;
 }
 
 function callerIp(req) {
@@ -169,79 +181,94 @@ function evictOldest(map, cap) {
   }
 }
 
-function touchPresence(req, now) {
-  const session = envStr(req.headers["x-ic-session"] || "");
-  if (!session) return;
-  const state = envStr(req.headers["x-ic-state"] || "idle");
-  const ip = callerIp(req);
-  let bySession = presence.get(ip);
-  if (!bySession) {
-    bySession = new Map();
-    presence.set(ip, bySession);
-    evictOldest(presence, MAX_PRESENCE_IPS);
-  }
-  bySession.set(session.slice(0, 64), { state, at: now });
-  evictOldest(bySession, MAX_SESSIONS_PER_IP);
-  if (state === "cooled") {
-    // Clamp a client-supplied cooldown to the kernel maximum so a bad value
-    // (or a skewed clock) can't park the IP offline indefinitely.
-    let until = Number(envStr(req.headers["x-ic-cooled-until"] || "")) || 0;
+export function doBeat(sessionId, ip, body, now) {
+  const prev = sessions.get(sessionId);
+  const runId = typeof body.runId === "string" ? body.runId.slice(0, 64) : "";
+  sessions.set(sessionId.slice(0, 64), {
+    ip,
+    at: now,
+    nealOk: body.nealOk !== false,
+    runId,
+    workedAt: prev ? prev.workedAt : 0,
+  });
+  evictOldest(sessions, MAX_SESSIONS);
+  // The 429 cooldown broadcast rides the beat, clamped to the kernel
+  // maximum so a bad value can't park an IP offline indefinitely.
+  let until = Number(body.cooledUntil) || 0;
+  if (until > now) {
     until = Math.min(until, now + MAX_COOLDOWN_MS);
-    const prev = ipCooldown.get(ip) || 0;
-    if (until > prev) {
+    if (until > (ipCooldown.get(ip) || 0)) {
       ipCooldown.set(ip, until);
       evictOldest(ipCooldown, MAX_COOLDOWN_IPS);
     }
   }
+  return { ok: true, work: workAvailableFor(sessionId, ip, now) };
+}
+
+// The beat's work bit: could this caller usefully pull right now? True for
+// live bounties it could claim, or review work it didn't author (bounded
+// probe — the pull is the authoritative, exact check).
+function workAvailableFor(sessionId, ip, now) {
+  if ((ipCooldown.get(ip) || 0) > now) return false;
+  if (householdRunning(ip, now)) return false;
+  pruneBounties(now);
+  for (const b of bounties.values()) {
+    if (bountyClaimable(b, sessionId, ip, now)) return true;
+  }
+  let probed = 0;
+  for (const [key, claim] of reviewPending) {
+    if (probed++ >= 50) break;
+    const entry = entries.get(key);
+    if (!entry || entry.rv) {
+      reviewPending.delete(key);
+      continue;
+    }
+    if (entry.by === sessionId) continue;
+    if (claim && claim.by !== sessionId) {
+      const a = liveSession(claim.by, now);
+      if (a && a.nealOk) continue;
+    }
+    return true;
+  }
+  return false;
 }
 
 function ipSnapshot(req, now) {
   const ip = callerIp(req);
-  const bySession = presence.get(ip);
   let spending = 0;
-  let running = 0;
-  if (bySession) {
-    for (const [session, info] of bySession) {
-      if (now - info.at > PRESENCE_TTL_MS) {
-        bySession.delete(session);
-        continue;
-      }
-      if (info.state === "running" || info.state === "serving") spending++;
-      if (info.state === "running") running++;
-    }
-    if (bySession.size === 0) presence.delete(ip);
+  for (const s of sessions.values()) {
+    if (s.ip !== ip || now - s.at > BEAT_LAPSE_MS) continue;
+    // Spending the household budget: mid-run, or handed hive work within
+    // the lapse window (a serving worker's slots are committed).
+    if (s.runId || now - s.workedAt <= BEAT_LAPSE_MS) spending++;
   }
   let cooledUntil = ipCooldown.get(ip) || 0;
   if (cooledUntil <= now) {
     ipCooldown.delete(ip);
     cooledUntil = 0;
   }
-  return { spending, running, cooledUntil };
+  return { spending, cooledUntil };
 }
 
-/** The hive envelope attached to every API response: what the caller's IP
-    looks like right now, so clients can split budget and stand down. */
+/** The hive envelope attached to cache/board responses: what the caller's
+    IP looks like right now, so clients can split budget and stand down. */
 function hiveEnvelope(req, now) {
   const snap = ipSnapshot(req, now);
   return { peers: snap.spending, cooledUntil: snap.cooledUntil };
 }
 
+// A bounty lives exactly as long as its poster keeps asserting its runId.
 export function pruneBounties(now) {
   for (const [key, b] of bounties) {
-    const ttl = b.leased ? Number(bountyLeaseTtlMs()) : Number(bountyLegacyTtlMs());
-    if (now - b.at > ttl) bounties.delete(key);
+    if (bountyExpired(b, now)) bounties.delete(key);
   }
 }
 
-// Global sweep of time-expiring tables so they shrink even for IPs/bounties
-// that never get queried again (lazy per-IP pruning alone can't reclaim a
-// silent client). Runs on a timer regardless of the snapshot backend.
+// Housekeeping sweep (server-internal, not a protocol clock): reclaim
+// lapsed sessions, spent cooldowns, and orphaned bounties.
 function pruneAll(now) {
-  for (const [ip, bySession] of presence) {
-    for (const [session, info] of bySession) {
-      if (now - info.at > PRESENCE_TTL_MS) bySession.delete(session);
-    }
-    if (bySession.size === 0) presence.delete(ip);
+  for (const [id, s] of sessions) {
+    if (now - s.at > BEAT_LAPSE_MS) sessions.delete(id);
   }
   for (const [ip, until] of ipCooldown) {
     if (until <= now) ipCooldown.delete(ip);
@@ -249,28 +276,24 @@ function pruneAll(now) {
   pruneBounties(now);
 }
 
-// Live sessions/IPs across the whole relay (expires stale entries as it goes).
-function presenceTotals(now) {
-  let sessions = 0;
+// Live sessions/IPs across the whole relay.
+function sessionTotals(now) {
+  let live = 0;
   let spending = 0;
-  for (const [ip, bySession] of presence) {
-    for (const [session, info] of bySession) {
-      if (now - info.at > PRESENCE_TTL_MS) {
-        bySession.delete(session);
-        continue;
-      }
-      sessions++;
-      if (info.state === "running" || info.state === "serving") spending++;
-    }
-    if (bySession.size === 0) presence.delete(ip);
+  const ips = new Set();
+  for (const s of sessions.values()) {
+    if (now - s.at > BEAT_LAPSE_MS) continue;
+    live++;
+    ips.add(s.ip);
+    if (s.runId || now - s.workedAt <= BEAT_LAPSE_MS) spending++;
   }
-  return { sessions, spending, ips: presence.size };
+  return { sessions: live, spending, ips: ips.size };
 }
 
 function statsPayload(now) {
   let reviewed = 0;
   for (const v of entries.values()) if (v.rv) reviewed++;
-  const totals = presenceTotals(now);
+  const totals = sessionTotals(now);
   const lookups = metrics.lookupPairs;
   return {
     entries: entries.size,
@@ -400,12 +423,9 @@ export function doContribute(list, session = "") {
         markDeleted(key);
         reviewPending.delete(key);
         metrics.healed++;
-        if (bounties.size < MAX_BOUNTIES && !bounties.has(key)) {
-          // Self-heal bounty: postedBy "" so anyone (including either
-          // disputing party) can re-derive it fresh. Legacy (non-leased) —
-          // no poster exists to renew a lease on it.
-          bounties.set(key, makeBounty(a, b, Date.now()));
-        }
+        // v3: no synthetic self-heal bounty — nothing exists on the board
+        // without a live poster behind it. The next run that needs this
+        // pair will miss, re-derive fresh, and re-post naturally.
       }
       // Conflicts against a reviewed entry are ignored: 2+ independent
       // neal sightings beat a lone dissenter.
@@ -426,29 +446,13 @@ export function doContribute(list, session = "") {
 }
 
 // ── bounty ops ───────────────────────────────────────────────────────
-export function doPostBounties(pairs, now, ip = "", session = "", lease = false) {
+export function doPostBounties(pairs, now, ip = "", session = "", runId = "") {
   // Pairs already cached come straight back as results (no bounty needed);
-  // existing board entries renew (at only); new keys respect per-poster
-  // quota then the global board cap.
+  // the rest go on the board bound to the poster's live run.
   const results = {};
   let posted = 0;
-  let renewed = 0;
   let m = 0;
-  // Per-poster open counts for this call — memoized so a large batch of
-  // new pairs from one session doesn't rescan the board every iteration.
-  const posterOpen = new Map();
-  const countOpen = (posterKey) => {
-    let n = posterOpen.get(posterKey);
-    if (n !== undefined) return n;
-    n = 0;
-    for (const b of bounties.values()) {
-      if (posterKeyOf(b) === posterKey) n++;
-    }
-    posterOpen.set(posterKey, n);
-    return n;
-  };
-  const posterKey = session || ip || "";
-  const quota = Number(bountySessionQuota());
+  pruneBounties(now);
   for (const p of pairs) {
     if (m++ >= MAX_POST) break;
     if (!Array.isArray(p) || p.length < 2) continue;
@@ -461,71 +465,37 @@ export function doPostBounties(pairs, now, ip = "", session = "", lease = false)
       results[key] = { r: hit.r, e: hit.e };
       continue;
     }
-    const existing = bounties.get(key);
-    if (existing) {
-      // Renewal: bump at only — keep Map insertion order and every other field.
-      existing.at = now;
-      metrics.bountiesRenewed++;
-      renewed++;
-      continue;
-    }
-    const openForPoster = countOpen(posterKey);
-    if (openForPoster >= quota) continue;
+    // Already on the board from a live run (prune just cleared the dead
+    // ones): first poster wins; a run-change re-post lands as a fresh
+    // bounty because the old one expired with its run.
+    if (bounties.has(key)) continue;
     if (bounties.size >= MAX_BOUNTIES) continue;
-    bounties.set(key, makeBounty(a, b, now, ip, session, !!lease));
+    bounties.set(key, { first: a, second: b, ip, session, runId, assignedTo: "" });
     metrics.bountiesPosted++;
     posted++;
-    posterOpen.set(posterKey, openForPoster + 1);
   }
-  return { results, posted, renewed, open: bounties.size };
+  return { results, posted, open: bounties.size };
 }
 
-export function doTakeBounties(limit, session, snap, now, ip = "") {
-  // Eligibility: the caller's whole IP must be idle (no running session)
-  // and not cooling down — bounty work must never contest a household's
-  // own runs or a banned IP.
-  if (snap.cooledUntil > now) {
-    return { bounties: [], reason: "cooled", pollMs: Number(bountyPollHintMs(0, false)) };
-  }
-  if (snap.running > 0) {
-    return { bounties: [], reason: "ip-active", pollMs: Number(bountyPollHintMs(0, false)) };
-  }
+export function doTakeWork(limit, session, now, ip = "") {
+  // Eligibility: not cooling, and nobody in the caller's household mid-run
+  // — hive work must never contest a household's own budget.
+  if ((ipCooldown.get(ip) || 0) > now) return { work: [], reason: "cooled" };
+  if (householdRunning(ip, now)) return { work: [], reason: "ip-active" };
   pruneBounties(now);
   const out = [];
   const cap = Math.max(1, Math.min(limit || 5, 20));
-  // Round-robin across poster groups (session || postedBy), preserving
-  // each group's board-insertion order and group first-seen order.
-  const groups = new Map(); // posterKey → bounty[]
   for (const b of bounties.values()) {
-    if (b.claimedBy && now - b.claimedAt <= CLAIM_TTL_MS) continue;
-    // Never hand a bounty back to the IP that posted it: same-IP clients
-    // share one neal budget, so self-serving spends the exact rate the
-    // poster would have — and it means a cancelled run's leftover bounties
-    // can't be silently resumed by the poster's own idle worker.
-    if (b.postedBy && b.postedBy === ip) continue;
-    const pk = posterKeyOf(b);
-    let g = groups.get(pk);
-    if (!g) {
-      g = [];
-      groups.set(pk, g);
-    }
-    g.push(b);
-  }
-  const queues = [...groups.values()];
-  let qi = 0;
-  while (out.length < cap && queues.some((q) => q.length > 0)) {
-    const q = queues[qi % queues.length];
-    qi++;
-    if (q.length === 0) continue;
-    const b = q.shift();
-    b.claimedBy = session || "?";
-    b.claimedAt = now;
+    if (out.length >= cap) break;
+    if (!bountyClaimable(b, session, ip, now)) continue;
+    b.assignedTo = session || "?";
     metrics.bountiesTaken++;
     out.push({ kind: "pair", first: b.first, second: b.second });
   }
   // Idle capacity beyond open bounties goes to peer review: re-ask neal
   // about unreviewed entries. The expected answer is never shared — the
-  // reviewer's independent contribute confirms or heals the entry.
+  // reviewer's independent contribute confirms or heals the entry. Never
+  // handed to the session that authored the sighting.
   if (out.length < cap) {
     for (const [key, claim] of reviewPending) {
       if (out.length >= cap) break;
@@ -534,20 +504,21 @@ export function doTakeBounties(limit, session, snap, now, ip = "") {
         reviewPending.delete(key);
         continue;
       }
-      if (claim && now - claim.at <= CLAIM_TTL_MS) continue;
-      const i = key.indexOf("\0");
-      if (i < 0) continue;
-      reviewPending.set(key, { by: session || "?", at: now });
+      if (entry.by === session) continue;
+      if (claim && claim.by !== session) {
+        const a = liveSession(claim.by, now);
+        if (a && a.nealOk) continue;
+      }
+      const i2 = key.indexOf("\0");
+      if (i2 < 0) continue;
+      reviewPending.set(key, { by: session || "?" });
       metrics.reviewsTaken++;
-      out.push({ kind: "review", first: key.slice(0, i), second: key.slice(i + 1) });
+      out.push({ kind: "review", first: key.slice(0, i2), second: key.slice(i2 + 1) });
     }
   }
-  // Pace the hint on what THIS caller could still claim (eligible, unclaimed,
-  // not same-IP) — board size alone would make a poster's own idle household
-  // hot-poll for bounties it can never take (review: spec finding 3). Reviews
-  // don't count: the backlog is effectively unbounded and reviews are filler.
-  const claimable = queues.reduce((n, q) => n + q.length, 0);
-  return { bounties: out, pollMs: Number(bountyPollHintMs(claimable, true)) };
+  const s = sessions.get(session);
+  if (s && out.length) s.workedAt = now;
+  return { work: out };
 }
 
 // ── Upstash snapshot (optional backstop) ─────────────────────────────
@@ -656,7 +627,7 @@ function dashboardHtml(s) {
     ["Contributed", m.contributed.toLocaleString()],
     ["Confirmations", m.confirmed.toLocaleString()],
     ["Self-healed", m.healed.toLocaleString()],
-    ["Bounties posted / renewed / taken", `${m.bountiesPosted.toLocaleString()} / ${m.bountiesRenewed.toLocaleString()} / ${m.bountiesTaken.toLocaleString()}`],
+    ["Bounties posted / taken", `${m.bountiesPosted.toLocaleString()} / ${m.bountiesTaken.toLocaleString()}`],
     ["Reviews served", m.reviewsTaken.toLocaleString()],
     ["Snapshot", s.snapshot.enabled ? (s.snapshot.lastErr ? "error: " + s.snapshot.lastErr : "ok") : "disabled"],
     ["Uptime", `${Math.floor(s.uptimeSec / 3600)}h ${Math.floor((s.uptimeSec % 3600) / 60)}m`],
@@ -695,10 +666,10 @@ function dashboardHtml(s) {
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  // The clients attach these on every request; without them here the browser
-  // trainer's cross-origin calls fail CORS preflight and the hive tier is
-  // silently disabled in the browser host.
-  "Access-Control-Allow-Headers": "Content-Type, x-ic-session, x-ic-state, x-ic-cooled-until",
+  // The clients attach the session header on every request; without it here
+  // the browser trainer's cross-origin calls fail CORS preflight and the
+  // hive tier is silently disabled in the browser host.
+  "Access-Control-Allow-Headers": "Content-Type, x-ic-session",
   "Access-Control-Max-Age": "86400",
 };
 
@@ -752,7 +723,6 @@ export function makeServer() {
         res.end();
         return;
       }
-      if (url.pathname.startsWith("/api/")) touchPresence(req, now);
       if (req.method === "GET" && url.pathname === "/health") {
         send(res, 200, { ok: true, entries: entries.size });
         return;
@@ -789,32 +759,40 @@ export function makeServer() {
         });
         return;
       }
+      if (req.method === "POST" && url.pathname === "/api/beat") {
+        const body = JSON.parse(await readBody(req));
+        const session = envStr(req.headers["x-ic-session"] || "");
+        if (!session) {
+          send(res, 400, { error: "x-ic-session required" });
+          return;
+        }
+        send(res, 200, doBeat(session, callerIp(req), body || {}, now));
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/work") {
+        const limit = Number(url.searchParams.get("limit") || "5");
+        const session = envStr(req.headers["x-ic-session"] || "");
+        send(res, 200, {
+          ...doTakeWork(limit, session, now, callerIp(req)),
+          hive: hiveEnvelope(req, now),
+        });
+        return;
+      }
       if (req.method === "POST" && url.pathname === "/api/bounties") {
         const body = JSON.parse(await readBody(req));
         if (!body || !Array.isArray(body.pairs)) {
           send(res, 400, { error: "expected { pairs: [[first, second], ...] }" });
           return;
         }
-        pruneBounties(now);
         send(res, 200, {
           ...doPostBounties(
             body.pairs,
             now,
             callerIp(req),
             envStr(req.headers["x-ic-session"] || ""),
-            body.lease === true
+            typeof body.runId === "string" ? body.runId.slice(0, 64) : ""
           ),
           hive: hiveEnvelope(req, now),
-        });
-        return;
-      }
-      if (req.method === "GET" && url.pathname === "/api/bounties") {
-        const limit = Number(url.searchParams.get("limit") || "5");
-        const session = envStr(req.headers["x-ic-session"] || "");
-        const snap = ipSnapshot(req, now);
-        send(res, 200, {
-          ...doTakeBounties(limit, session, snap, now, callerIp(req)),
-          hive: { peers: snap.spending, cooledUntil: snap.cooledUntil },
         });
         return;
       }
@@ -831,7 +809,7 @@ export function _resetForTests() {
   entries.clear();
   dirty.clear();
   deletedDirty.clear();
-  presence.clear();
+  sessions.clear();
   ipCooldown.clear();
   bounties.clear();
   reviewPending.clear();
