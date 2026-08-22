@@ -609,9 +609,11 @@ class TestHiveWaitForSlots:
         a, b = MockElement("A"), MockElement("B")
         sync = AsyncMock()
         with patch.object(cli, "_hive_run_sync", new=sync), \
+             patch.object(cli.relay_client, "lookup", return_value={}) as look, \
              patch.object(cli, "_sleep_cancellable_async", new=AsyncMock(return_value=False)):
             run_async(cli._hive_wait_for_slots(client, [(a, b)], [(a, b)]))
         sync.assert_awaited_once()  # exactly one sync, at the spend boundary
+        look.assert_called_once_with([("A", "B")])  # the per-beat batch probe
 
     def test_exits_on_cooldown_mid_wait(self):
         import infinite_craft_cli.cli as cli
@@ -634,6 +636,27 @@ class TestHiveWaitForSlots:
              patch.object(cli.relay_client, "sync_bounties", return_value={"results": {}, "posted": 0}):
             run_async(cli._hive_wait_for_slots(client, [(a, b)], [(a, b)]))
         assert waits["n"] >= 2
+
+    def test_fleet_fill_unblocks_without_a_slot(self):
+        """3.0.1 field fix: a rate-limited batch whose pairs the fleet has
+        answered must resolve within ~a beat, not wait for a local slot."""
+        import infinite_craft_cli.cli as cli
+        from unittest.mock import AsyncMock
+
+        _relay_on(cli)
+        client = make_mock_client()
+        client._rate_limiter.chrome_snapshot.return_value = (0, 60, 500)  # never a slot
+        client._rate_limiter._timestamps = []
+        a, b = MockElement("A"), MockElement("B")
+        key = cli.craft.pair_key("A", "B")
+        fills = [{}, {f"{key[0]}\0{key[1]}": ("Fleet Thing", "🐝")}]
+        with patch.object(cli.relay_client, "lookup", side_effect=fills) as look, \
+             patch.object(cli, "_sleep_cancellable_async", new=AsyncMock(return_value=False)):
+            run_async(cli._hive_wait_for_slots(client, [(a, b)], [(a, b)]))
+        assert look.call_count == 2  # probed each beat-wake
+        got = cli._pair_cache.get(key)
+        assert got is not None and got.name == "Fleet Thing"
+        assert cli._relay_hits == 1  # the bee ticks live, mid-wait
 
 
 class TestHiveRunSync:

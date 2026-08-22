@@ -1043,9 +1043,23 @@ async def _hive_wait_for_slots(client, batch, remaining) -> None:
         wait = 0.1
         if ts:
             wait = max(0.05, ts[0] + client._rate_limiter._window - time.monotonic())
+        # A fleet fill for THESE pairs is an event only the cache tier can
+        # show us: cap the sleep at the beat rhythm and probe just this
+        # batch's misses each wake, so a hive completion unblocks us in ~a
+        # beat — with zero slots spent — instead of stalling until the next
+        # local slot frees (3.0.1 field fix: rate-limited runs sat dark
+        # while their answers waited on the relay).
+        wait = min(wait, craft.beat_interval_ms() / 1000.0)
         if await _sleep_cancellable_async(wait):
             return  # cancelled
         waited = True
+        miss_names = [(p[0].name, p[1].name) for p in misses]
+        found = await asyncio.to_thread(relay_client.lookup, miss_names)
+        if found is None:
+            _relay_mark_unreachable()
+            return
+        _relay_apply_hive(client)
+        _merge_hive_results(found, miss_names)
 
 
 def _relay_spawn_bg(coro) -> None:

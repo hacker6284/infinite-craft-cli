@@ -1300,15 +1300,25 @@ async function hiveWaitForSlots(pairEl, tail) {
       if (waited) await hiveRunSync(tail); // sync-before-spend
       return;
     }
-    const wait = timestamps.length
-      ? Math.max(50, timestamps[0] + RATE_WINDOW - Date.now() + 10)
-      : 100;
+    // A fleet fill for THIS pair is an event only the cache tier can show
+    // us: cap the sleep at the beat rhythm and probe the pair each wake,
+    // so a hive completion unblocks us in ~a beat with zero slots spent
+    // (3.0.1 field fix; matches the CLI).
+    const wait = Math.min(
+      timestamps.length
+        ? Math.max(50, timestamps[0] + RATE_WINDOW - Date.now() + 10)
+        : 100,
+      Number(beatIntervalMs())
+    );
     try {
       await sleepCancellable(wait);
     } catch {
       return; // cancelled
     }
     waited = true;
+    const found = await relayLookup([[pairEl[0].text, pairEl[1].text]]);
+    if (found == null) return; // relayLookup marked the tier unreachable
+    mergeHiveResults(found);
   }
 }
 
