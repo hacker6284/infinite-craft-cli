@@ -202,15 +202,14 @@ def _reset_test_state() -> None:
     _relay_warmup_task = None
     _relay_bg_tasks.clear()
     global _cooldown_until, _cooldown_strikes, _bounty_task
-    global _bounties_worked, _bounty_progress, _bounty_poll_ms
+    global _bounties_worked, _bounty_progress, _run_id, _run_posted_once
     _cooldown_until = 0.0
     _cooldown_strikes = 0
     _bounty_task = None
     _bounties_worked = 0
     _bounty_progress = None
-    _bounty_poll_ms = 0
-    global _relay_retry_at
-    _relay_retry_at = 0.0
+    _run_id = ""
+    _run_posted_once = False
     relay_client.last_hive["peers"] = 0
     relay_client.last_hive["cooledUntil"] = 0
     _script_new_reg = []
@@ -775,8 +774,12 @@ _cooldown_strikes: int = 0
 _bounty_task: asyncio.Task | None = None
 _bounties_worked: int = 0
 _bounty_progress: tuple[int, int] | None = None  # (done, batch) while serving
-_bounty_poll_ms: int = 0  # relay pacing hint for the idle worker (0 = none)
-_relay_retry_at: float = 0.0  # monotonic gate for the unreachable-recovery probe
+# Active pair-lane run id, asserted in every beat. A run's bounties live on
+# the relay exactly as long as this id keeps appearing — clearing it (the
+# finally in _combine_pairs) IS the cancel mechanism; no revoke call exists.
+_run_id: str = ""
+_run_seq: int = 0
+_run_posted_once: bool = False  # the 🐝 posted line prints once per run
 
 
 def _cooling() -> bool:
@@ -797,20 +800,6 @@ def _trip_cooldown() -> None:
         f"  {_color('429 from neal.fun — standing down until ~' + resume, RED)} "
         f"(the ban is IP-wide and lasts hours; hive lookups still work)"
     )
-
-
-def _relay_presence() -> tuple[str, int]:
-    """State provider for relay headers: what this session is doing."""
-    if _cooling():
-        return ("cooled", int(_cooldown_until * 1000))
-    if _current_command:
-        return ("running", 0)
-    if _bounty_progress is not None:
-        return ("serving", 0)
-    return ("idle", 0)
-
-
-relay_client.state_provider = _relay_presence
 
 
 def _relay_apply_hive(client) -> None:
@@ -983,19 +972,57 @@ async def _hive_sweep(client, pairs) -> int:
     return _merge_hive_results(found, missing)
 
 
-async def _hive_aware_wait(client, batch, tail) -> None:
-    """Before spending rate slots on a batch's genuine misses, prefer the hive.
+async def _hive_run_sync(client, remaining) -> None:
+    """Batch-event hive sync — there is no timer behind it. Absorbs fills
+    for the pairs we're about to spend on (lookup on the head) and offers
+    everything beyond the slots free right now to the board (bound to this
+    run's id — the board entry lives exactly as long as our beats keep
+    asserting that id). Called at run start and before spending after a
+    rate wait."""
+    global _run_posted_once
+    if not _relay_active():
+        return
+    missing = [
+        (a.name, b.name)
+        for (a, b) in remaining
+        if craft.pair_key(a.name, b.name) not in _pair_cache
+    ]
+    if not missing:
+        return
+    left, _max, _f = client._rate_limiter.chrome_snapshot()
+    start, count = craft.bounty_sync_plan(len(missing), left)
+    head = missing[:start]
+    if head:
+        found = await asyncio.to_thread(relay_client.lookup, head)
+        if found is None:
+            _relay_mark_unreachable()
+            return
+        _relay_apply_hive(client)
+        _merge_hive_results(found, head)
+    if count > 0:
+        resp = await asyncio.to_thread(
+            relay_client.sync_bounties, missing[start : start + count], _run_id
+        )
+        if resp is None:
+            _relay_mark_unreachable()
+            return
+        _merge_hive_results(resp["results"], missing)
+        posted = resp.get("posted") or 0
+        if posted and not _run_posted_once:
+            _run_posted_once = True
+            _repl_print_lines(
+                _color(f"  🐝 posted {posted} bounties to the hive", DIM)
+            )
 
-    While the batch still has misses AND we lack the slots to cover them
-    without blocking, re-sweep the whole remaining ``tail`` against the hive
-    (pulling any fleet-filled pairs into the local cache for free) and wait a
-    short, cancellable tick. Returns once the batch is fully covered — either
-    every miss now has a slot free to spend, or the hive filled them — so the
-    subsequent gather never blocks inside acquire. No-ops when the relay is
-    down. Cancellation and 429 cooldown break the wait immediately."""
-    resweep_interval = craft.hive_resweep_interval_ms() / 1000.0
-    tick = craft.hive_wait_tick_ms() / 1000.0
-    last_resweep = 0.0
+
+async def _hive_wait_for_slots(client, batch, remaining) -> None:
+    """Event-driven rate wait: while this mini-batch has misses we lack
+    slots for, sleep until the next slot frees (the sliding window makes
+    the wake time exactly computable; the sleep is cancellable), then
+    sync-before-spend — so a freed slot is never burned on a pair the
+    fleet already answered. Cancellation and 429 cooldown exit
+    immediately; the beat task keeps liveness flowing throughout."""
+    waited = False
     while not _cancelled and not _cooling() and _relay_active():
         misses = [
             p
@@ -1005,59 +1032,20 @@ async def _hive_aware_wait(client, batch, tail) -> None:
         if not misses:
             return  # all cached → gather resolves for free
         left, maximum, _f = client._rate_limiter.chrome_snapshot()
-        if left >= len(misses):
-            return  # enough slots → gather won't block
-        if left >= 1 and left >= maximum:
-            # The window is as full as it will ever get and still can't cover
-            # the batch (only reachable if the same-IP budget split dropped the
-            # effective max below the batch size). Waiting can't help — proceed
-            # and let the gather spend what slots it has (review finding F4).
+        if left >= len(misses) or (left >= 1 and left >= maximum):
+            # Enough slots — or the window will never stretch further under
+            # the household split (review finding F4). Sync once before the
+            # spend if we actually waited.
+            if waited:
+                await _hive_run_sync(client, remaining)
             return
-        now = time.monotonic()
-        if now - last_resweep >= resweep_interval:
-            merged = await _hive_sweep(client, tail)
-            last_resweep = time.monotonic()
-            if merged:
-                continue  # re-evaluate: the batch's misses may have shrunk
-        if await _sleep_cancellable_async(tick):
+        ts = client._rate_limiter._timestamps
+        wait = 0.1
+        if ts:
+            wait = max(0.05, ts[0] + client._rate_limiter._window - time.monotonic())
+        if await _sleep_cancellable_async(wait):
             return  # cancelled
-
-
-async def _bounty_sync_heartbeat(client, pairs, run_pos) -> None:
-    """Demand heartbeat for a bulk run: lease the beyond-horizon slice of the
-    remaining misses to the hive every sync interval, absorbing any results
-    the fleet has already produced. ``run_pos`` is a one-element list the
-    batch loop advances so each pass re-derives live demand.
-
-    Stopping this task IS the cancel mechanism — leased bounties lapse
-    seconds after heartbeats stop — so _combine_pairs owns the task and
-    cancels it in a finally on every exit path. As belt and braces the loop
-    also exits itself on cancel, cooldown, and relay drop."""
-    posted_once = False
-    while not _cancelled and not _cooling() and _relay_active():
-        missing = [
-            (a.name, b.name)
-            for (a, b) in pairs[run_pos[0] :]
-            if craft.pair_key(a.name, b.name) not in _pair_cache
-        ]
-        left, maximum, _f = client._rate_limiter.chrome_snapshot()
-        start, count = craft.bounty_sync_plan(len(missing), left, maximum)
-        if count > 0:
-            resp = await asyncio.to_thread(
-                relay_client.sync_bounties, missing[start : start + count]
-            )
-            if resp is None:
-                _relay_mark_unreachable()
-                return
-            _merge_hive_results(resp["results"], missing)
-            posted = resp.get("posted") or 0
-            if not posted_once and posted:
-                posted_once = True
-                _repl_print_lines(
-                    _color(f"  🐝 posted {posted} bounties to the hive", DIM)
-                )
-        if await _sleep_cancellable_async(craft.bounty_sync_interval_ms() / 1000.0):
-            return  # cancelled
+        waited = True
 
 
 def _relay_spawn_bg(coro) -> None:
@@ -1105,37 +1093,28 @@ def _fleet_slot_available(client) -> bool:
     return left > 0
 
 
-async def _bounty_cycle(client, storage) -> str:
-    """One poll-and-serve pass. Returns a status the worker paces on:
-      "worked"       — served the batch fully with rate to spare (poll again now)
-      "empty"        — no work on the board (idle-poll)
-      "blocked"      — preempted or out of rate (back off to idle-poll)
-      "unreachable"  — relay dropped (idle-poll)
+async def _serve_hive(client, storage) -> str:
+    """One pull-and-serve pass, triggered by the beat's work bit.
 
-    Every bounty — pair or review — is answered by a FRESH neal call, never
-    from local cache: each contribution is an independent neal sighting (so it
-    counts toward peer review) and a poisoned local entry can never be
-    re-propagated into the hive. The relay refuses us whenever any session on
-    our IP is running, so this can never contest a household's own runs.
-    Serving never *blocks* on a rate slot — it checks availability first and
-    backs off to polling when the window is drained."""
-    global _bounties_worked, _bounty_progress, _bounty_poll_ms
+    Every item — pair or review — is answered by a FRESH neal call, never
+    from local cache: each contribution is an independent neal sighting (so
+    it counts toward peer review) and a poisoned local entry can never be
+    re-propagated into the hive. The relay refuses us whenever any session
+    in our household is mid-run. Serving never blocks on a rate slot — it
+    checks availability first and stops when the window drains. Runs inline
+    in the beat loop; the lapse threshold tolerates the gap."""
+    global _bounties_worked, _bounty_progress
     if _bounty_preempted():
-        _bounty_poll_ms = 0  # local refusal: a stale fast hint must not spin us
         return "blocked"
     left, _max, _frac = client._rate_limiter.chrome_snapshot()
     if left <= 0:
-        _bounty_poll_ms = 0
         return "blocked"  # rate-limited — don't even claim work we can't do
-    # Claim only as many as we can actually serve this window, so we don't
-    # lock bounties we'll abandon to their claim-TTL (review finding F3).
-    resp = await asyncio.to_thread(
-        relay_client.take_bounties, craft.bounty_claim_limit(left)
+    items = await asyncio.to_thread(
+        relay_client.pull_work, craft.bounty_claim_limit(left)
     )
-    if resp is None:
+    if items is None:
         _relay_mark_unreachable()
         return "unreachable"
-    items, _bounty_poll_ms = resp
     _relay_apply_hive(client)
     if not items:
         return "empty"
@@ -1189,44 +1168,34 @@ async def _bounty_cycle(client, storage) -> str:
     return status
 
 
-async def _relay_retry_probe() -> None:
-    """Un-deafen the hive tier: 'unreachable' was a one-way door (a single
-    relay nap — routine on a spin-down free instance — silenced serving until
-    a manual /relay toggle; 2.4.1 field bug). When the tier is user-on but
-    marked unreachable, probe /health on the kernel retry cadence and restore
-    on success. The ping doubles as the wake-up call for a spun-down relay,
-    which also breaks the fleet-wide blackout spiral (nobody polls → the
-    relay never wakes)."""
-    global _relay_reachable, _relay_retry_at
-    if not _relay_user_on or _relay_reachable is not False:
-        return
-    now = time.monotonic()
-    if now < _relay_retry_at:
-        return
-    _relay_retry_at = now + craft.relay_retry_interval_ms() / 1000.0
-    health = await asyncio.to_thread(relay_client.ping)
-    if health is not None:
-        _relay_reachable = True
+async def _beat_worker(client, storage) -> None:
+    """THE one timer (~1s): send a liveness beat, act on the work bit.
 
-
-async def _bounty_worker(client, storage) -> None:
-    """Serve the hive while idle at the prompt. Eager while there's work and
-    rate to spare — after finishing a batch it re-checks the board immediately
-    instead of idling a full poll interval, so a long-idle client uses its
-    whole rate budget for the fleet rather than ~half. Falls back to the 10s
-    poll (which doubles as the presence heartbeat) when the board is empty or
-    the rate window is drained."""
+    The beat carries neal reachability, the active run id (a run's board
+    entries live exactly as long as the id keeps appearing), and any 429
+    cooldown to broadcast to the household. A failed beat marks the hive
+    tier unreachable; the next successful one restores it — the beat IS
+    the recovery probe, and it keeps flowing while the tier is down so a
+    spun-down relay gets woken. Everything else in the hive protocol is
+    an event."""
+    global _relay_reachable
     while True:
-        status = "blocked"
-        with contextlib.suppress(Exception):
-            await _relay_retry_probe()
-            status = await _bounty_cycle(client, storage)
-        if status == "worked":
-            await asyncio.sleep(0)  # yield to the loop, then serve again now
-            continue
-        # Idle pacing: the relay hints how soon to come back (fast while the
-        # board is deep for an eligible caller, the kernel default otherwise).
-        await asyncio.sleep((_bounty_poll_ms or craft.bounty_poll_interval_ms()) / 1000.0)
+        if _relay_user_on:
+            cooled_ms = int(_cooldown_until * 1000) if _cooling() else 0
+            resp = await asyncio.to_thread(
+                relay_client.beat, not _cooling(), _run_id, cooled_ms
+            )
+            if resp is None:
+                if _relay_reachable is not False:
+                    _relay_mark_unreachable()
+            else:
+                if _relay_reachable is not True:
+                    _relay_reachable = True
+                _ok, work = resp
+                if work and not _bounty_preempted():
+                    with contextlib.suppress(Exception):
+                        await _serve_hive(client, storage)
+        await asyncio.sleep(craft.beat_interval_ms() / 1000.0)
 
 
 def _request_skip_current() -> bool:
@@ -2435,8 +2404,6 @@ async def _combine_pairs(client, storage, pairs: list[tuple], collect: dict | No
     # beat absorbs their results as free local hits. The run OWNS the task:
     # cancelling it (the finally below) is what lets a cancelled run's board
     # entries lapse, so it must stop on every exit path.
-    run_pos = [0]
-    heartbeat: asyncio.Task | None = None
     total = len(pairs)
     new_count = 0
     nothing_count = 0
@@ -2513,17 +2480,18 @@ async def _combine_pairs(client, storage, pairs: list[tuple], collect: dict | No
                 if stop:
                     return
 
-    # Start the heartbeat as the LAST step before the guarded loop: nothing
-    # may run between task creation and the try, or an exception there would
-    # leak a heartbeat that keeps renewing leases (review: spec finding 1).
-    if _relay_active() and len(pairs) > 1:
-        heartbeat = asyncio.create_task(
-            _bounty_sync_heartbeat(client, pairs, run_pos)
-        )
+    # The run asserts an id from here on: every beat carries it, and the
+    # run's board entries live exactly as long as it keeps appearing. The
+    # finally clears it — that IS cancellation, on every exit path.
+    global _run_id, _run_seq, _run_posted_once
+    _run_seq += 1
+    _run_posted_once = False
     # Process in batches of API_CONCURRENCY to avoid overwhelming the rate limiter
     try:
+        _run_id = f"{relay_client.SESSION_ID}-{_run_seq}"
+        if _relay_active() and len(pairs) > 1:
+            await _hive_run_sync(client, pairs)
         for i in range(0, len(pairs), API_CONCURRENCY):
-            run_pos[0] = i
             if _cancelled:
                 break
             if _cooling():
@@ -2533,13 +2501,11 @@ async def _combine_pairs(client, storage, pairs: list[tuple], collect: dict | No
                 )
                 break
             batch = pairs[i : i + API_CONCURRENCY]
-            # Hive-aware wait: rather than block inside the gather waiting on a
-            # rate slot for a genuine miss, keep draining the hive for the tail
-            # (pairs the fleet fills land as free cache hits) and wait only until
-            # a slot frees or these pairs get filled. Spend a scarce neal slot
-            # only on pairs the hive genuinely can't provide.
+            # Event-driven rate wait + sync-before-spend: sleep until slots
+            # free (no ticks), then absorb hive fills so a scarce neal slot
+            # is spent only on pairs the fleet genuinely hasn't provided.
             if _relay_active():
-                await _hive_aware_wait(client, batch, pairs[i:])
+                await _hive_wait_for_slots(client, batch, pairs[i:])
                 if _cancelled:
                     break
                 if _cooling():
@@ -2553,12 +2519,10 @@ async def _combine_pairs(client, storage, pairs: list[tuple], collect: dict | No
                 _set_last_pair(batch[0][0].name, batch[0][1].name)
             await asyncio.gather(*(process(a, b) for a, b in batch))
     finally:
-        # Stopping the heartbeat is what cancels our board leases — they
-        # lapse a few missed beats after this. Must run on every exit.
-        if heartbeat is not None:
-            heartbeat.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await heartbeat
+        # Dropping the run id from our beats is what expires this run's
+        # board entries — the relay clears them beat_lapse_ms later, on
+        # every exit path, with no revoke call.
+        _run_id = ""
 
     if _cancelled:
         _repl_print_lines(
@@ -4402,7 +4366,7 @@ async def interactive_mode():
             _rate_ticker_task = asyncio.create_task(_rate_ticker_loop())
             _relay_spawn_warmup(storage)
             global _bounty_task, _relay_warmup_task
-            _bounty_task = asyncio.create_task(_bounty_worker(client, storage))
+            _bounty_task = asyncio.create_task(_beat_worker(client, storage))
             starters = "  ".join(format_element(e) for e in storage.get_all()[:4])
             _repl_print_lines(f"  Starting elements: {starters}")
             total = len(storage.get_all())

@@ -343,120 +343,131 @@ class TestBudgetSplit:
         assert cli._cooling()
 
 
-class TestBountyWorker:
-    def test_cycle_serves_then_contributes_via_neal(self):
+class TestServeHive:
+    """Pull-and-serve, triggered by the beat's work bit — no polling."""
+
+    def test_serves_then_contributes_via_neal(self):
         import infinite_craft_cli.cli as cli
 
         _relay_on(cli)
         client = make_mock_client()
         client.pair.return_value = MockElement("Dust", "")
         storage = make_mock_storage()
-        bounties = [{"kind": "pair", "first": "Earth", "second": "Wind"}]
-
-        with patch.object(cli.relay_client, "take_bounties", return_value=(bounties, 0)), \
+        work = [{"kind": "pair", "first": "Earth", "second": "Wind"}]
+        with patch.object(cli.relay_client, "pull_work", return_value=work), \
              patch.object(cli.relay_client, "contribute", return_value=1) as contrib:
-            run_async(cli._bounty_cycle(client, storage))
-
+            status = run_async(cli._serve_hive(client, storage))
         client.pair.assert_awaited_once()
         assert client.pair.await_args.kwargs.get("fleet") is True
         assert contrib.called
         assert cli._bounties_worked == 1
         assert cli._bounty_progress is None  # reset in finally
+        assert status == "worked"
 
-    def test_bounty_always_hits_neal_even_when_locally_cached(self):
-        """Poison-containment: a pair we already hold locally must still be
-        re-derived from neal when served as a bounty, never answered from
-        the local cache."""
+    def test_always_hits_neal_even_when_locally_cached(self):
+        """Poison-containment: a locally-cached pair must still be re-derived
+        from neal when served, never answered from the local cache."""
         import infinite_craft_cli.cli as cli
 
         _relay_on(cli)
         client = make_mock_client()
         client.pair.return_value = MockElement("Real", "")
         storage = make_mock_storage()
-        # Pre-seed local cache with a (possibly poisoned) value.
         cli._pair_cache[cli.craft.pair_key("Earth", "Wind")] = MockElement("Stale", "")
-        bounties = [{"kind": "pair", "first": "Earth", "second": "Wind"}]
-
+        work = [{"kind": "pair", "first": "Earth", "second": "Wind"}]
         contributed = []
-        with patch.object(cli.relay_client, "take_bounties", return_value=(bounties, 0)), \
-             patch.object(cli.relay_client, "contribute", side_effect=lambda e: contributed.extend(e) or 1):
-            run_async(cli._bounty_cycle(client, storage))
-
-        client.pair.assert_awaited_once()  # hit neal despite the cache
-        # Contributed the FRESH neal value, not the stale cache entry.
+        with patch.object(cli.relay_client, "pull_work", return_value=work), \
+             patch.object(cli.relay_client, "contribute",
+                          side_effect=lambda e: contributed.extend(e) or 1):
+            run_async(cli._serve_hive(client, storage))
+        client.pair.assert_awaited_once()
         assert contributed[0][2] == "Real"
 
-    def test_cycle_noop_when_preempted(self):
+    def test_noop_when_preempted(self):
         import infinite_craft_cli.cli as cli
 
         _relay_on(cli)
         client = make_mock_client()
         storage = make_mock_storage()
         cli._current_command = "/permute *"
-        with patch.object(cli.relay_client, "take_bounties") as take:
-            status = run_async(cli._bounty_cycle(client, storage))
-            take.assert_not_called()
+        with patch.object(cli.relay_client, "pull_work") as pull:
+            status = run_async(cli._serve_hive(client, storage))
+            pull.assert_not_called()
         assert status == "blocked"
 
-    def test_cycle_returns_worked_with_rate_to_spare(self):
-        import infinite_craft_cli.cli as cli
-
-        _relay_on(cli)
-        client = make_mock_client()  # mock limiter reports 60 free
-        client.pair.return_value = MockElement("Dust", "")
-        storage = make_mock_storage()
-        bounties = [{"kind": "pair", "first": "Earth", "second": "Wind"}]
-        with patch.object(cli.relay_client, "take_bounties", return_value=(bounties, 0)), \
-             patch.object(cli.relay_client, "contribute", return_value=1):
-            status = run_async(cli._bounty_cycle(client, storage))
-        # Full batch served with rate left → the worker will poll again now.
-        assert status == "worked"
-
-    def test_cycle_blocked_when_rate_limited_claims_nothing(self):
+    def test_blocked_when_rate_limited_pulls_nothing(self):
         import infinite_craft_cli.cli as cli
 
         _relay_on(cli)
         client = make_mock_client()
-        # Window drained → no slot available.
         client._rate_limiter.chrome_snapshot.return_value = (0, 60, 500)
         storage = make_mock_storage()
-        with patch.object(cli.relay_client, "take_bounties") as take:
-            status = run_async(cli._bounty_cycle(client, storage))
-            take.assert_not_called()  # don't claim work we can't do
+        with patch.object(cli.relay_client, "pull_work") as pull:
+            status = run_async(cli._serve_hive(client, storage))
+            pull.assert_not_called()  # don't claim work we can't do
         assert status == "blocked"
 
-    def test_cycle_returns_empty_when_board_empty(self):
+    def test_pull_sized_by_kernel_claim_limit(self):
         import infinite_craft_cli.cli as cli
 
         _relay_on(cli)
         client = make_mock_client()
+        client._rate_limiter.chrome_snapshot.return_value = (3, 60, 1000)
         storage = make_mock_storage()
-        with patch.object(cli.relay_client, "take_bounties", return_value=([], 0)):
-            status = run_async(cli._bounty_cycle(client, storage))
+        with patch.object(cli.relay_client, "pull_work", return_value=[]) as pull:
+            status = run_async(cli._serve_hive(client, storage))
+        pull.assert_called_once_with(3)  # kernel bounty_claim_limit(left=3)
         assert status == "empty"
 
-    def test_cycle_stops_serving_when_rate_runs_out_midbatch(self):
+    def test_stops_serving_when_rate_runs_out_midbatch(self):
         import infinite_craft_cli.cli as cli
 
         _relay_on(cli)
         client = make_mock_client()
         client.pair.return_value = MockElement("Dust", "")
-        # First availability check True (serve pair 1), then drained.
         client._rate_limiter.chrome_snapshot.side_effect = [
-            (60, 60, 1000),  # cycle entry gate
-            (60, 60, 1000),  # before pair 1 → serve
-            (0, 60, 500),    # before pair 2 → stop
+            (60, 60, 1000),  # entry gate
+            (60, 60, 1000),  # before item 1 → serve
+            (0, 60, 500),    # before item 2 → stop
         ]
         storage = make_mock_storage()
-        bounties = [
+        work = [
             {"kind": "pair", "first": "Earth", "second": "Wind"},
             {"kind": "pair", "first": "Fire", "second": "Water"},
         ]
-        with patch.object(cli.relay_client, "take_bounties", return_value=(bounties, 0)), \
+        with patch.object(cli.relay_client, "pull_work", return_value=work), \
              patch.object(cli.relay_client, "contribute", return_value=1):
-            status = run_async(cli._bounty_cycle(client, storage))
-        assert client.pair.await_count == 1  # only the first, then backed off
+            status = run_async(cli._serve_hive(client, storage))
+        assert client.pair.await_count == 1
         assert status == "blocked"
+
+    def test_serving_nothing_reports_blocked_not_worked(self):
+        """A pass that pulls work but serves none (non-429 outage) must not
+        report 'worked'."""
+        import infinite_craft_cli.cli as cli
+
+        _relay_on(cli)
+        client = make_mock_client()
+        client.pair.side_effect = RuntimeError("neal 503")
+        storage = make_mock_storage()
+        work = [{"kind": "pair", "first": "Earth", "second": "Wind"}]
+        with patch.object(cli.relay_client, "pull_work", return_value=work), \
+             patch.object(cli.relay_client, "contribute", return_value=1) as contrib:
+            status = run_async(cli._serve_hive(client, storage))
+        assert cli._bounties_worked == 0
+        assert not contrib.called
+        assert status == "blocked"
+
+    def test_unreachable_pull_marks_tier_down(self):
+        import infinite_craft_cli.cli as cli
+
+        _relay_on(cli)
+        client = make_mock_client()
+        storage = make_mock_storage()
+        with patch.object(cli.relay_client, "pull_work", return_value=None):
+            status = run_async(cli._serve_hive(client, storage))
+        assert status == "unreachable"
+        assert cli._relay_reachable is False
 
     def test_worker_preempted_by_running_command(self):
         import infinite_craft_cli.cli as cli
@@ -467,59 +478,104 @@ class TestBountyWorker:
         cli._current_command = ""
         assert cli._bounty_preempted() is False
 
-    def test_worker_preempted_while_cooling(self):
+
+class TestBeatWorker:
+    """THE one timer: liveness out, work bit back, recovery built in."""
+
+    def _run_iters(self, cli, client, storage, n):
+        """Run n beat-loop iterations, then cancel via the sleep."""
+        calls = {"n": 0}
+
+        async def fake_sleep(secs):
+            calls["n"] += 1
+            assert secs == cli.craft.beat_interval_ms() / 1000.0
+            if calls["n"] >= n:
+                raise asyncio.CancelledError()
+
+        with patch("infinite_craft_cli.cli.asyncio.sleep", side_effect=fake_sleep):
+            with pytest.raises(asyncio.CancelledError):
+                run_async(cli._beat_worker(client, storage))
+
+    def test_beat_failure_marks_unreachable_but_beats_continue(self):
         import infinite_craft_cli.cli as cli
 
-        _relay_on(cli)
-        cli._current_command = ""
-        assert cli._bounty_preempted() is False
-        cli._trip_cooldown()  # never serve the hive while banned
-        assert cli._bounty_preempted() is True
-
-    def test_worker_preempted_when_relay_off(self):
-        import infinite_craft_cli.cli as cli
-
-        cli._current_command = ""
-        cli._relay_user_on = False
-        assert cli._bounty_preempted() is True
-
-
-class TestHiveAwareWait:
-    def test_returns_when_hive_fills_the_miss(self):
-        """The payoff path: rate-limited, but the fleet fills the pair — we
-        resolve it from cache for free instead of spending a slot."""
-        import infinite_craft_cli.cli as cli
-
-        _relay_on(cli)
+        cli._relay_user_on = True
+        cli._relay_reachable = True
         client = make_mock_client()
-        client._rate_limiter.chrome_snapshot.return_value = (0, 60, 500)  # drained
         storage = make_mock_storage()
-        a, b = MockElement("A"), MockElement("B")
-        key = _nul_key(cli, "A", "B")
-        with patch.object(cli.relay_client, "lookup", return_value={key: ("AB", "")}):
-            run_async(cli._hive_aware_wait(client, [(a, b)], [(a, b)]))
-        assert cli.craft.pair_key("A", "B") in cli._pair_cache  # filled, no slot spent
+        with patch.object(cli.relay_client, "beat", return_value=None) as beat:
+            self._run_iters(cli, client, storage, 2)
+        assert beat.call_count == 2  # kept beating while down — beats ARE the probe
+        assert cli._relay_reachable is False
 
-    def test_returns_immediately_when_a_slot_is_free(self):
+    def test_beat_success_restores_tier(self):
         import infinite_craft_cli.cli as cli
+
+        cli._relay_user_on = True
+        cli._relay_reachable = False  # a past failure deafened the tier
+        client = make_mock_client()
+        storage = make_mock_storage()
+        with patch.object(cli.relay_client, "beat", return_value=(True, False)):
+            self._run_iters(cli, client, storage, 1)
+        assert cli._relay_reachable is True
+
+    def test_work_bit_triggers_serve(self):
+        import infinite_craft_cli.cli as cli
+        from unittest.mock import AsyncMock
+
+        cli._relay_user_on = True
+        cli._relay_reachable = True
+        client = make_mock_client()
+        storage = make_mock_storage()
+        serve = AsyncMock(return_value="worked")
+        with patch.object(cli.relay_client, "beat", return_value=(True, True)), \
+             patch.object(cli, "_serve_hive", new=serve):
+            self._run_iters(cli, client, storage, 1)
+        serve.assert_awaited_once()
+
+    def test_no_serve_without_work_bit(self):
+        import infinite_craft_cli.cli as cli
+        from unittest.mock import AsyncMock
+
+        cli._relay_user_on = True
+        cli._relay_reachable = True
+        client = make_mock_client()
+        storage = make_mock_storage()
+        serve = AsyncMock()
+        with patch.object(cli.relay_client, "beat", return_value=(True, False)), \
+             patch.object(cli, "_serve_hive", new=serve):
+            self._run_iters(cli, client, storage, 1)
+        serve.assert_not_awaited()
+
+    def test_beat_carries_run_id_and_cooldown(self):
+        import infinite_craft_cli.cli as cli
+
+        cli._relay_user_on = True
+        cli._relay_reachable = True
+        cli._run_id = "sess-7"
+        cli._cooldown_until = cli.time.time() + 3600
+        client = make_mock_client()
+        storage = make_mock_storage()
+        with patch.object(cli.relay_client, "beat", return_value=(True, False)) as beat:
+            self._run_iters(cli, client, storage, 1)
+        neal_ok, run_id, cooled_ms = beat.call_args.args
+        assert neal_ok is False  # cooling → we cannot usefully reach neal
+        assert run_id == "sess-7"
+        assert cooled_ms > 0
+
+
+class TestHiveWaitForSlots:
+    def test_returns_immediately_when_slots_cover_and_skips_sync_without_wait(self):
+        import infinite_craft_cli.cli as cli
+        from unittest.mock import AsyncMock
 
         _relay_on(cli)
         client = make_mock_client()  # 60 free
         a, b = MockElement("A"), MockElement("B")
-        with patch.object(cli.relay_client, "lookup") as look:
-            run_async(cli._hive_aware_wait(client, [(a, b)], [(a, b)]))
-            look.assert_not_called()  # slot available → no need to drain/wait
-
-    def test_noop_when_relay_off(self):
-        import infinite_craft_cli.cli as cli
-
-        cli._relay_user_on = False
-        client = make_mock_client()
-        client._rate_limiter.chrome_snapshot.return_value = (0, 60, 500)
-        a, b = MockElement("A"), MockElement("B")
-        with patch.object(cli.relay_client, "lookup") as look:
-            run_async(cli._hive_aware_wait(client, [(a, b)], [(a, b)]))
-            look.assert_not_called()
+        sync = AsyncMock()
+        with patch.object(cli, "_hive_run_sync", new=sync):
+            run_async(cli._hive_wait_for_slots(client, [(a, b)], [(a, b)]))
+        sync.assert_not_awaited()  # no wait happened → start-of-run sync suffices
 
     def test_returns_when_batch_already_cached(self):
         import infinite_craft_cli.cli as cli
@@ -527,178 +583,138 @@ class TestHiveAwareWait:
         _relay_on(cli)
         client = make_mock_client()
         client._rate_limiter.chrome_snapshot.return_value = (0, 60, 500)
-        cli._pair_cache[cli.craft.pair_key("A", "B")] = MockElement("AB")
         a, b = MockElement("A"), MockElement("B")
-        with patch.object(cli.relay_client, "lookup") as look:
-            run_async(cli._hive_aware_wait(client, [(a, b)], [(a, b)]))
-            look.assert_not_called()  # nothing unresolved → don't wait
+        cli._pair_cache[cli.craft.pair_key("A", "B")] = MockElement("C")
+        run_async(cli._hive_wait_for_slots(client, [(a, b)], [(a, b)]))
 
-
-class TestReviewFixes:
-    def test_cycle_serving_nothing_reports_blocked_not_worked(self):
-        """F1: a cycle that claims work but serves none (non-429 neal outage)
-        must not return 'worked', or the eager worker skips its backoff."""
+    def test_noop_when_relay_off(self):
         import infinite_craft_cli.cli as cli
 
-        _relay_on(cli)
-        client = make_mock_client()  # 60 free
-        client.pair.side_effect = RuntimeError("neal 503")  # generic outage
-        storage = make_mock_storage()
-        bounties = [{"kind": "pair", "first": "Earth", "second": "Wind"}]
-        with patch.object(cli.relay_client, "take_bounties", return_value=(bounties, 0)), \
-             patch.object(cli.relay_client, "contribute", return_value=1) as contrib:
-            status = run_async(cli._bounty_cycle(client, storage))
-        assert cli._bounties_worked == 0
-        assert not contrib.called
-        assert status == "blocked"  # → worker backs off, no budget burst
-
-    def test_cycle_claims_only_available_slots(self):
-        """F3: with 3 free slots, claim at most 3 (not 5) so we don't lock
-        bounties we'd abandon to their claim-TTL."""
-        import infinite_craft_cli.cli as cli
-
-        _relay_on(cli)
+        cli._relay_user_on = False
         client = make_mock_client()
-        client._rate_limiter.chrome_snapshot.return_value = (3, 60, 1000)
-        client.pair.return_value = MockElement("X", "")
-        storage = make_mock_storage()
-        with patch.object(cli.relay_client, "take_bounties", return_value=([], 0)) as take, \
-             patch.object(cli.relay_client, "contribute", return_value=1):
-            run_async(cli._bounty_cycle(client, storage))
-        take.assert_called_once_with(3)  # kernel bounty_claim_limit(left=3)
+        a, b = MockElement("A"), MockElement("B")
+        run_async(cli._hive_wait_for_slots(client, [(a, b)], [(a, b)]))
 
-    def test_worker_eager_polls_after_worked_then_backs_off(self):
-        """Eager cadence: 'worked' → immediate re-poll (sleep 0); anything
-        else → the poll interval."""
+    def test_sleeps_until_slot_frees_then_syncs_before_spend(self):
         import infinite_craft_cli.cli as cli
         from unittest.mock import AsyncMock
 
+        _relay_on(cli)
         client = make_mock_client()
-        storage = make_mock_storage()
-        poll = cli.craft.bounty_poll_interval_ms() / 1000.0
+        client._rate_limiter.chrome_snapshot.side_effect = [
+            (0, 60, 500),   # no slot → wait
+            (60, 60, 1000), # slot freed → sync-before-spend, return
+        ]
+        client._rate_limiter._timestamps = []
+        a, b = MockElement("A"), MockElement("B")
+        sync = AsyncMock()
+        with patch.object(cli, "_hive_run_sync", new=sync), \
+             patch.object(cli, "_sleep_cancellable_async", new=AsyncMock(return_value=False)):
+            run_async(cli._hive_wait_for_slots(client, [(a, b)], [(a, b)]))
+        sync.assert_awaited_once()  # exactly one sync, at the spend boundary
 
-        def last_sleep_for(status_val):
-            sleeps = []
-
-            async def fake_sleep(secs):
-                sleeps.append(secs)
-                raise asyncio.CancelledError()  # break after the first sleep
-
-            with patch.object(cli, "_bounty_cycle", new=AsyncMock(return_value=status_val)), \
-                 patch("infinite_craft_cli.cli.asyncio.sleep", side_effect=fake_sleep):
-                with pytest.raises(asyncio.CancelledError):
-                    run_async(cli._bounty_worker(client, storage))
-            return sleeps[-1]
-
-        assert last_sleep_for("worked") == 0  # immediate re-poll
-        assert last_sleep_for("empty") == poll  # back off
-        assert last_sleep_for("blocked") == poll
-
-    def test_hive_aware_wait_ticks_then_exits_on_cooldown(self):
-        """F4/coverage: the load-bearing loop path — no slot, hive doesn't
-        fill — sleeps a tick and re-loops, exiting when cooldown trips."""
+    def test_exits_on_cooldown_mid_wait(self):
         import infinite_craft_cli.cli as cli
 
         _relay_on(cli)
         client = make_mock_client()
-        client._rate_limiter.chrome_snapshot.return_value = (0, 60, 500)  # never a slot
-        storage = make_mock_storage()
+        client._rate_limiter.chrome_snapshot.return_value = (0, 60, 500)
+        client._rate_limiter._timestamps = []
         a, b = MockElement("A"), MockElement("B")
-        ticks = {"n": 0}
+        waits = {"n": 0}
 
-        async def fake_tick(_secs):
-            ticks["n"] += 1
-            if ticks["n"] >= 2:
-                cli._cooldown_until = cli.time.time() + 3600  # trip cooldown → exit
-            return False  # not cancelled
+        async def fake_sleep(_secs):
+            waits["n"] += 1
+            if waits["n"] >= 2:
+                cli._cooldown_until = cli.time.time() + 3600
+            return False
 
-        # hive never fills (lookup returns no hit for this pair)
-        with patch.object(cli.relay_client, "lookup", return_value={}), \
-             patch.object(cli, "_sleep_cancellable_async", side_effect=fake_tick):
-            run_async(cli._hive_aware_wait(client, [(a, b)], [(a, b)]))
-        assert ticks["n"] >= 2  # it actually looped-and-slept, then exited
+        with patch.object(cli, "_sleep_cancellable_async", side_effect=fake_sleep), \
+             patch.object(cli.relay_client, "lookup", return_value={}), \
+             patch.object(cli.relay_client, "sync_bounties", return_value={"results": {}, "posted": 0}):
+            run_async(cli._hive_wait_for_slots(client, [(a, b)], [(a, b)]))
+        assert waits["n"] >= 2
 
 
+class TestHiveRunSync:
+    def _pairs(self, n):
+        return [(MockElement(f"A{i}"), MockElement(f"B{i}")) for i in range(n)]
 
-class TestBountySyncHeartbeat:
-    """The demand heartbeat: leases are renewed only while a run is alive,
-    so termination on every exit path is the load-bearing property — a
-    leaked heartbeat renews zombie bounties other users spend real rate on."""
+    def test_head_looked_up_tail_offered_with_run_id(self):
+        import infinite_craft_cli.cli as cli
+
+        _relay_on(cli)
+        cli._run_id = "sess-1"
+        client = make_mock_client()  # 60 free
+        pairs = self._pairs(130)
+        with patch.object(cli.relay_client, "lookup", return_value={}) as look, \
+             patch.object(cli.relay_client, "sync_bounties",
+                          return_value={"results": {}, "posted": 70}) as sync:
+            run_async(cli._hive_run_sync(client, pairs))
+        # Head = the 60 we can spend on now; tail = everything else, offered.
+        assert look.call_args.args[0] == [(f"A{i}", f"B{i}") for i in range(60)]
+        sent, run_id = sync.call_args.args
+        assert sent == [(f"A{i}", f"B{i}") for i in range(60, 130)]
+        assert run_id == "sess-1"
+
+    def test_no_offer_when_slots_cover_everything(self):
+        import infinite_craft_cli.cli as cli
+
+        _relay_on(cli)
+        client = make_mock_client()
+        pairs = self._pairs(5)
+        with patch.object(cli.relay_client, "lookup", return_value={}) as look, \
+             patch.object(cli.relay_client, "sync_bounties") as sync:
+            run_async(cli._hive_run_sync(client, pairs))
+        assert len(look.call_args.args[0]) == 5
+        sync.assert_not_called()
+
+    def test_posted_line_prints_once_per_run(self, capsys):
+        import infinite_craft_cli.cli as cli
+
+        _relay_on(cli)
+        cli._run_id = "sess-1"
+        client = make_mock_client()
+        client._rate_limiter.chrome_snapshot.return_value = (0, 60, 500)
+        pairs = self._pairs(3)
+        with patch.object(cli.relay_client, "sync_bounties",
+                          return_value={"results": {}, "posted": 3}):
+            run_async(cli._hive_run_sync(client, pairs))
+            run_async(cli._hive_run_sync(client, pairs))
+        out = capsys.readouterr().out
+        assert out.count("posted 3 bounties") == 1
+
+    def test_relay_drop_marks_unreachable(self):
+        import infinite_craft_cli.cli as cli
+
+        _relay_on(cli)
+        client = make_mock_client()
+        with patch.object(cli.relay_client, "lookup", return_value=None):
+            run_async(cli._hive_run_sync(client, self._pairs(5)))
+        assert cli._relay_reachable is False
+
+    def test_polling_api_is_gone(self):
+        import infinite_craft_cli.cli as cli
+
+        assert not hasattr(cli.relay_client, "take_bounties")
+        assert not hasattr(cli.relay_client, "post_bounties")
+        assert not hasattr(cli.relay_client, "state_provider")
+
+
+class TestRunIdLifecycle:
+    """Dropping the run id from beats IS cancellation — it must clear on
+    every exit path of _combine_pairs, and be asserted while it runs."""
 
     def _pairs(self, n):
         return [(MockElement(f"A{i}"), MockElement(f"B{i}")) for i in range(n)]
 
-    # ── the coroutine's own exit conditions ──────────────────────────
+    def _run(self, cli, client, storage, pairs, expect_error=None):
+        seen = {}
 
-    def test_heartbeat_stops_on_relay_drop(self):
-        import infinite_craft_cli.cli as cli
+        async def spy_sync(_client, _remaining):
+            seen["run_id"] = cli._run_id
 
-        _relay_on(cli)
-        client = make_mock_client()  # limiter reports (60, 60) → horizon 120
-        pairs = self._pairs(130)  # 10 misses beyond the horizon
-        with patch.object(cli.relay_client, "sync_bounties", return_value=None) as sync:
-            run_async(cli._bounty_sync_heartbeat(client, pairs, [0]))
-        sync.assert_called_once()
-        assert cli._relay_reachable is False  # drop marked, tier restored
-
-    def test_heartbeat_syncs_exact_beyond_horizon_slice(self):
-        import infinite_craft_cli.cli as cli
-        from unittest.mock import AsyncMock
-
-        _relay_on(cli)
-        client = make_mock_client()
-        pairs = self._pairs(130)
-        resp = {"results": {}, "posted": 10, "renewed": 0}
-        with patch.object(cli.relay_client, "sync_bounties", return_value=resp) as sync, \
-             patch.object(cli, "_sleep_cancellable_async", new=AsyncMock(return_value=True)):
-            run_async(cli._bounty_sync_heartbeat(client, pairs, [0]))
-        sync.assert_called_once()
-        sent = sync.call_args.args[0]
-        # Exactly the prioritized tail past horizon = left + max = 120.
-        assert sent == [(f"A{i}", f"B{i}") for i in range(120, 130)]
-
-    def test_heartbeat_noop_when_misses_fit_horizon(self):
-        import infinite_craft_cli.cli as cli
-        from unittest.mock import AsyncMock
-
-        _relay_on(cli)
-        client = make_mock_client()
-        pairs = self._pairs(5)  # well inside the horizon
-        with patch.object(cli.relay_client, "sync_bounties") as sync, \
-             patch.object(cli, "_sleep_cancellable_async", new=AsyncMock(return_value=True)):
-            run_async(cli._bounty_sync_heartbeat(client, pairs, [0]))
-        sync.assert_not_called()
-
-    def test_heartbeat_exits_on_cooldown(self):
-        import infinite_craft_cli.cli as cli
-
-        _relay_on(cli)
-        client = make_mock_client()
-        cli._cooldown_until = cli.time.time() + 3600
-        with patch.object(cli.relay_client, "sync_bounties") as sync:
-            run_async(cli._bounty_sync_heartbeat(client, self._pairs(130), [0]))
-        sync.assert_not_called()
-
-    def test_one_shot_posting_is_gone(self):
-        import infinite_craft_cli.cli as cli
-
-        assert not hasattr(cli.relay_client, "post_bounties")
-
-    # ── _combine_pairs owns the task: cancelled on EVERY exit path ───
-
-    def _run_combine_with_fake_heartbeat(self, cli, client, storage, pairs,
-                                         expect_error=None):
-        state = {}
-
-        async def fake_hb(_client, _pairs, _run_pos):
-            state["started"] = True
-            try:
-                await asyncio.sleep(3600)  # would outlive any run
-            except asyncio.CancelledError:
-                state["cancelled"] = True
-                raise
-
-        with patch.object(cli, "_bounty_sync_heartbeat", new=fake_hb), \
+        with patch.object(cli, "_hive_run_sync", new=spy_sync), \
              patch.object(cli.relay_client, "lookup", return_value={}), \
              patch.object(cli.relay_client, "contribute", return_value=1):
             if expect_error is not None:
@@ -706,45 +722,31 @@ class TestBountySyncHeartbeat:
                     run_async(cli._combine_pairs(client, storage, pairs))
             else:
                 run_async(cli._combine_pairs(client, storage, pairs))
-        return state
+        return seen
 
-    def test_run_cancels_heartbeat_on_normal_completion(self):
+    def test_run_id_set_during_run_cleared_after_completion(self):
         import infinite_craft_cli.cli as cli
 
         _relay_on(cli)
         client = make_mock_client()
         client.pair.return_value = MockElement("Steam", "")
         storage = make_mock_storage()
-        state = self._run_combine_with_fake_heartbeat(
-            cli, client, storage, self._pairs(3)
-        )
-        assert state.get("started") and state.get("cancelled")
+        seen = self._run(cli, client, storage, self._pairs(3))
+        assert seen.get("run_id")  # asserted while running
+        assert cli._run_id == ""  # dropped on exit → board lapses
 
-    def test_run_cancels_heartbeat_on_user_cancel(self):
-        """Cancel before the first batch: the loop breaks without ever
-        yielding, so the heartbeat is cancelled before its body first runs —
-        assert the real property (no live heartbeat survives the run)."""
+    def test_run_id_cleared_on_user_cancel(self):
         import infinite_craft_cli.cli as cli
 
         _relay_on(cli)
         client = make_mock_client()
         client.pair.return_value = MockElement("Steam", "")
         storage = make_mock_storage()
-        cli._cancelled = True  # cancel before the first batch
+        cli._cancelled = True
+        self._run(cli, client, storage, self._pairs(3))
+        assert cli._run_id == ""
 
-        async def scenario():
-            with patch.object(cli.relay_client, "lookup", return_value={}), \
-                 patch.object(cli.relay_client, "contribute", return_value=1), \
-                 patch.object(cli.relay_client, "sync_bounties", return_value=None):
-                await cli._combine_pairs(client, storage, self._pairs(3))
-            return [
-                t for t in asyncio.all_tasks()
-                if not t.done() and "_bounty_sync_heartbeat" in repr(t)
-            ]
-
-        assert run_async(scenario()) == []
-
-    def test_run_cancels_heartbeat_on_429_cooldown(self):
+    def test_run_id_cleared_on_429_cooldown(self):
         import infinite_craft_cli.cli as cli
         from infinite_craft_cli.client import NealRateLimited
 
@@ -752,12 +754,10 @@ class TestBountySyncHeartbeat:
         client = make_mock_client()
         client.pair.side_effect = NealRateLimited()
         storage = make_mock_storage()
-        state = self._run_combine_with_fake_heartbeat(
-            cli, client, storage, self._pairs(3)
-        )
-        assert state.get("started") and state.get("cancelled")
+        self._run(cli, client, storage, self._pairs(3))
+        assert cli._run_id == ""
 
-    def test_run_cancels_heartbeat_on_unexpected_exception(self):
+    def test_run_id_cleared_on_unexpected_exception(self):
         import infinite_craft_cli.cli as cli
 
         _relay_on(cli)
@@ -765,104 +765,5 @@ class TestBountySyncHeartbeat:
         client.pair.return_value = MockElement("Steam", "")
         storage = make_mock_storage()
         storage.add.side_effect = RuntimeError("disk full")
-        state = self._run_combine_with_fake_heartbeat(
-            cli, client, storage, self._pairs(3), expect_error=RuntimeError
-        )
-        assert state.get("started") and state.get("cancelled")
-
-    # ── idle worker pacing on the relay hint ─────────────────────────
-
-    def test_local_refusal_clears_stale_hint(self):
-        """A worker refused locally (preempted / no slots) must not keep
-        spinning on an old 2s hint — local refusals reset it to the default."""
-        import infinite_craft_cli.cli as cli
-
-        _relay_on(cli)
-        client = make_mock_client()
-        storage = make_mock_storage()
-        cli._bounty_poll_ms = 2000
-        cli._current_command = "/permute *"  # preempted
-        assert run_async(cli._bounty_cycle(client, storage)) == "blocked"
-        assert cli._bounty_poll_ms == 0
-        cli._current_command = ""
-        cli._bounty_poll_ms = 2000
-        client._rate_limiter.chrome_snapshot.return_value = (0, 60, 500)
-        assert run_async(cli._bounty_cycle(client, storage)) == "blocked"
-        assert cli._bounty_poll_ms == 0
-
-    def test_cycle_stores_poll_hint(self):
-        import infinite_craft_cli.cli as cli
-
-        _relay_on(cli)
-        client = make_mock_client()
-        storage = make_mock_storage()
-        with patch.object(cli.relay_client, "take_bounties", return_value=([], 2500)):
-            status = run_async(cli._bounty_cycle(client, storage))
-        assert status == "empty"
-        assert cli._bounty_poll_ms == 2500
-
-    def test_worker_sleeps_poll_hint_when_idle(self):
-        import infinite_craft_cli.cli as cli
-        from unittest.mock import AsyncMock
-
-        client = make_mock_client()
-        storage = make_mock_storage()
-        cli._bounty_poll_ms = 2000
-        sleeps = []
-
-        async def fake_sleep(secs):
-            sleeps.append(secs)
-            raise asyncio.CancelledError()
-
-        with patch.object(cli, "_bounty_cycle", new=AsyncMock(return_value="empty")), \
-             patch("infinite_craft_cli.cli.asyncio.sleep", side_effect=fake_sleep):
-            with pytest.raises(asyncio.CancelledError):
-                run_async(cli._bounty_worker(client, storage))
-        assert sleeps[-1] == 2.0  # the hint, not the 10s kernel default
-
-class TestRelayRecovery:
-    """The 2.4.1 field bug: 'unreachable' was a one-way door, so one relay
-    nap silenced idle serving forever. The worker now probes /health on the
-    kernel retry cadence and restores the tier."""
-
-    def test_worker_probe_restores_tier(self):
-        import infinite_craft_cli.cli as cli
-        from unittest.mock import AsyncMock
-
-        cli._relay_user_on = True
-        cli._relay_reachable = False  # a past failure deafened the tier
-
-        async def fake_sleep(secs):
-            raise asyncio.CancelledError()  # one worker iteration
-
-        with patch.object(cli.relay_client, "ping", return_value={"ok": True}) as ping, \
-             patch.object(cli, "_bounty_cycle", new=AsyncMock(return_value="blocked")), \
-             patch("infinite_craft_cli.cli.asyncio.sleep", side_effect=fake_sleep):
-            with pytest.raises(asyncio.CancelledError):
-                run_async(cli._bounty_worker(make_mock_client(), make_mock_storage()))
-        ping.assert_called_once()
-        assert cli._relay_reachable is True
-
-    def test_failed_probe_stays_down_and_respects_cadence(self):
-        import infinite_craft_cli.cli as cli
-
-        cli._relay_user_on = True
-        cli._relay_reachable = False
-        with patch.object(cli.relay_client, "ping", return_value=None) as ping:
-            run_async(cli._relay_retry_probe())
-            assert cli._relay_reachable is False
-            # Second probe inside the retry window: no ping fired.
-            run_async(cli._relay_retry_probe())
-        ping.assert_called_once()
-
-    def test_no_probe_when_tier_healthy_or_user_off(self):
-        import infinite_craft_cli.cli as cli
-
-        with patch.object(cli.relay_client, "ping") as ping:
-            cli._relay_user_on = True
-            cli._relay_reachable = True
-            run_async(cli._relay_retry_probe())
-            cli._relay_user_on = False
-            cli._relay_reachable = False
-            run_async(cli._relay_retry_probe())
-        ping.assert_not_called()
+        self._run(cli, client, storage, self._pairs(3), expect_error=RuntimeError)
+        assert cli._run_id == ""
