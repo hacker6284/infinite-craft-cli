@@ -116,7 +116,11 @@ let autoApprove = false; // /auto: skip bulk-size y/n confirms this session
 let relayUserOn = true; // /relay session toggle
 let relayReachable = null; // null = not yet pinged (warming)
 let relayHits = 0;
-let lastRenderedHits = 0; // for the one-shot bee pulse (fires when relayHits grows)
+let lastRenderedHits = 0; // growth detector for the bee pulse
+// Must match the .ict-bee-pulse animation duration in the stylesheet.
+const BEE_PULSE_ANIM_MS = 300;
+let beePulseUntil = 0; // hit growth arms a pulse window; renders inside it animate
+let beePulseStart = 0; // first render in the window anchors the animation timeline
 let relayContributed = 0;
 let relaySeeded = false;
 // Presence identity + same-IP arbitration (relay-fed)
@@ -2560,14 +2564,35 @@ function updateChrome() {
   // Permanent rate line: segmented bar + optional last pair (pair lane only).
   const { remaining, max, oldestFracMilli, fleetUsed } = rateChromeSnapshot();
   const rateNote = rateStatusNote(remaining);
-  // One-shot pulse: the rate line is rebuilt every RATE_TICK_MS, so a
-  // continuous CSS animation just resets before it ever peaks. Instead tag
-  // the bee with `.pulse` only on the render where the hit count actually
-  // grew — the freshly-mounted element plays the short animation once.
-  const beePulse = relayHits > lastRenderedHits ? " pulse" : "";
+  // Pulse = arm + resume, measured in a headless-Chrome lab against three
+  // render patterns (solo ticker / same-task clusters / 30ms storms):
+  // 1. ARM: hit growth opens a RATE_TICK + animation-length window, so the
+  //    class survives clustered renders that replace a one-shot before it
+  //    ever paints (the 3.0 field bug), reaching the guaranteed ticker
+  //    render and holding through one full play after it.
+  // 2. RESUME: every rebuild destroys the animating element, and a fresh
+  //    mount RESTARTS a CSS animation — under a post-absorption render
+  //    storm the pulse never reached its peak. The first render in the
+  //    window anchors the timeline; every remount continues it via a
+  //    negative animation-delay, so a storm shows successive frames of
+  //    the same pulse instead of endless frame-zero restarts.
+  if (relayHits > lastRenderedHits) {
+    beePulseUntil = Date.now() + RATE_TICK_MS + BEE_PULSE_ANIM_MS;
+    beePulseStart = 0;
+  }
   lastRenderedHits = relayHits;
+  let beePulse = "";
+  let beeStyle = "";
+  if (Date.now() < beePulseUntil) {
+    if (!beePulseStart) beePulseStart = Date.now();
+    const elapsed = Date.now() - beePulseStart;
+    if (elapsed < BEE_PULSE_ANIM_MS) {
+      beePulse = " pulse";
+      beeStyle = ` style="animation-delay:-${elapsed}ms"`;
+    }
+  }
   const hiveHtml = relayHits > 0
-    ? ` <span class="ict-rate-sep">·</span> <span class="ict-rate-hive"><span class="ict-bee${beePulse}">🐝</span> +${relayHits}</span>`
+    ? ` <span class="ict-rate-sep">·</span> <span class="ict-rate-hive"><span class="ict-bee${beePulse}"${beeStyle}>🐝</span> +${relayHits}</span>`
     : "";
   const servingHtml = bountyProgress !== null
     ? ` <span class="ict-rate-sep">·</span> <span class="ict-rate-hive">🐝 serving</span>`
