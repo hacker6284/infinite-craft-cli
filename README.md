@@ -171,12 +171,17 @@ a rate-limit slot is committed only after both cache tiers miss, and fresh
 results are contributed back automatically. Bulk runs sweep the whole batch
 against the hive in one request before spending their first slot.
 
-**Bounty board.** When a bulk run overflows your own rate budget, the extra
-pairs go on a shared board. Idle clients elsewhere pick them up *within their
-own rate limit* and drop the results into the cache, which your run re-sweeps
-and absorbs for free — so the neal.fun rate limit is pooled across willing
-users instead of stranding your backlog. Working bounties is on by default and
-symmetric: while you're idle at the prompt, your client serves the hive too.
+**Bounty board.** When a bulk run overflows your own rate budget, it leases the
+still-unfilled slice beyond its rate horizon onto a shared board — heartbeating
+every ~3s to renew those leases (up to 500 pairs) and absorb whatever the fleet
+has filled — so neal.fun's rate limit is pooled across willing users instead of
+stranding your backlog. Cancel the run and the leases self-clear ~10s after the
+last heartbeat; no revoke call needed. Handout is round-robin across posting
+sessions, so a small run is never starved behind a big one's slice. If you and
+the fleet ever derive the same pair twice, that duplicate independent sighting
+counts as peer-review confirmation — overlap is review, not waste. Working
+bounties is on by default and symmetric: while you're idle at the prompt, your
+client serves the hive too.
 
 **Peer review.** A cache entry is trusted only after a second, independent
 client re-asks neal.fun and gets the same answer (review bounties never accept
