@@ -11,8 +11,16 @@ import {
   envStr,
   doTakeBounties,
   doPostBounties,
+  pruneBounties,
   _resetForTests,
+  _bountyForTests,
 } from "./server.mjs";
+import {
+  bounty_lease_ttl_ms as bountyLeaseTtlMs,
+  bounty_legacy_ttl_ms as bountyLegacyTtlMs,
+  bounty_session_quota as bountySessionQuota,
+  bounty_poll_hint_ms as bountyPollHintMs,
+} from "./_sudo/craft.mjs";
 
 const NUL = String.fromCharCode(0);
 
@@ -417,6 +425,203 @@ test("review bounties are counted in reviewsTaken (metrics undercount fix)", asy
     // Dashboard surfaces it.
     const html = await (await fetch(`${base}/api/dashboard`)).text();
     assert.ok(html.includes("Reviews served"));
+  } finally {
+    server.close();
+  }
+});
+
+test("lease renewal bumps at only; claim survives renewal", () => {
+  _resetForTests();
+  const t0 = 1_000_000;
+  const post = doPostBounties([["Lease", "Me"]], t0, "1.1.1.1", "s1", true);
+  assert.equal(post.posted, 1);
+  assert.equal(post.renewed, 0);
+  const firstAt = _bountyForTests("Lease", "Me").firstAt;
+  assert.equal(firstAt, t0);
+
+  const t1 = t0 + 5_000;
+  const renew = doPostBounties([["Lease", "Me"]], t1, "1.1.1.1", "s1", true);
+  assert.equal(renew.renewed, 1);
+  assert.equal(renew.posted, 0);
+  const b = _bountyForTests("Lease", "Me");
+  assert.equal(b.at, t1);
+  assert.equal(b.firstAt, firstAt);
+
+  // Claim, then renew again — claimedBy/claimedAt must stick.
+  doTakeBounties(5, "taker", { cooledUntil: 0, running: 0 }, t1, "2.2.2.2");
+  assert.equal(_bountyForTests("Lease", "Me").claimedBy, "taker");
+  const claimedAt = _bountyForTests("Lease", "Me").claimedAt;
+  const t2 = t1 + 1_000;
+  doPostBounties([["Lease", "Me"]], t2, "1.1.1.1", "s1", true);
+  const after = _bountyForTests("Lease", "Me");
+  assert.equal(after.claimedBy, "taker");
+  assert.equal(after.claimedAt, claimedAt);
+  assert.equal(after.at, t2);
+  assert.equal(after.firstAt, firstAt);
+});
+
+test("leased vs legacy TTL", () => {
+  _resetForTests();
+  const leaseTtl = Number(bountyLeaseTtlMs());
+  const legacyTtl = Number(bountyLegacyTtlMs());
+  assert.equal(leaseTtl, 10_000);
+  assert.equal(legacyTtl, 900_000);
+
+  const t0 = 2_000_000;
+  doPostBounties([["Leased", "Pair"]], t0, "1.1.1.1", "sL", true);
+  pruneBounties(t0 + leaseTtl + 1);
+  assert.equal(_bountyForTests("Leased", "Pair"), undefined);
+
+  _resetForTests();
+  doPostBounties([["Legacy", "Pair"]], t0, "1.1.1.1", "sG", false);
+  pruneBounties(t0 + leaseTtl + 1);
+  assert.ok(_bountyForTests("Legacy", "Pair"), "legacy survives past lease TTL");
+  pruneBounties(t0 + legacyTtl + 1);
+  assert.equal(_bountyForTests("Legacy", "Pair"), undefined);
+});
+
+test("lease flag sticks on renewal", () => {
+  _resetForTests();
+  const leaseTtl = Number(bountyLeaseTtlMs());
+  const t0 = 3_000_000;
+
+  // Legacy first, then re-post with lease:true — stays legacy.
+  doPostBounties([["Sticky", "A"]], t0, "1.1.1.1", "s1", false);
+  doPostBounties([["Sticky", "A"]], t0 + 1_000, "1.1.1.1", "s1", true);
+  assert.equal(_bountyForTests("Sticky", "A").leased, false);
+  pruneBounties(t0 + 1_000 + leaseTtl + 1);
+  assert.ok(_bountyForTests("Sticky", "A"), "legacy TTL still applies after leased re-post");
+
+  // Leased first, then re-post without lease — stays leased.
+  _resetForTests();
+  doPostBounties([["Sticky", "B"]], t0, "1.1.1.1", "s1", true);
+  doPostBounties([["Sticky", "B"]], t0 + 1_000, "1.1.1.1", "s1", false);
+  assert.equal(_bountyForTests("Sticky", "B").leased, true);
+  pruneBounties(t0 + 1_000 + leaseTtl + 1);
+  assert.equal(_bountyForTests("Sticky", "B"), undefined);
+});
+
+test("per-session bounty quota; renewals exempt; other sessions unaffected", () => {
+  _resetForTests();
+  const quota = Number(bountySessionQuota());
+  assert.equal(quota, 600);
+  const now = 4_000_000;
+  const mk = (i) => [`Q${i}`, `R${i}`];
+
+  // MAX_POST is 500 — fill quota across two calls.
+  let posted = 0;
+  for (let start = 0; start < quota; start += 500) {
+    const batch = [];
+    for (let i = start; i < Math.min(start + 500, quota); i++) batch.push(mk(i));
+    const r = doPostBounties(batch, now, "1.1.1.1", "quota-s");
+    posted += r.posted;
+  }
+  assert.equal(posted, quota);
+  assert.equal(doPostBounties([mk(0)], now, "1.1.1.1", "quota-s").open, quota);
+
+  const over = doPostBounties([mk(quota)], now, "1.1.1.1", "quota-s");
+  assert.equal(over.posted, 0);
+  assert.equal(over.renewed, 0);
+  assert.equal(over.open, quota);
+  assert.equal(_bountyForTests(...mk(quota)), undefined);
+
+  // Renewals still succeed at quota.
+  const renew = doPostBounties([mk(0)], now + 1, "1.1.1.1", "quota-s");
+  assert.equal(renew.renewed, 1);
+  assert.equal(renew.posted, 0);
+
+  // A different session can still post.
+  const other = doPostBounties([["Other", "Session"]], now, "9.9.9.9", "other-s");
+  assert.equal(other.posted, 1);
+});
+
+test("take handout is round-robin across poster sessions", () => {
+  _resetForTests();
+  const now = 5_000_000;
+  doPostBounties(
+    [
+      ["Aa1", "Xa"],
+      ["Aa2", "Xa"],
+      ["Aa3", "Xa"],
+    ],
+    now,
+    "1.1.1.1",
+    "A"
+  );
+  doPostBounties(
+    [
+      ["Bb1", "Xb"],
+      ["Bb2", "Xb"],
+    ],
+    now + 1,
+    "2.2.2.2",
+    "B"
+  );
+  const take = doTakeBounties(4, "taker", { cooledUntil: 0, running: 0 }, now + 2, "3.3.3.3");
+  assert.deepEqual(
+    take.bounties.map((b) => b.first),
+    ["Aa1", "Bb1", "Aa2", "Bb2"]
+  );
+});
+
+test("pollMs hints for eligible / empty / ip-active", () => {
+  _resetForTests();
+  const now = 6_000_000;
+  const idle = { cooledUntil: 0, running: 0 };
+
+  // Empty board → slow poll.
+  const empty = doTakeBounties(5, "t", idle, now, "8.8.8.8");
+  assert.equal(empty.pollMs, Number(bountyPollHintMs(0, true)));
+  assert.equal(empty.pollMs, 10_000);
+
+  doPostBounties([["Open", "Board"]], now, "1.1.1.1", "poster");
+  const open = doTakeBounties(5, "t", idle, now, "8.8.8.8");
+  assert.equal(open.bounties.length, 1);
+  assert.equal(open.pollMs, Number(bountyPollHintMs(1, true)));
+  assert.equal(open.pollMs, 2_000);
+
+  // Refused while IP has a running session — hint is the idle interval.
+  doPostBounties([["Still", "Open"]], now, "1.1.1.1", "poster2");
+  const busy = doTakeBounties(5, "t", { cooledUntil: 0, running: 1 }, now, "8.8.8.8");
+  assert.equal(busy.reason, "ip-active");
+  assert.equal(busy.bounties.length, 0);
+  assert.equal(busy.pollMs, Number(bountyPollHintMs(0, false)));
+  assert.equal(busy.pollMs, 10_000);
+});
+
+test("HTTP POST /api/bounties threads lease + session into renewals", async () => {
+  _resetForTests();
+  const server = makeServer();
+  await new Promise((resolve) => server.listen(0, resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const headers = {
+    "Content-Type": "application/json",
+    "x-ic-session": "http-lease-s",
+    "x-ic-state": "running",
+    "x-forwarded-for": "5.5.5.5",
+  };
+  try {
+    const first = await (
+      await fetch(`${base}/api/bounties`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ pairs: [["Http", "Lease"]], lease: true }),
+      })
+    ).json();
+    assert.equal(first.posted, 1);
+    assert.equal(first.renewed, 0);
+    assert.equal(_bountyForTests("Http", "Lease").leased, true);
+    assert.equal(_bountyForTests("Http", "Lease").session, "http-lease-s");
+
+    const second = await (
+      await fetch(`${base}/api/bounties`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ pairs: [["Http", "Lease"]], lease: true }),
+      })
+    ).json();
+    assert.equal(second.renewed, 1);
+    assert.equal(second.posted, 0);
   } finally {
     server.close();
   }

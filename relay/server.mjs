@@ -36,6 +36,10 @@ import {
   pair_key as pairKeyKernel,
   sanitize_element_name as sanitizeKernel,
   cooldown_duration_ms as cooldownDurationMs,
+  bounty_lease_ttl_ms as bountyLeaseTtlMs,
+  bounty_legacy_ttl_ms as bountyLegacyTtlMs,
+  bounty_session_quota as bountySessionQuota,
+  bounty_poll_hint_ms as bountyPollHintMs,
 } from "./_sudo/craft.mjs";
 
 // The longest cooldown the kernel will ever mint (3rd strike = 8h). Used to
@@ -99,6 +103,7 @@ const metrics = {
   confirmed: 0, // duplicate-confirmations that advanced review
   healed: 0, // entries dropped by a conflicting claim
   bountiesPosted: 0,
+  bountiesRenewed: 0,
   bountiesTaken: 0,
   reviewsTaken: 0, // peer-review bounties handed to idle clients
 };
@@ -107,11 +112,12 @@ const metrics = {
 const ipCooldown = new Map();
 
 // ── bounty board ─────────────────────────────────────────────────────
-// key → {first, second, at, claimedBy, claimedAt}. Posted by rate-limited
-// clients; offered only to callers whose IP is fully idle and not cooling.
+// key → {first, second, at, firstAt, claimedBy, claimedAt, postedBy,
+// session, leased}. Posted by rate-limited clients; offered only to
+// callers whose IP is fully idle and not cooling. `leased` / `firstAt` /
+// `session` stick at creation; renewals only bump `at`.
 const bounties = new Map();
 const MAX_BOUNTIES = 10_000;
-const BOUNTY_TTL_MS = 15 * 60_000;
 const CLAIM_TTL_MS = 90_000;
 const MAX_POST = 500; // bounties per POST
 const REVIEW_PENDING_MAX = 100_000; // review backlog memory bound
@@ -197,9 +203,10 @@ function hiveEnvelope(req, now) {
   return { peers: snap.spending, cooledUntil: snap.cooledUntil };
 }
 
-function pruneBounties(now) {
+export function pruneBounties(now) {
   for (const [key, b] of bounties) {
-    if (now - b.at > BOUNTY_TTL_MS) bounties.delete(key);
+    const ttl = b.leased ? Number(bountyLeaseTtlMs()) : Number(bountyLegacyTtlMs());
+    if (now - b.at > ttl) bounties.delete(key);
   }
 }
 
@@ -372,8 +379,19 @@ export function doContribute(list, session = "") {
         metrics.healed++;
         if (bounties.size < MAX_BOUNTIES && !bounties.has(key)) {
           // Self-heal bounty: postedBy "" so anyone (including either
-          // disputing party) can re-derive it fresh.
-          bounties.set(key, { first: a, second: b, at: Date.now(), claimedBy: "", claimedAt: 0, postedBy: "" });
+          // disputing party) can re-derive it fresh. Legacy (non-leased).
+          const t = Date.now();
+          bounties.set(key, {
+            first: a,
+            second: b,
+            at: t,
+            firstAt: t,
+            claimedBy: "",
+            claimedAt: 0,
+            postedBy: "",
+            session: "",
+            leased: false,
+          });
         }
       }
       // Conflicts against a reviewed entry are ignored: 2+ independent
@@ -395,12 +413,29 @@ export function doContribute(list, session = "") {
 }
 
 // ── bounty ops ───────────────────────────────────────────────────────
-export function doPostBounties(pairs, now, ip = "") {
+export function doPostBounties(pairs, now, ip = "", session = "", lease = false) {
   // Pairs already cached come straight back as results (no bounty needed);
-  // the rest go on the board, tagged with the poster's IP.
+  // existing board entries renew (at only); new keys respect per-poster
+  // quota then the global board cap.
   const results = {};
   let posted = 0;
+  let renewed = 0;
   let m = 0;
+  // Per-poster open counts for this call — memoized so a large batch of
+  // new pairs from one session doesn't rescan the board every iteration.
+  const posterOpen = new Map();
+  const countOpen = (posterKey) => {
+    let n = posterOpen.get(posterKey);
+    if (n !== undefined) return n;
+    n = 0;
+    for (const b of bounties.values()) {
+      if ((b.session || b.postedBy || "") === posterKey) n++;
+    }
+    posterOpen.set(posterKey, n);
+    return n;
+  };
+  const posterKey = session || ip || "";
+  const quota = Number(bountySessionQuota());
   for (const p of pairs) {
     if (m++ >= MAX_POST) break;
     if (!Array.isArray(p) || p.length < 2) continue;
@@ -413,31 +448,73 @@ export function doPostBounties(pairs, now, ip = "") {
       results[key] = { r: hit.r, e: hit.e };
       continue;
     }
-    if (bounties.has(key) || bounties.size >= MAX_BOUNTIES) continue;
-    bounties.set(key, { first: a, second: b, at: now, claimedBy: "", claimedAt: 0, postedBy: ip });
+    const existing = bounties.get(key);
+    if (existing) {
+      // Renewal: bump at only — keep Map insertion order and every other field.
+      existing.at = now;
+      metrics.bountiesRenewed++;
+      renewed++;
+      continue;
+    }
+    const openForPoster = countOpen(posterKey);
+    if (openForPoster >= quota) continue;
+    if (bounties.size >= MAX_BOUNTIES) continue;
+    bounties.set(key, {
+      first: a,
+      second: b,
+      at: now,
+      firstAt: now,
+      claimedBy: "",
+      claimedAt: 0,
+      postedBy: ip,
+      session,
+      leased: !!lease,
+    });
     metrics.bountiesPosted++;
     posted++;
+    posterOpen.set(posterKey, openForPoster + 1);
   }
-  return { results, posted, open: bounties.size };
+  return { results, posted, renewed, open: bounties.size };
 }
 
 export function doTakeBounties(limit, session, snap, now, ip = "") {
   // Eligibility: the caller's whole IP must be idle (no running session)
   // and not cooling down — bounty work must never contest a household's
   // own runs or a banned IP.
-  if (snap.cooledUntil > now) return { bounties: [], reason: "cooled" };
-  if (snap.running > 0) return { bounties: [], reason: "ip-active" };
+  if (snap.cooledUntil > now) {
+    return { bounties: [], reason: "cooled", pollMs: Number(bountyPollHintMs(0, false)) };
+  }
+  if (snap.running > 0) {
+    return { bounties: [], reason: "ip-active", pollMs: Number(bountyPollHintMs(0, false)) };
+  }
   pruneBounties(now);
   const out = [];
   const cap = Math.max(1, Math.min(limit || 5, 20));
-  for (const [key, b] of bounties) {
-    if (out.length >= cap) break;
+  // Round-robin across poster groups (session || postedBy), preserving
+  // each group's board-insertion order and group first-seen order.
+  const groups = new Map(); // posterKey → bounty[]
+  for (const b of bounties.values()) {
     if (b.claimedBy && now - b.claimedAt <= CLAIM_TTL_MS) continue;
     // Never hand a bounty back to the IP that posted it: same-IP clients
     // share one neal budget, so self-serving spends the exact rate the
     // poster would have — and it means a cancelled run's leftover bounties
     // can't be silently resumed by the poster's own idle worker.
     if (b.postedBy && b.postedBy === ip) continue;
+    const pk = b.session || b.postedBy || "";
+    let g = groups.get(pk);
+    if (!g) {
+      g = [];
+      groups.set(pk, g);
+    }
+    g.push(b);
+  }
+  const queues = [...groups.values()];
+  let qi = 0;
+  while (out.length < cap && queues.some((q) => q.length > 0)) {
+    const q = queues[qi % queues.length];
+    qi++;
+    if (q.length === 0) continue;
+    const b = q.shift();
     b.claimedBy = session || "?";
     b.claimedAt = now;
     metrics.bountiesTaken++;
@@ -462,7 +539,7 @@ export function doTakeBounties(limit, session, snap, now, ip = "") {
       out.push({ kind: "review", first: key.slice(0, i), second: key.slice(i + 1) });
     }
   }
-  return { bounties: out };
+  return { bounties: out, pollMs: Number(bountyPollHintMs(bounties.size, true)) };
 }
 
 // ── Upstash snapshot (optional backstop) ─────────────────────────────
@@ -571,7 +648,7 @@ function dashboardHtml(s) {
     ["Contributed", m.contributed.toLocaleString()],
     ["Confirmations", m.confirmed.toLocaleString()],
     ["Self-healed", m.healed.toLocaleString()],
-    ["Bounties posted / taken", `${m.bountiesPosted.toLocaleString()} / ${m.bountiesTaken.toLocaleString()}`],
+    ["Bounties posted / renewed / taken", `${m.bountiesPosted.toLocaleString()} / ${m.bountiesRenewed.toLocaleString()} / ${m.bountiesTaken.toLocaleString()}`],
     ["Reviews served", m.reviewsTaken.toLocaleString()],
     ["Snapshot", s.snapshot.enabled ? (s.snapshot.lastErr ? "error: " + s.snapshot.lastErr : "ok") : "disabled"],
     ["Uptime", `${Math.floor(s.uptimeSec / 3600)}h ${Math.floor((s.uptimeSec % 3600) / 60)}m`],
@@ -712,7 +789,13 @@ export function makeServer() {
         }
         pruneBounties(now);
         send(res, 200, {
-          ...doPostBounties(body.pairs, now, callerIp(req)),
+          ...doPostBounties(
+            body.pairs,
+            now,
+            callerIp(req),
+            envStr(req.headers["x-ic-session"] || ""),
+            body.lease === true
+          ),
           hive: hiveEnvelope(req, now),
         });
         return;
@@ -745,6 +828,11 @@ export function _resetForTests() {
   bounties.clear();
   reviewPending.clear();
   for (const k of Object.keys(metrics)) metrics[k] = 0;
+}
+
+// Test hook: inspect a bounty record (lease/TTL/renewal assertions).
+export function _bountyForTests(first, second) {
+  return bounties.get(pairKey(sanitizeName(first), sanitizeName(second)));
 }
 
 const isMain = process.argv[1] && import.meta.url.endsWith(process.argv[1].split("/").pop());
