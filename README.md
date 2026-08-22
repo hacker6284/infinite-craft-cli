@@ -171,23 +171,34 @@ a rate-limit slot is committed only after both cache tiers miss, and fresh
 results are contributed back automatically. Bulk runs sweep the whole batch
 against the hive in one request before spending their first slot.
 
-**Bounty board.** When a bulk run overflows your own rate budget, it leases the
-still-unfilled slice beyond its rate horizon onto a shared board — heartbeating
-every ~3s to renew those leases (up to 500 pairs) and absorb whatever the fleet
-has filled — so neal.fun's rate limit is pooled across willing users instead of
-stranding your backlog. Cancel the run and the leases self-clear ~10s after the
-last heartbeat; no revoke call needed. Handout is round-robin across posting
-sessions, so a small run is never starved behind a big one's slice. If you and
-the fleet ever derive the same pair twice, that duplicate independent sighting
-counts as peer-review confirmation — overlap is review, not waste. Working
-bounties is on by default and symmetric: while you're idle at the prompt, your
-client serves the hive too.
+**One timer.** Every client — idle or running — sends the relay a ~1s beat:
+liveness, neal reachability, and the active run id out; a status and a
+"there's work you could do" bit back. That beat is the *only* clock in the
+protocol — everything else is an event — and one threshold derives from it:
+anything a session owns (its runs' bounties, its work assignments, its place
+in the household budget split) lapses ~15s after its last beat.
+
+**Bounty board.** When a bulk run needs more than the rate slots it has free
+right now, it offers the entire uncovered remainder to the board (up to 500
+pairs), bound to its run id — so neal.fun's rate limit is pooled across
+willing users instead of stranding your backlog. The board entry lives
+exactly as long as the run keeps appearing in your beats: cancel (or crash)
+and it lapses by silence alone, no revoke call anywhere. Idle clients whose
+beat says there's work pull it and get it *assigned* — never handed to two
+workers while the assignee stays live and neal-capable, and forfeited the
+moment it lapses or reports it can't reach neal. You keep grinding your own
+list regardless (bounties are parallelization offers, not delegation), your
+run absorbs the fleet's fills right before each spend, and if you and the
+fleet ever derive the same pair twice, that duplicate independent sighting
+counts as peer-review confirmation — overlap is review, not waste. Serving
+is on by default and symmetric: while you're idle at the prompt, your client
+serves the hive too.
 
 **Peer review.** A cache entry is trusted only after a second, independent
-client re-asks neal.fun and gets the same answer (review bounties never accept
-a cached answer — that would defeat the check). A conflicting claim against an
-unreviewed entry drops it and re-opens the pair, so the network self-heals
-around a bad result rather than trusting last-writer.
+client re-asks neal.fun and gets the same answer (review work never accepts
+a cached answer, and is never handed to the session that authored the
+sighting). A conflicting claim against an unreviewed entry drops it, so the
+network self-heals around a bad result rather than trusting last-writer.
 
 **Same-IP fairness.** The relay sees each client's public IP and tells everyone
 how many sessions on that IP are actively spending neal budget; each client
