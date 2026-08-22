@@ -45,13 +45,9 @@ import {
   rate_bar_split_segments as rateBarSplitSegments,
   effective_rate_limit as effectiveRateLimit,
   cooldown_duration_ms as cooldownDurationMs,
-  bounty_poll_interval_ms as bountyPollIntervalMs,
-  relay_retry_interval_ms as relayRetryIntervalMs,
-  bounty_sync_interval_ms as bountySyncIntervalMs,
+  beat_interval_ms as beatIntervalMs,
   bounty_sync_plan as bountySyncPlan,
   bounty_claim_limit as bountyClaimLimit,
-  hive_wait_tick_ms as hiveWaitTickMs,
-  hive_resweep_interval_ms as hiveResweepIntervalMs,
   bulk_confirm_required as bulkConfirmRequired,
   rate_status_note as rateStatusNote,
   script_parse as scriptParse,
@@ -720,21 +716,10 @@ function tripCooldown() {
   updateChrome();
 }
 
-function relayPresenceState() {
-  if (cooling()) return "cooled";
-  if (currentPairCommand) return "running";
-  if (bountyProgress !== null) return "serving";
-  return "idle";
-}
-
 function relayHeaders() {
-  const h = {
-    "Content-Type": "application/json",
-    "x-ic-session": relaySessionId,
-    "x-ic-state": relayPresenceState(),
-  };
-  if (cooling()) h["x-ic-cooled-until"] = String(cooldownUntil);
-  return h;
+  // All state (neal reachability, run id, cooldowns) rides the ~1s beat
+  // body — headers carry identity only.
+  return { "Content-Type": "application/json", "x-ic-session": relaySessionId };
 }
 
 /** Fold the hive envelope into local state: split the per-IP budget by
@@ -826,45 +811,58 @@ function bountyPreempted() {
   );
 }
 
-let bountyTimer = null;
-let bountyPollHintMs = 0;
-
 function fleetSlotAvailable() {
   return rateChromeSnapshot().remaining > 0;
 }
 
-// One poll-and-serve pass. Returns a status the scheduler paces on:
-// "worked" (served fully, rate to spare → poll again now), "empty",
-// "blocked" (preempted or out of rate), "unreachable". Serving never blocks
-// on a rate slot — it checks availability first and backs off to polling.
-// Un-deafen the hive tier: 'unreachable' was a one-way door (a single relay
-// nap — routine on a spin-down free instance — silenced serving until a
-// manual /relay toggle; 2.4.1 field bug). Probe /health on the kernel retry
-// cadence and restore on success; the ping doubles as the wake-up call for a
-// spun-down relay. Matches the CLI's _relay_retry_probe.
-let relayRetryAt = 0;
-async function relayRetryProbe() {
-  if (!relayUserOn || relayReachable !== false) return;
-  const now = Date.now();
-  if (now < relayRetryAt) return;
-  relayRetryAt = now + Number(relayRetryIntervalMs());
-  const health = await relayFetch("/health", null, 8000);
-  if (health != null && health.ok) relayReachable = true;
+// ── the one timer ────────────────────────────────────────────────────
+// A ~1s beat: liveness + neal reachability + the active run id out, a
+// work bit back. A failed beat marks the tier unreachable; the next
+// success restores it — the beat IS the recovery probe, and it keeps
+// flowing while the tier is down so a spun-down relay gets woken.
+// Everything else in the hive protocol is an event. Matches the CLI's
+// _beat_worker.
+let beatTimer = null;
+let runId = "";
+let runSeq = 0;
+let runPostedOnce = false; // the 🐝 posted line prints once per run
+
+async function beatTick() {
+  if (relayUserOn) {
+    const body = { nealOk: !cooling() };
+    if (runId) body.runId = runId;
+    if (cooling()) body.cooledUntil = cooldownUntil;
+    const d = await relayFetch("/api/beat", body, 2500);
+    if (d == null) {
+      if (relayReachable !== false) relayMarkUnreachable();
+    } else {
+      if (relayReachable !== true) relayReachable = true;
+      if (d.work && !bountyPreempted()) {
+        try { await serveHive(); } catch { /* best-effort; next beat retries */ }
+      }
+    }
+  }
+  beatTimer = setTimeout(beatTick, Number(beatIntervalMs()));
 }
 
-async function bountyTick() {
-  await relayRetryProbe();
-  // Local refusals clear the hint: a stale fast pollMs must not spin a
-  // blocked worker at 2s (review: spec finding 2; matches the CLI).
-  if (bountyPreempted()) { bountyPollHintMs = 0; return "blocked"; }
+function startBeat() {
+  if (beatTimer) clearTimeout(beatTimer);
+  beatTick();
+}
+
+// One pull-and-serve pass, triggered by the beat's work bit. Every item —
+// pair or review — is answered by a FRESH neal call, never from cache:
+// each contribution is an independent sighting for peer review, and a
+// poisoned local entry can never be re-propagated to the hive. Serving
+// never blocks on a rate slot; the lapse threshold tolerates the beat gap.
+async function serveHive() {
+  if (bountyPreempted()) return "blocked";
   const left = rateChromeSnapshot().remaining;
-  if (left <= 0) { bountyPollHintMs = 0; return "blocked"; }
-  // Claim only as many as we can serve this window (review finding F3).
-  const data = await relayFetch(`/api/bounties?limit=${Number(bountyClaimLimit(left))}`, null, 4000);
+  if (left <= 0) return "blocked";
+  const data = await relayFetch(`/api/work?limit=${Number(bountyClaimLimit(left))}`, null, 4000);
   if (data == null) { relayMarkUnreachable(); return "unreachable"; }
-  bountyPollHintMs = data.pollMs != null ? Number(data.pollMs) : 0;
-  if (!Array.isArray(data.bounties) || !data.bounties.length) return "empty";
-  const items = data.bounties;
+  const items = Array.isArray(data.work) ? data.work : [];
+  if (!items.length) return "empty";
   let done = 0;
   let status = "worked";
   bountyProgress = [0, items.length];
@@ -875,9 +873,6 @@ async function bountyTick() {
       const aName = it.first, bName = it.second;
       if (!aName || !bName) continue;
       const key = pairKey(aName, bName);
-      // Always a fresh neal call (fleet=true skips local + hive caches):
-      // every contribution is then an independent sighting for peer review,
-      // and a poisoned local entry can never be re-propagated to the hive.
       let res;
       try {
         res = await apiPair(aName, bName, true);
@@ -887,8 +882,7 @@ async function bountyTick() {
         continue;
       }
       pairCache.set(key, res);
-      // Record the recipe locally too (host parity: the Python bounty worker
-      // does this, so both hosts' recipe indexes stay in sync).
+      // Record the recipe locally too (host parity with the Python worker).
       if (res) recordRecipe(res.text, aName, bName);
       const [ka, kb] = pairKeyKernel(aName, bName);
       const added = await relayFetch(
@@ -907,30 +901,8 @@ async function bountyTick() {
     bountyProgress = null;
     updateChrome();
   }
-  // Served nothing (e.g. every pair errored) → don't report "worked", or the
-  // scheduler skips its backoff and bursts the budget (review finding F1).
   if (status === "worked" && done === 0) status = "blocked";
   return status;
-}
-
-// Self-scheduling (setTimeout, not setInterval) so cycles never overlap:
-// after a fully-served batch, poll again immediately to drain the board while
-// rate lasts; otherwise wait a poll interval (which doubles as the presence
-// heartbeat).
-function scheduleBountyTick() {
-  bountyTick()
-    .then((status) => {
-      const delay = status === "worked" ? 0 : bountyPollHintMs || Number(bountyPollIntervalMs());
-      bountyTimer = setTimeout(scheduleBountyTick, delay);
-    })
-    .catch(() => {
-      bountyTimer = setTimeout(scheduleBountyTick, bountyPollHintMs || Number(bountyPollIntervalMs()));
-    });
-}
-
-function startBountyWorker() {
-  if (bountyTimer) clearTimeout(bountyTimer);
-  scheduleBountyTick();
 }
 
 /** Ping (wakes a spun-down free instance), then re-seed the hive once per
@@ -1274,25 +1246,69 @@ async function hiveSweep(pairs) {
 // pairs land free) and wait a short, cancellable tick. Returns once the pair
 // is cached or a slot is available, so the apiPair call never blocks on
 // acquire. No-ops when the relay is down.
-async function hiveAwareWait(pairEl, tail) {
-  const resweepInterval = Number(hiveResweepIntervalMs());
-  const tick = Number(hiveWaitTickMs());
-  let lastResweep = 0;
+function mergeHiveResults(results) {
+  for (const [key, v] of Object.entries(results || {})) {
+    if (!pairCache.has(key)) {
+      const cached = relayResultToCache(v);
+      pairCache.set(key, cached);
+      const sep = key.indexOf("\0");
+      if (cached && sep >= 0) recordRecipe(cached.text, key.slice(0, sep), key.slice(sep + 1));
+      relayHits++;
+    }
+  }
+}
+
+// Batch-event hive sync — no timer behind it. Absorbs fills for the pairs
+// we're about to spend on (lookup on the head) and offers everything
+// beyond the slots free right now to the board, bound to this run's id —
+// the board entry lives exactly as long as our beats keep asserting it.
+// Matches the CLI's _hive_run_sync.
+async function hiveRunSync(remaining) {
+  if (!relayActive()) return;
+  const missing = remaining
+    .filter(([a, b]) => !pairCache.has(pairKey(a.text, b.text)))
+    .map(([a, b]) => [a.text, b.text]);
+  if (!missing.length) return;
+  const [start, count] = bountySyncPlan(missing.length, rateChromeSnapshot().remaining).map(Number);
+  const head = missing.slice(0, start);
+  if (head.length) {
+    const found = await relayLookup(head);
+    if (found == null) return; // relayLookup marked the tier unreachable
+    mergeHiveResults(found);
+  }
+  if (count > 0) {
+    const d = await relayFetch("/api/bounties", { pairs: missing.slice(start, start + count), runId }, 8000);
+    if (d == null) { relayMarkUnreachable(); return; }
+    mergeHiveResults(d.results);
+    if (!runPostedOnce && d.posted > 0) {
+      runPostedOnce = true;
+      print(dim(`  🐝 posted ${d.posted} bounties to the hive`));
+    }
+  }
+}
+
+// Event-driven rate wait + sync-before-spend: sleep until the next slot
+// frees (the sliding window makes the wake time exactly computable), then
+// absorb hive fills so a freed slot is never burned on a pair the fleet
+// already answered. Matches the CLI's _hive_wait_for_slots.
+async function hiveWaitForSlots(pairEl, tail) {
+  let waited = false;
   while (!cancelled && !cooling() && relayActive()) {
     const key = pairKey(pairEl[0].text, pairEl[1].text);
     if (pairCache.has(key)) return; // filled by the fleet → free
-    if (rateChromeSnapshot().remaining >= 1) return; // a slot is available
-    const now = Date.now();
-    if (now - lastResweep >= resweepInterval) {
-      const merged = await hiveSweep(tail);
-      lastResweep = Date.now();
-      if (merged) continue; // re-check: this pair may now be cached
+    if (rateChromeSnapshot().remaining >= 1) {
+      if (waited) await hiveRunSync(tail); // sync-before-spend
+      return;
     }
+    const wait = timestamps.length
+      ? Math.max(50, timestamps[0] + RATE_WINDOW - Date.now() + 10)
+      : 100;
     try {
-      await sleepCancellable(tick);
+      await sleepCancellable(wait);
     } catch {
       return; // cancelled
     }
+    waited = true;
   }
 }
 
@@ -1304,73 +1320,31 @@ async function runPairsInner(pairs, opts = {}) {
     await hiveSweep(pairs);
   }
   pairs = prioritizePairs(pairs);
-  let runPos = 0;
-  // Run-lifetime demand heartbeat: re-posts unfilled pairs so leased
-  // bounties never lapse while we still have work. Stopping it is the
-  // only cancel — a lease dies ~10s after heartbeats stop — so it lives
-  // in the finally below.
-  let bountySyncStopped = true;
-  let bountySyncTimer = null;
-  let bountySyncPosted = false; // print the hive line at most once per run
-
-  async function bountySyncTick() {
-    if (bountySyncStopped || cancelled || cooling() || !relayActive()) return; // do not reschedule
-    const missing = pairs
-      .slice(runPos)
-      .filter(([a, b]) => !pairCache.has(pairKey(a.text, b.text)))
-      .map(([a, b]) => [a.text, b.text]);
-    const snap = rateChromeSnapshot();
-    const [start, count] = bountySyncPlan(missing.length, snap.remaining, snap.max).map(Number);
-    if (count > 0) {
-      const d = await relayFetch("/api/bounties", { pairs: missing.slice(start, start + count), lease: true }, 8000);
-      if (d == null) { relayMarkUnreachable(); bountySyncStopped = true; return; } // unreachable: stop, do not reschedule
-      for (const [key, v] of Object.entries(d.results || {})) {
-        if (!pairCache.has(key)) {
-          const cached = relayResultToCache(v);
-          pairCache.set(key, cached);
-          const sep = key.indexOf("\0");
-          if (cached && sep >= 0) recordRecipe(cached.text, key.slice(0, sep), key.slice(sep + 1));
-          relayHits++;
-        }
-      }
-      if (!bountySyncPosted && d.posted > 0) {
-        bountySyncPosted = true;
-        print(dim(`  🐝 posted ${d.posted} bounties to the hive`));
-      }
-    }
-    if (bountySyncStopped) return;
-    bountySyncTimer = setTimeout(bountySyncTick, Number(bountySyncIntervalMs()));
-  }
-
-  function stopBountySync() {
-    bountySyncStopped = true;
-    if (bountySyncTimer) clearTimeout(bountySyncTimer);
-  }
-
-  if (relayActive() && pairs.length > 1) {
-    bountySyncStopped = false;
-    bountySyncTick(); // fire-and-forget; finally stops the chain
-  }
-
+  // The run asserts an id from here on: every beat carries it, and the
+  // run's board entries live exactly as long as it keeps appearing. The
+  // finally clears it — that IS cancellation, on every exit path.
+  runSeq++;
+  runPostedOnce = false;
   let done = 0, newCount = 0, nothingCount = 0, errors = 0;
   const total = pairs.length;
   const onResult = opts.onResult;
   const shouldPrint = opts.shouldPrint;
   setLaneProgress("pair", 0, total);
   try {
+    runId = `${relaySessionId}-${runSeq}`;
+    if (relayActive() && pairs.length > 1) await hiveRunSync(pairs);
     for (let i = 0; i < pairs.length; i++) {
-      runPos = i;
       const [a, b] = pairs[i];
       if (cancelled) break;
       if (cooling()) {
         print("  " + red(`429 cooldown — ${pairs.length - i} pairs skipped.`));
         break;
       }
-      // Hive-aware wait: rather than block on a rate slot for a genuine miss,
-      // drain the hive for the tail (fleet-filled pairs land as free cache
-      // hits) and wait only until a slot frees or this pair gets filled.
+      // Event-driven rate wait + sync-before-spend: sleep until a slot
+      // frees (no ticks), then absorb hive fills so a scarce neal slot is
+      // spent only on pairs the fleet genuinely hasn't provided.
       if (relayActive()) {
-        await hiveAwareWait([a, b], pairs.slice(i));
+        await hiveWaitForSlots([a, b], pairs.slice(i));
         if (cancelled) break;
         if (cooling()) { print("  " + red(`429 cooldown — ${pairs.length - i} pairs skipped.`)); break; }
       }
@@ -1419,7 +1393,10 @@ async function runPairsInner(pairs, opts = {}) {
       print(`  Done: ${green(String(newCount))} new, ${dim(String(nothingCount))} nothing, ${errors ? red(String(errors)) + " errors" : "0 errors"} (${done}/${total})`);
     }
   } finally {
-    stopBountySync();
+    // Dropping the run id from our beats is what expires this run's board
+    // entries — the relay clears them beat_lapse_ms later, on every exit
+    // path, with no revoke call.
+    runId = "";
   }
 }
 
@@ -3065,7 +3042,7 @@ function initBrowserUI() {
     rebuildRecipeIndex();
     startPageSync();
     relayWarmup().catch(() => {});
-    startBountyWorker();
+    startBeat();
     output.innerHTML = "";
     print(bold(cyan("=== Infinite Craft Trainer ===")) + dim(`  v${TRAINER_VERSION}`));
     print(`  Active save: ${bold(esc(saveName))} (id=${_saveId})`);
