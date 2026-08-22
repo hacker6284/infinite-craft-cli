@@ -1,5 +1,23 @@
 # Changelog
 
+## [3.0.1] - 2026-08-23
+
+### Fixed
+- **Rate-limited runs now catch up on the hive's work in real time.** The
+  rate wait's only wake-up event was the next local slot freeing, so fleet
+  fills for the very pairs a run was blocked on sat unclaimed on the relay
+  until a slot freed anyway — hive help saved slots but never wall-clock,
+  and a fully rate-limited run showed no progress, no result lines, and a
+  frozen bee even while the fleet was answering its bounties. The wait now
+  wakes at the next slot free or the next beat, whichever is sooner, and
+  runs one full catch-up sync per wake — at zero free slots that is a
+  single request that re-offers the whole outstanding backlog and absorbs
+  every fill the hive has. A fleet completion unblocks the run in about a
+  beat with zero slots spent, results print as they land, and the bee
+  ticks live. Verified by a fleet-blitz live test: a run with a fully
+  drained window completes its entire batch in seconds on fleet fills
+  alone.
+
 ## [3.0.0] - 2026-08-22
 
 ### Changed
