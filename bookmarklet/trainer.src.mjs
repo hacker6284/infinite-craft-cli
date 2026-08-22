@@ -46,6 +46,9 @@ import {
   effective_rate_limit as effectiveRateLimit,
   cooldown_duration_ms as cooldownDurationMs,
   bounty_poll_interval_ms as bountyPollIntervalMs,
+  bounty_sync_interval_ms as bountySyncIntervalMs,
+  bounty_sync_plan as bountySyncPlan,
+  bounty_claim_limit as bountyClaimLimit,
   hive_wait_tick_ms as hiveWaitTickMs,
   hive_resweep_interval_ms as hiveResweepIntervalMs,
   bulk_confirm_required as bulkConfirmRequired,
@@ -823,6 +826,7 @@ function bountyPreempted() {
 }
 
 let bountyTimer = null;
+let bountyPollHintMs = 0;
 
 function fleetSlotAvailable() {
   return rateChromeSnapshot().remaining > 0;
@@ -837,8 +841,9 @@ async function bountyTick() {
   const left = rateChromeSnapshot().remaining;
   if (left <= 0) return "blocked";
   // Claim only as many as we can serve this window (review finding F3).
-  const data = await relayFetch(`/api/bounties?limit=${Math.min(5, left)}`, null, 4000);
+  const data = await relayFetch(`/api/bounties?limit=${Number(bountyClaimLimit(left))}`, null, 4000);
   if (data == null) { relayMarkUnreachable(); return "unreachable"; }
+  bountyPollHintMs = data.pollMs != null ? Number(data.pollMs) : 0;
   if (!Array.isArray(data.bounties) || !data.bounties.length) return "empty";
   const items = data.bounties;
   let done = 0;
@@ -896,11 +901,11 @@ async function bountyTick() {
 function scheduleBountyTick() {
   bountyTick()
     .then((status) => {
-      const delay = status === "worked" ? 0 : Number(bountyPollIntervalMs());
+      const delay = status === "worked" ? 0 : bountyPollHintMs || Number(bountyPollIntervalMs());
       bountyTimer = setTimeout(scheduleBountyTick, delay);
     })
     .catch(() => {
-      bountyTimer = setTimeout(scheduleBountyTick, Number(bountyPollIntervalMs()));
+      bountyTimer = setTimeout(scheduleBountyTick, bountyPollHintMs || Number(bountyPollIntervalMs()));
     });
 }
 
@@ -1279,96 +1284,123 @@ async function runPairsInner(pairs, opts = {}) {
     // spent, and the cache-first prioritization below promotes it.
     await hiveSweep(pairs);
   }
-  if (relayActive()) {
-    // Overflow beyond ~two windows of local budget goes on the bounty
-    // board; idle users elsewhere fill the shared cache while we grind our
-    // own share, and the periodic re-sweep below absorbs their results.
-    const missNames = pairs
+  pairs = prioritizePairs(pairs);
+  let runPos = 0;
+  // Run-lifetime demand heartbeat: re-posts unfilled pairs so leased
+  // bounties never lapse while we still have work. Stopping it is the
+  // only cancel — a lease dies ~10s after heartbeats stop — so it lives
+  // in the finally below.
+  let bountySyncStopped = true;
+  let bountySyncTimer = null;
+  let bountySyncPosted = false; // print the hive line at most once per run
+
+  async function bountySyncTick() {
+    if (bountySyncStopped || cancelled || cooling() || !relayActive()) return; // do not reschedule
+    const missing = pairs
+      .slice(runPos)
       .filter(([a, b]) => !pairCache.has(pairKey(a.text, b.text)))
       .map(([a, b]) => [a.text, b.text]);
     const snap = rateChromeSnapshot();
-    const horizon = snap.remaining + snap.max;
-    if (missNames.length > horizon) {
-      const tail = missNames.slice(horizon, horizon + 500);
-      relayFetch("/api/bounties", { pairs: tail }, 8000).then((d) => {
-        if (!d) return;
-        for (const [key, v] of Object.entries(d.results || {})) {
-          if (!pairCache.has(key)) {
-            const cached = relayResultToCache(v);
-            pairCache.set(key, cached);
-            const sep = key.indexOf("\0");
-            if (cached && sep >= 0) recordRecipe(cached.text, key.slice(0, sep), key.slice(sep + 1));
-            relayHits++;
-          }
+    const [start, count] = bountySyncPlan(missing.length, snap.remaining, snap.max).map(Number);
+    if (count > 0) {
+      const d = await relayFetch("/api/bounties", { pairs: missing.slice(start, start + count), lease: true }, 8000);
+      if (d == null) { relayMarkUnreachable(); bountySyncStopped = true; return; } // unreachable: stop, do not reschedule
+      for (const [key, v] of Object.entries(d.results || {})) {
+        if (!pairCache.has(key)) {
+          const cached = relayResultToCache(v);
+          pairCache.set(key, cached);
+          const sep = key.indexOf("\0");
+          if (cached && sep >= 0) recordRecipe(cached.text, key.slice(0, sep), key.slice(sep + 1));
+          relayHits++;
         }
-        if (d.posted) print(dim(`  🐝 posted ${d.posted} bounties to the hive`));
-      }).catch(() => {});
+      }
+      if (!bountySyncPosted && d.posted > 0) {
+        bountySyncPosted = true;
+        print(dim(`  🐝 posted ${d.posted} bounties to the hive`));
+      }
     }
+    if (bountySyncStopped) return;
+    bountySyncTimer = setTimeout(bountySyncTick, Number(bountySyncIntervalMs()));
   }
-  pairs = prioritizePairs(pairs);
+
+  function stopBountySync() {
+    bountySyncStopped = true;
+    if (bountySyncTimer) clearTimeout(bountySyncTimer);
+  }
+
+  if (relayActive() && pairs.length > 1) {
+    bountySyncStopped = false;
+    bountySyncTick(); // fire-and-forget; finally stops the chain
+  }
+
   let done = 0, newCount = 0, nothingCount = 0, errors = 0;
   const total = pairs.length;
   const onResult = opts.onResult;
   const shouldPrint = opts.shouldPrint;
   setLaneProgress("pair", 0, total);
-  for (let i = 0; i < pairs.length; i++) {
-    const [a, b] = pairs[i];
-    if (cancelled) break;
-    if (cooling()) {
-      print("  " + red(`429 cooldown — ${pairs.length - i} pairs skipped.`));
-      break;
-    }
-    // Hive-aware wait: rather than block on a rate slot for a genuine miss,
-    // drain the hive for the tail (fleet-filled pairs land as free cache
-    // hits) and wait only until a slot frees or this pair gets filled.
-    if (relayActive()) {
-      await hiveAwareWait([a, b], pairs.slice(i));
+  try {
+    for (let i = 0; i < pairs.length; i++) {
+      runPos = i;
+      const [a, b] = pairs[i];
       if (cancelled) break;
-      if (cooling()) { print("  " + red(`429 cooldown — ${pairs.length - i} pairs skipped.`)); break; }
-    }
-    // Bump progress when the pair *starts* so chrome never sits at 0/N
-    // while a fetch (or rate-limit wait) is in flight.
-    setLastPair(a.text, b.text);
-    setLaneProgress("pair", i + 1, total);
-    try {
-      const result = await apiPair(a.text, b.text);
-      if (cancelled) break;
-      done = i + 1;
-      if (result) {
-        const isNew = addElement(result.text, result.emoji, result.discovered);
-        recordRecipe(result.text, a.text, b.text);
-        history.push({ a: a.text, b: b.text, result: result.text });
-        let extra = "";
-        if (isNew) {
-          newCount++;
-          extra += " " + green("(new)");
-        }
-        const hit = isTargetHitKernel(targetElement, result.text || "");
-        if (hit) {
-          extra += " " + bold(yellow("★ TARGET ★"));
-        }
-        const ctx = { a, b, result, isNew, isTarget: hit, extra, done, total };
-        const wantPrint = shouldPrint ? shouldPrint(ctx) : !!extra;
-        if (wantPrint) {
-          print(`  ${dim(`[${done}/${total}]`)} ${formatResult(a, b, result)}${extra}`);
-        }
-        if (onResult) await onResult(ctx);
-        if (hit) {
-          if (await acknowledgeTargetHit(a.text, b.text, result.text || "")) break;
-        }
-      } else {
-        nothingCount++;
-        history.push({ a: a.text, b: b.text, result: "Nothing" });
+      if (cooling()) {
+        print("  " + red(`429 cooldown — ${pairs.length - i} pairs skipped.`));
+        break;
       }
-    } catch (e) {
-      if (cancelled) break;
-      done = i + 1;
-      errors++;
+      // Hive-aware wait: rather than block on a rate slot for a genuine miss,
+      // drain the hive for the tail (fleet-filled pairs land as free cache
+      // hits) and wait only until a slot frees or this pair gets filled.
+      if (relayActive()) {
+        await hiveAwareWait([a, b], pairs.slice(i));
+        if (cancelled) break;
+        if (cooling()) { print("  " + red(`429 cooldown — ${pairs.length - i} pairs skipped.`)); break; }
+      }
+      // Bump progress when the pair *starts* so chrome never sits at 0/N
+      // while a fetch (or rate-limit wait) is in flight.
+      setLastPair(a.text, b.text);
+      setLaneProgress("pair", i + 1, total);
+      try {
+        const result = await apiPair(a.text, b.text);
+        if (cancelled) break;
+        done = i + 1;
+        if (result) {
+          const isNew = addElement(result.text, result.emoji, result.discovered);
+          recordRecipe(result.text, a.text, b.text);
+          history.push({ a: a.text, b: b.text, result: result.text });
+          let extra = "";
+          if (isNew) {
+            newCount++;
+            extra += " " + green("(new)");
+          }
+          const hit = isTargetHitKernel(targetElement, result.text || "");
+          if (hit) {
+            extra += " " + bold(yellow("★ TARGET ★"));
+          }
+          const ctx = { a, b, result, isNew, isTarget: hit, extra, done, total };
+          const wantPrint = shouldPrint ? shouldPrint(ctx) : !!extra;
+          if (wantPrint) {
+            print(`  ${dim(`[${done}/${total}]`)} ${formatResult(a, b, result)}${extra}`);
+          }
+          if (onResult) await onResult(ctx);
+          if (hit) {
+            if (await acknowledgeTargetHit(a.text, b.text, result.text || "")) break;
+          }
+        } else {
+          nothingCount++;
+          history.push({ a: a.text, b: b.text, result: "Nothing" });
+        }
+      } catch (e) {
+        if (cancelled) break;
+        done = i + 1;
+        errors++;
+      }
+      await new Promise(r => setTimeout(r, 0));
     }
-    await new Promise(r => setTimeout(r, 0));
-  }
-  if (!cancelled && !opts.skipSummary) {
-    print(`  Done: ${green(String(newCount))} new, ${dim(String(nothingCount))} nothing, ${errors ? red(String(errors)) + " errors" : "0 errors"} (${done}/${total})`);
+    if (!cancelled && !opts.skipSummary) {
+      print(`  Done: ${green(String(newCount))} new, ${dim(String(nothingCount))} nothing, ${errors ? red(String(errors)) + " errors" : "0 errors"} (${done}/${total})`);
+    }
+  } finally {
+    stopBountySync();
   }
 }
 
