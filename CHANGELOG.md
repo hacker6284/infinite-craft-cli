@@ -1,5 +1,44 @@
 # Changelog
 
+## [3.0.0] - 2026-08-22
+
+### Changed
+- **The hive protocol has exactly one timer.** Every client — idle or
+  running — sends a ~1s beat: liveness, neal reachability, and the active
+  run id out; a status and a "there's work you could do" bit back.
+  Everything else is an event, and one threshold derives from the beat:
+  anything a session owns (its runs' board entries, its work assignments,
+  its place in the household budget split) lapses ~15s after its last
+  beat. Deleted outright: lease and legacy TTLs, 90s claim locks, renewal
+  bookkeeping, per-session quotas, idle polls and pacing hints, the
+  recovery probe, the rate-wait tick, the re-sweep timer, and presence
+  headers — ten protocol clocks replaced by one.
+- **Bounties are parallelization offers bound to a live run.** A run
+  offers everything beyond the rate slots it has free right now (the old
+  formula reserved a phantom extra window, so sub-window batches — the
+  common case for script steps — never engaged the fleet at all). Board
+  entries expire by silence alone: cancel or crash, and the run id stops
+  appearing in your beats — no revoke call exists. Work is *assigned*:
+  never handed to two workers while the assignee beats and reports it can
+  reach neal, forfeited the moment it lapses or goes neal-blind, and the
+  poster keeps grinding its own list regardless, absorbing fleet fills
+  right before each spend.
+- **Breaking:** pre-3.0 clients lose the hive tier against the new relay
+  (everything else fails open and works solo) until they upgrade. The
+  trainer updates automatically on next page load.
+
+### Fixed
+- A pre-release adversarial round (three parallel test agents) found and
+  fixed: inconsistent session-id truncation that made long-id posters'
+  bounties unclaimable; anonymous contributions self-confirming into
+  heal-immune cache entries; `limit=0` work pulls assigning the default 5;
+  size-cap eviction removing actively-beating sessions instead of stale
+  ones; non-boolean `nealOk` values stranding assignments (now strict,
+  fails closed); metrics inflation from idempotent re-pulls; a beat-loop
+  crash path that could silently kill the hive tier for a session; and a
+  startup window where a household sibling could see hive work before a
+  starting run's id hit the beats.
+
 ## [2.5.0] - 2026-08-22
 
 ### Added
