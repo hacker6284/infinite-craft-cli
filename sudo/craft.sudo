@@ -2584,41 +2584,30 @@ export func cooldown_duration_ms(strikes: int) -> int
         i = i + 1
     return ms
 
-// Idle bounty poll cadence (fast per design review: idle clients should
-// pick up work promptly; the GET doubles as the presence heartbeat).
-export func bounty_poll_interval_ms() -> int
-    return 10000
+// THE one timer. Every client — idle or running — beats once a second:
+// liveness out (plus neal-reachability and the active run id), a status
+// and a work bit back. Everything else in the hive protocol is an event.
+export func beat_interval_ms() -> int
+    return 1000
 
-// Demand-heartbeat cadence: a rate-limited bulk run re-affirms its open
-// bounties this often.
-export func bounty_sync_interval_ms() -> int
-    return 3000
+// A session (and everything bound to it: its runs' bounties, its work
+// assignments, its presence in the household budget split) lapses this
+// long after its last beat — ~15 nominal beats, generous enough that
+// spaced-out beats from a loaded client or a jittery network degrade
+// gracefully instead of mass-expiring the board.
+export func beat_lapse_ms() -> int
+    return 15000
 
-// A leased bounty lapses after ~3 missed heartbeats — a cancelled run's
-// board self-clears in seconds.
-export func bounty_lease_ttl_ms() -> int
-    return 10000
-
-// One-shot posts from pre-lease clients keep the old 15-minute board TTL.
-export func bounty_legacy_ttl_ms() -> int
-    return 900000
-
-// Max open bounties per posting session; renewals are exempt — quota
-// gates only new posts.
-export func bounty_session_quota() -> int
-    return 600
-
-// Slice of a prioritized miss list a run should lease to the hive:
-// (start, count) past the live horizon (slots_left + effective_max),
-// count clamped to [0, 500].
-export func bounty_sync_plan(miss_count: int, slots_left: int, effective_max: int) -> (int, int)
-    sl = slots_left
-    if sl < 0
-        sl = 0
-    em = effective_max
-    if em < 0
-        em = 0
-    start = sl + em
+// Slice of a prioritized miss list a run should offer the hive:
+// (start, count) — everything beyond what the run can cover with the
+// slots free RIGHT NOW, count clamped to [0, 500]. No look-ahead reserve:
+// a fleet collision is a peer-review confirmation, not waste, and the
+// poster keeps grinding its own list either way (bounties are
+// parallelization offers, not delegation).
+export func bounty_sync_plan(miss_count: int, slots_left: int) -> (int, int)
+    start = slots_left
+    if start < 0
+        start = 0
     count = miss_count - start
     if count < 0
         count = 0
@@ -2626,7 +2615,7 @@ export func bounty_sync_plan(miss_count: int, slots_left: int, effective_max: in
         count = 500
     return (start, count)
 
-// How many bounties an idle client claims per poll.
+// How much work an idle client pulls when the beat says there is some.
 export func bounty_claim_limit(slots_left: int) -> int
     n = slots_left
     if n > 5
@@ -2634,31 +2623,6 @@ export func bounty_claim_limit(slots_left: int) -> int
     if n < 0
         n = 0
     return n
-
-// Relay-computed pacing hint for idle workers — speed up while the board
-// is deep, never for ineligible callers.
-export func bounty_poll_hint_ms(open_bounties: int, eligible: bool) -> int
-    if eligible and open_bounties > 0
-        return 2000
-    return bounty_poll_interval_ms()
-
-// After a relay failure marks the hive tier unreachable, the idle loop
-// probes /health this often. The ping doubles as the wake-up call for a
-// spun-down free instance, so the fleet un-deafens itself instead of
-// staying silent until a manual /relay toggle (2.4.1 field bug).
-export func relay_retry_interval_ms() -> int
-    return 60000
-
-// Hive-aware rate wait: while a bulk run is rate-limited on genuine misses,
-// it re-checks rate/cache every tick and re-sweeps the hive for the tail
-// every interval — draining fleet-filled pairs for free instead of blocking
-// on a slot. A slot frees ~once/sec at 60/min, so a 1s tick paces naturally;
-// re-sweeping every 3s keeps relay load bounded on a large tail.
-export func hive_wait_tick_ms() -> int
-    return 1000
-
-export func hive_resweep_interval_ms() -> int
-    return 3000
 
 // Glyph segment for rate bars: clamp filled to [0, width], then █ filled + ░ empty.
 // Hosts keep ANSI/HTML wrappers; kernel owns clamp + glyph construction.
@@ -3979,9 +3943,8 @@ test "effective_rate_limit and cooldown policy"
     assert cooldown_duration_ms(2) == 14400000
     assert cooldown_duration_ms(3) == 28800000
     assert cooldown_duration_ms(9) == 28800000
-    assert bounty_poll_interval_ms() == 10000
-    assert hive_wait_tick_ms() == 1000
-    assert hive_resweep_interval_ms() == 3000
+    assert beat_interval_ms() == 1000
+    assert beat_lapse_ms() == 15000
     assert rate_bar_segment(-3, 4) == "░░░░"
     assert rate_bar_segment(99, 4) == "████"
     assert rate_bar_segment(0, 0) == ""
@@ -3999,36 +3962,29 @@ test "effective_rate_limit and cooldown policy"
     assert rate_format_pair_for_width("Water", "Fire", 6) == "W… + …"
     assert rate_format_pair_for_width("Water", "Fire", 11) == "Wat… + Fire"
 
-test "bounty lease policy"
-    // bounty_sync_plan: (start, count) past live horizon, count clamped [0, 500]
-    s, c = bounty_sync_plan(5000, 60, 60)
-    assert s == 120
+test "one-timer bounty policy"
+    // bounty_sync_plan: everything beyond the slots free right now
+    s, c = bounty_sync_plan(5000, 60)
+    assert s == 60
     assert c == 500
-    s, c = bounty_sync_plan(100, 60, 60)
-    assert s == 120
-    assert c == 0
-    s, c = bounty_sync_plan(130, 10, 30)
-    assert s == 40
-    assert c == 90
-    s, c = bounty_sync_plan(0, 0, 0)
+    s, c = bounty_sync_plan(100, 60)
+    assert s == 60
+    assert c == 40
+    // Rate-limited mid-batch: the whole remaining backlog is offered
+    s, c = bounty_sync_plan(45, 0)
+    assert s == 0
+    assert c == 45
+    s, c = bounty_sync_plan(0, 0)
     assert s == 0
     assert c == 0
-    // Negative slots_left clamps to 0 before the horizon math
-    s, c = bounty_sync_plan(50, -5, 30)
-    assert s == 30
-    assert c == 20
+    // Negative slots_left clamps to 0
+    s, c = bounty_sync_plan(50, -5)
+    assert s == 0
+    assert c == 50
     assert bounty_claim_limit(3) == 3
     assert bounty_claim_limit(9) == 5
     assert bounty_claim_limit(0) == 0
     assert bounty_claim_limit(-2) == 0
-    assert bounty_poll_hint_ms(4, true) == 2000
-    assert bounty_poll_hint_ms(0, true) == 10000
-    assert bounty_poll_hint_ms(4, false) == 10000
-    assert bounty_sync_interval_ms() == 3000
-    assert bounty_lease_ttl_ms() == 10000
-    assert bounty_legacy_ttl_ms() == 900000
-    assert bounty_session_quota() == 600
-    assert relay_retry_interval_ms() == 60000
 
 test "parse_query_filter parity"
     p, ex, on = parse_query_filter("!fire*")
