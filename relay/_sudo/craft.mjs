@@ -472,6 +472,47 @@ export function bounty_poll_interval_ms() {
     return _rt.int_out(_r);
 }
 
+export function bounty_sync_interval_ms() {
+    const _r = _impl.bounty_sync_interval_ms();
+    return _rt.int_out(_r);
+}
+
+export function bounty_lease_ttl_ms() {
+    const _r = _impl.bounty_lease_ttl_ms();
+    return _rt.int_out(_r);
+}
+
+export function bounty_legacy_ttl_ms() {
+    const _r = _impl.bounty_legacy_ttl_ms();
+    return _rt.int_out(_r);
+}
+
+export function bounty_session_quota() {
+    const _r = _impl.bounty_session_quota();
+    return _rt.int_out(_r);
+}
+
+export function bounty_sync_plan(miss_count, slots_left, effective_max) {
+    miss_count = _rt.host_int(miss_count);
+    slots_left = _rt.host_int(slots_left);
+    effective_max = _rt.host_int(effective_max);
+    const _r = _impl.bounty_sync_plan(miss_count, slots_left, effective_max);
+    return [_rt.int_out(_r[0]), _rt.int_out(_r[1])];
+}
+
+export function bounty_claim_limit(slots_left) {
+    slots_left = _rt.host_int(slots_left);
+    const _r = _impl.bounty_claim_limit(slots_left);
+    return _rt.int_out(_r);
+}
+
+export function bounty_poll_hint_ms(open_bounties, eligible) {
+    open_bounties = _rt.host_int(open_bounties);
+    eligible = _rt.host_bool(eligible);
+    const _r = _impl.bounty_poll_hint_ms(open_bounties, eligible);
+    return _rt.int_out(_r);
+}
+
 export function hive_wait_tick_ms() {
     const _r = _impl.hive_wait_tick_ms();
     return _rt.int_out(_r);

@@ -2589,6 +2589,59 @@ export func cooldown_duration_ms(strikes: int) -> int
 export func bounty_poll_interval_ms() -> int
     return 10000
 
+// Demand-heartbeat cadence: a rate-limited bulk run re-affirms its open
+// bounties this often.
+export func bounty_sync_interval_ms() -> int
+    return 3000
+
+// A leased bounty lapses after ~3 missed heartbeats — a cancelled run's
+// board self-clears in seconds.
+export func bounty_lease_ttl_ms() -> int
+    return 10000
+
+// One-shot posts from pre-lease clients keep the old 15-minute board TTL.
+export func bounty_legacy_ttl_ms() -> int
+    return 900000
+
+// Max open bounties per posting session; renewals are exempt — quota
+// gates only new posts.
+export func bounty_session_quota() -> int
+    return 600
+
+// Slice of a prioritized miss list a run should lease to the hive:
+// (start, count) past the live horizon (slots_left + effective_max),
+// count clamped to [0, 500].
+export func bounty_sync_plan(miss_count: int, slots_left: int, effective_max: int) -> (int, int)
+    sl = slots_left
+    if sl < 0
+        sl = 0
+    em = effective_max
+    if em < 0
+        em = 0
+    start = sl + em
+    count = miss_count - start
+    if count < 0
+        count = 0
+    if count > 500
+        count = 500
+    return (start, count)
+
+// How many bounties an idle client claims per poll.
+export func bounty_claim_limit(slots_left: int) -> int
+    n = slots_left
+    if n > 5
+        n = 5
+    if n < 0
+        n = 0
+    return n
+
+// Relay-computed pacing hint for idle workers — speed up while the board
+// is deep, never for ineligible callers.
+export func bounty_poll_hint_ms(open_bounties: int, eligible: bool) -> int
+    if eligible and open_bounties > 0
+        return 2000
+    return bounty_poll_interval_ms()
+
 // Hive-aware rate wait: while a bulk run is rate-limited on genuine misses,
 // it re-checks rate/cache every tick and re-sweeps the hive for the tail
 // every interval — draining fleet-filled pairs for free instead of blocking
@@ -3938,6 +3991,36 @@ test "effective_rate_limit and cooldown policy"
     assert rate_format_pair_for_width("Water", "Fire", 5) == "Wate…"
     assert rate_format_pair_for_width("Water", "Fire", 6) == "W… + …"
     assert rate_format_pair_for_width("Water", "Fire", 11) == "Wat… + Fire"
+
+test "bounty lease policy"
+    // bounty_sync_plan: (start, count) past live horizon, count clamped [0, 500]
+    s, c = bounty_sync_plan(5000, 60, 60)
+    assert s == 120
+    assert c == 500
+    s, c = bounty_sync_plan(100, 60, 60)
+    assert s == 120
+    assert c == 0
+    s, c = bounty_sync_plan(130, 10, 30)
+    assert s == 40
+    assert c == 90
+    s, c = bounty_sync_plan(0, 0, 0)
+    assert s == 0
+    assert c == 0
+    // Negative slots_left clamps to 0 before the horizon math
+    s, c = bounty_sync_plan(50, -5, 30)
+    assert s == 30
+    assert c == 20
+    assert bounty_claim_limit(3) == 3
+    assert bounty_claim_limit(9) == 5
+    assert bounty_claim_limit(0) == 0
+    assert bounty_claim_limit(-2) == 0
+    assert bounty_poll_hint_ms(4, true) == 2000
+    assert bounty_poll_hint_ms(0, true) == 10000
+    assert bounty_poll_hint_ms(4, false) == 10000
+    assert bounty_sync_interval_ms() == 3000
+    assert bounty_lease_ttl_ms() == 10000
+    assert bounty_legacy_ttl_ms() == 900000
+    assert bounty_session_quota() == 600
 
 test "parse_query_filter parity"
     p, ex, on = parse_query_filter("!fire*")

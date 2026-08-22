@@ -3372,6 +3372,60 @@ export function bounty_poll_interval_ms() {
     return 10000n;
 }
 
+export function bounty_sync_interval_ms() {
+    return 3000n;
+}
+
+export function bounty_lease_ttl_ms() {
+    return 10000n;
+}
+
+export function bounty_legacy_ttl_ms() {
+    return 900000n;
+}
+
+export function bounty_session_quota() {
+    return 600n;
+}
+
+export function bounty_sync_plan(miss_count, slots_left, effective_max) {
+    let sl = slots_left;
+    if (sl < 0n) {
+        sl = 0n;
+    }
+    let em = effective_max;
+    if (em < 0n) {
+        em = 0n;
+    }
+    let start = _rt.chk(sl + em);
+    let count = _rt.chk(miss_count - start);
+    if (count < 0n) {
+        count = 0n;
+    }
+    if (count > 500n) {
+        count = 500n;
+    }
+    return [start, count];
+}
+
+export function bounty_claim_limit(slots_left) {
+    let n = slots_left;
+    if (n > 5n) {
+        n = 5n;
+    }
+    if (n < 0n) {
+        n = 0n;
+    }
+    return n;
+}
+
+export function bounty_poll_hint_ms(open_bounties, eligible) {
+    if (eligible && open_bounties > 0n) {
+        return 2000n;
+    }
+    return bounty_poll_interval_ms();
+}
+
 export function hive_wait_tick_ms() {
     return 1000n;
 }
@@ -3564,7 +3618,7 @@ export function seg_concat(segs) {
         let t;
         let hl;
         [t, hl] = seg;
-        _rt.sudo_assert_eq(hl, hl, 2756);
+        _rt.sudo_assert_eq(hl, hl, 2809);
         out = _rt.dup(out.concat(t));
     }
     return _rt.dup(out);
@@ -3602,7 +3656,7 @@ export function has_spaced_pipe_payload(rest) {
         let pfirst;
         let psecond;
         [pfirst, psecond] = _rt.unwrap(parsed);
-        _rt.sudo_assert_eq(pfirst, pfirst, 2785);
+        _rt.sudo_assert_eq(pfirst, pfirst, 2838);
         if (globalThis.BigInt(psecond.length) > 0n && _rt.at(psecond, 0n) === 124n) {
             return true;
         }
@@ -3786,7 +3840,7 @@ export function validate_command_line_segments(line) {
         let with_elem;
         let query;
         [with_elem, query] = _rt.unwrap(parsed);
-        _rt.sudo_assert_eq(with_elem, with_elem, 2925);
+        _rt.sudo_assert_eq(with_elem, with_elem, 2978);
         return query_err_segments(validate_query_at_enqueue(query));
     }
     if (_rt.eq(kind, _rt.txt("cross"))) {
