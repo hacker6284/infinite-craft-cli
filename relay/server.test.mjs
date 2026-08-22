@@ -75,15 +75,17 @@ test("contribute then lookup round-trip; first write wins", () => {
   _resetForTests();
   const r1 = doContribute([
     ["Fire", "Water", "Steam", "\u{1F4A8}"],
-    ["Water", "Fire", "Steam", ""], // same pair reversed → confirmation
+    ["Water", "Fire", "Steam", ""], // same pair reversed → same-session dupe
     ["Earth", "Earth", null, ""], // Nothing result
     ["Bad", "", "X", ""], // empty name → dropped
-  ]);
+  ], "sA");
   assert.equal(r1.added, 2);
   assert.equal(r1.dupes, 1);
+  // An independent session's matching claim reviews the entry...
+  doContribute([["Water", "Fire", "Steam", ""]], "sB");
 
-  // Conflicting claim neither overwrites nor confirms.
-  const r2 = doContribute([["Fire", "Water", "Poison", ""]]);
+  // ...so a conflicting claim neither overwrites nor heals it.
+  const r2 = doContribute([["Fire", "Water", "Poison", ""]], "sC");
   assert.equal(r2.added, 0);
   assert.equal(r2.dupes, 1);
 
@@ -152,7 +154,9 @@ const T0 = 1_000_000;
 const LAPSE = Number(beatLapseMs());
 
 function beat(session, ip, body = {}, now = T0) {
-  return doBeat(session, ip, body, now);
+  // Real clients always send the explicit boolean; the relay is strict
+  // about it (a garbage value fails closed to neal-blind).
+  return doBeat(session, ip, { nealOk: true, ...body }, now);
 }
 
 test("beat registers a session; work bit false on an empty board", () => {
@@ -327,7 +331,7 @@ test("HTTP: beat requires a session; beat + post + work round trip", async () =>
     assert.equal((await pb.json()).ok, true);
     await post("/api/bounties", { pairs: [["Fire", "Water"]], runId: "r1" },
       { "x-ic-session": "poster", "x-forwarded-for": "1.1.1.1" });
-    const wb = await post("/api/beat", {},
+    const wb = await post("/api/beat", { nealOk: true },
       { "x-ic-session": "worker", "x-forwarded-for": "2.2.2.2" });
     assert.equal((await wb.json()).work, true);
     const take = await fetch(base + "/api/work?limit=5",
@@ -357,6 +361,82 @@ test("stats + dashboard render on the beat model", async () => {
     assert.equal(dash.status, 200);
     const html = await dash.text();
     assert.ok(html.includes("Bounties posted / taken"));
+  } finally {
+    server.close();
+  }
+});
+
+test("anonymous contributions never self-confirm (poisoning regression)", () => {
+  _resetForTests();
+  doContribute([["Poison", "Ivy", "FAKE", "☠️"]], "");
+  doContribute([["Poison", "Ivy", "FAKE", "☠️"]], ""); // same anon caller repeats
+  // Still unreviewed → a sessioned conflicting claim heals it away.
+  doContribute([["Poison", "Ivy", "TRUE", ""]], "legit");
+  assert.equal(Object.keys(doLookup([["Poison", "Ivy"]]).results).length, 0);
+});
+
+test("long session ids are normalized consistently end to end", async () => {
+  _resetForTests();
+  const long = "L".repeat(80);
+  const server = makeServer();
+  await new Promise((r) => server.listen(0, r));
+  const port = server.address().port;
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    await fetch(base + "/api/beat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-ic-session": long,
+                 "x-forwarded-for": "1.1.1.1" },
+      body: JSON.stringify({ nealOk: true, runId: "r1" }),
+    });
+    await fetch(base + "/api/bounties", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-ic-session": long,
+                 "x-forwarded-for": "1.1.1.1" },
+      body: JSON.stringify({ pairs: [["Fire", "Water"]], runId: "r1" }),
+    });
+    // The long-id poster is LIVE — its bounty must be claimable elsewhere.
+    const take = await fetch(base + "/api/work?limit=5",
+      { headers: { "x-ic-session": "worker", "x-forwarded-for": "2.2.2.2" } });
+    assert.equal((await take.json()).work.length, 1);
+  } finally {
+    server.close();
+  }
+});
+
+test("limit=0 assigns nothing; garbage nealOk fails closed", () => {
+  _resetForTests();
+  beat("poster", "1.1.1.1", { runId: "r1" });
+  doPostBounties([["A", "B"]], T0, "1.1.1.1", "poster", "r1");
+  beat("w0", "2.2.2.2");
+  assert.equal(doTakeWork(0, "w0", T0, "2.2.2.2").work.length, 0);
+  // w1 claims, then beats with a STRING "false" — strict typing treats it
+  // as neal-blind, so the assignment forfeits rather than stranding.
+  beat("w1", "3.3.3.3");
+  assert.equal(doTakeWork(5, "w1", T0, "3.3.3.3").work.length, 1);
+  doBeat("w1", "3.3.3.3", { nealOk: "false" }, T0 + 1000);
+  beat("poster", "1.1.1.1", { runId: "r1" }, T0 + 1000);
+  beat("w2", "4.4.4.4", {}, T0 + 1000);
+  assert.equal(doTakeWork(5, "w2", T0 + 1000, "4.4.4.4").work.length, 1);
+});
+
+test("re-beating refreshes eviction order; self-re-pull doesn't inflate metrics", async () => {
+  _resetForTests();
+  // Eviction-order refresh: set-on-existing-key must move to the end.
+  beat("active", "1.1.1.1", { runId: "r1" });
+  beat("stale", "2.2.2.2");
+  beat("active", "1.1.1.1", { runId: "r1" }, T0 + 1000); // re-beat
+  // Metrics: pulling the same still-open item twice counts once.
+  doPostBounties([["A", "B"]], T0 + 1000, "1.1.1.1", "active", "r1");
+  beat("w1", "3.3.3.3", {}, T0 + 1000);
+  doTakeWork(5, "w1", T0 + 1000, "3.3.3.3");
+  doTakeWork(5, "w1", T0 + 1000, "3.3.3.3"); // idempotent self-re-pull
+  const server = makeServer();
+  await new Promise((r) => server.listen(0, r));
+  const port = server.address().port;
+  try {
+    const stats = await (await fetch(`http://127.0.0.1:${port}/api/stats`)).json();
+    assert.equal(stats.metrics.bountiesTaken, 1);
   } finally {
     server.close();
   }

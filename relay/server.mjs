@@ -160,6 +160,13 @@ function householdRunning(ip, now) {
   return false;
 }
 
+// Session ids are client-generated; normalize (trim + 64-char cap) ONCE
+// here so every map — sessions, bounty.session, assignedTo, review claims —
+// stores and looks up the identical key (adversarial finding #1).
+function callerSession(req) {
+  return envStr(req.headers["x-ic-session"] || "").slice(0, 64);
+}
+
 function callerIp(req) {
   // Render terminates TLS and sets X-Forwarded-For with the client IP as the
   // leftmost entry (its documented format), so we read leftmost. That entry
@@ -182,12 +189,20 @@ function evictOldest(map, cap) {
 }
 
 export function doBeat(sessionId, ip, body, now) {
+  sessionId = String(sessionId).slice(0, 64);
   const prev = sessions.get(sessionId);
   const runId = typeof body.runId === "string" ? body.runId.slice(0, 64) : "";
-  sessions.set(sessionId.slice(0, 64), {
+  // Delete-then-set: a Map.set on an existing key keeps its old insertion
+  // position, so without this an actively-beating session could be evicted
+  // by the size cap while stale ones linger (adversarial finding #4).
+  sessions.delete(sessionId);
+  sessions.set(sessionId, {
     ip,
     at: now,
-    nealOk: body.nealOk !== false,
+    // Strict boolean: a client with a serialization bug ("false", 0, null)
+    // fails CLOSED (treated neal-blind, forfeits assignments) rather than
+    // holding work it can't do (adversarial finding #5).
+    nealOk: body.nealOk === true,
     runId,
     workedAt: prev ? prev.workedAt : 0,
   });
@@ -198,6 +213,7 @@ export function doBeat(sessionId, ip, body, now) {
   if (until > now) {
     until = Math.min(until, now + MAX_COOLDOWN_MS);
     if (until > (ipCooldown.get(ip) || 0)) {
+      ipCooldown.delete(ip); // keep eviction order = recency (finding #4)
       ipCooldown.set(ip, until);
       evictOldest(ipCooldown, MAX_COOLDOWN_IPS);
     }
@@ -402,7 +418,10 @@ export function doContribute(list, session = "") {
         // session than the last confirmer) advances peer review. A repeat
         // from the same session is counted as a dupe and ignored for review,
         // so one client can't lock in its own result.
-        const independent = !session || session !== prev.by;
+        // Anonymous callers are NEVER independent — otherwise two bare
+        // header-less POSTs self-confirm a fabricated result into a
+        // reviewed, heal-immune entry (adversarial finding #2).
+        const independent = session !== "" && session !== prev.by;
         if (independent && !prev.rv) {
           prev.c += 1;
           prev.by = session;
@@ -484,12 +503,15 @@ export function doTakeWork(limit, session, now, ip = "") {
   if (householdRunning(ip, now)) return { work: [], reason: "ip-active" };
   pruneBounties(now);
   const out = [];
-  const cap = Math.max(1, Math.min(limit || 5, 20));
+  // limit=0 is an explicit "nothing" (0 is falsy — `limit || 5` silently
+  // upgraded it to the default and assigned unwanted work; finding #3).
+  const cap = Math.max(0, Math.min(Number.isFinite(limit) ? limit : 5, 20));
+  if (cap === 0) return { work: out };
   for (const b of bounties.values()) {
     if (out.length >= cap) break;
     if (!bountyClaimable(b, session, ip, now)) continue;
+    if (b.assignedTo !== session) metrics.bountiesTaken++;
     b.assignedTo = session || "?";
-    metrics.bountiesTaken++;
     out.push({ kind: "pair", first: b.first, second: b.second });
   }
   // Idle capacity beyond open bounties goes to peer review: re-ask neal
@@ -511,8 +533,8 @@ export function doTakeWork(limit, session, now, ip = "") {
       }
       const i2 = key.indexOf("\0");
       if (i2 < 0) continue;
+      if (!claim || claim.by !== session) metrics.reviewsTaken++;
       reviewPending.set(key, { by: session || "?" });
-      metrics.reviewsTaken++;
       out.push({ kind: "review", first: key.slice(0, i2), second: key.slice(i2 + 1) });
     }
   }
@@ -754,14 +776,14 @@ export function makeServer() {
           return;
         }
         send(res, 200, {
-          ...doContribute(body.entries, envStr(req.headers["x-ic-session"] || "")),
+          ...doContribute(body.entries, callerSession(req)),
           hive: hiveEnvelope(req, now),
         });
         return;
       }
       if (req.method === "POST" && url.pathname === "/api/beat") {
         const body = JSON.parse(await readBody(req));
-        const session = envStr(req.headers["x-ic-session"] || "");
+        const session = callerSession(req);
         if (!session) {
           send(res, 400, { error: "x-ic-session required" });
           return;
@@ -771,7 +793,7 @@ export function makeServer() {
       }
       if (req.method === "GET" && url.pathname === "/api/work") {
         const limit = Number(url.searchParams.get("limit") || "5");
-        const session = envStr(req.headers["x-ic-session"] || "");
+        const session = callerSession(req);
         send(res, 200, {
           ...doTakeWork(limit, session, now, callerIp(req)),
           hive: hiveEnvelope(req, now),
@@ -789,7 +811,7 @@ export function makeServer() {
             body.pairs,
             now,
             callerIp(req),
-            envStr(req.headers["x-ic-session"] || ""),
+            callerSession(req),
             typeof body.runId === "string" ? body.runId.slice(0, 64) : ""
           ),
           hive: hiveEnvelope(req, now),
