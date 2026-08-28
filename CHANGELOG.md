@@ -1,5 +1,22 @@
 # Changelog
 
+## [3.0.2] - 2026-08-28
+
+### Fixed
+- **The trainer's hive bee visibly pulses again.** The pulse class was
+  applied only on the single chrome render that observed the hit count
+  grow, and died two ways (confirmed in a headless-Chrome lab measuring
+  actual on-screen scale): a same-task render cluster replaced the element
+  before the browser ever painted it, and the render bursts that follow
+  v3's batch absorptions remounted the bee mid-animation, restarting the
+  CSS animation at frame zero every few milliseconds so it never reached
+  its peak. Hit growth now arms a short pulse window (one rate-tick plus
+  the animation length), and the first render in the window anchors a
+  timeline that every subsequent remount resumes via a negative
+  animation-delay — one coherent pulse plays regardless of render
+  pattern. Measured 6/6 visible under solo, clustered, and 30ms-storm
+  rendering, versus 0/6 for the old one-shot outside the solo case.
+
 ## [3.0.1] - 2026-08-23
 
 ### Fixed
