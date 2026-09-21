@@ -37,10 +37,34 @@ import {
 // Parity-only helpers: trainer installs seeders on globalThis when loaded
 // under Node (not exported on the production API surface).
 const _parity = globalThis.__IC_TRAINER_PARITY__;
-if (!_parity || typeof _parity.resetState !== "function" || typeof _parity.getRecipeIndex !== "function") {
+if (
+  !_parity ||
+  typeof _parity.resetState !== "function" ||
+  typeof _parity.getRecipeIndex !== "function" ||
+  typeof _parity.seedRawItems !== "function"
+) {
   throw new Error(
     "trainer parity hooks missing; expected Node install of globalThis.__IC_TRAINER_PARITY__"
   );
+}
+
+// Live game rows use `discovery`; older trainer writes used `discovered`.
+// `^` (and therefore /search labels) must see both spellings.
+_parity.seedRawItems([
+  { id: 0, saveId: 0, text: "GameFlag", emoji: "", discovery: true },
+  { id: 1, saveId: 0, text: "LegacyFlag", emoji: "", discovered: true },
+  { id: 2, saveId: 0, text: "Plain", emoji: "" },
+]);
+{
+  const names = matchElements("^")
+    .matches.map((e) => e.text)
+    .sort();
+  const expected = ["GameFlag", "LegacyFlag"];
+  if (JSON.stringify(names) !== JSON.stringify(expected)) {
+    throw new Error(
+      `live first-discovery flags: got ${JSON.stringify(names)}, expected ${JSON.stringify(expected)}`
+    );
+  }
 }
 function _resetStateForParity(elements, recipes) {
   _parity.resetState(elements, recipes);

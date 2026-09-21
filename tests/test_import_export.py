@@ -119,6 +119,26 @@ class TestImportFromSave:
         assert "\x1b" not in batch[0][0]
         assert "Evil" in batch[0][0]
 
+    def test_honors_discovery_and_legacy_discovered_flags(self, tmp_path):
+        from infinite_craft_cli.cli import _import_from_save
+
+        storage = make_mock_storage()
+        storage.add_batch.return_value = 3
+        path = tmp_path / "flags.ic"
+        items = [
+            {"id": 0, "text": "Water", "emoji": "💧", "recipes": []},
+            {"id": 1, "text": "Steam", "emoji": "💨", "discovery": True, "recipes": []},
+            {"id": 2, "text": "Unicorn", "emoji": "🦄", "discovered": True, "recipes": []},
+        ]
+        self._write_save(path, items)
+        with patch("infinite_craft_cli.cli._record_recipes_batch"):
+            _import_from_save(storage, str(path))
+        batch = storage.add_batch.call_args[0][0]
+        by_name = {name: first for name, _emoji, first in batch}
+        assert by_name["Water"] is False
+        assert by_name["Steam"] is True
+        assert by_name["Unicorn"] is True
+
     def test_empty_items(self, tmp_path):
         from infinite_craft_cli.cli import _import_from_save
         storage = make_mock_storage()

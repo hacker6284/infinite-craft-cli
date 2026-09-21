@@ -192,10 +192,16 @@ function magenta(t) { return wrap("ict-magenta", t); }
 function red(t) { return wrap("ict-red", t); }
 function dim(t) { return wrap("ict-dim", t); }
 
+// Game IndexedDB items and .ic saves store first discoveries as `discovery`.
+// Earlier trainer versions wrote `discovered`. Reads accept either spelling.
+function itemIsFirstDiscovery(item) {
+  return !!(item && (item.discovery || item.discovered));
+}
+
 function formatElement(el) {
   if (!el || !el.text) return dim("Nothing");
   let s = el.emoji ? `${el.emoji} ${esc(el.text)}` : esc(el.text);
-  if (el.discovered) s += " " + magenta("[FIRST DISCOVERY!]");
+  if (itemIsFirstDiscovery(el)) s += " " + magenta("[FIRST DISCOVERY!]");
   return s;
 }
 
@@ -205,7 +211,7 @@ function formatResult(a, b, result) {
 
 // ── Storage layer (IndexedDB) ─────────────────────────────────────────
 // The game stores items in IndexedDB "infinite-craft" database, "items" store.
-// Each item: {id, saveId, text, emoji, discovered?, recipes?: [[id,id],...]}
+// Each item: {id, saveId, text, emoji, discovery?, recipes?: [[id,id],...]}
 // We load everything into memory at startup and write back on mutations.
 
 const DB_NAME = "infinite-craft";
@@ -301,7 +307,7 @@ function getByName(name) {
 }
 
 function toTuples(elements) {
-  return elements.map(e => [e.text, e.emoji || "", !!e.discovered]);
+  return elements.map(e => [e.text, e.emoji || "", itemIsFirstDiscovery(e)]);
 }
 
 function elementTuples() {
@@ -430,7 +436,7 @@ function startPageSync() {
 
 function _materializeElement(text, emoji, discovered) {
   const item = { id: _nextId++, saveId: _saveId, text, emoji: emoji || "" };
-  if (discovered) item.discovered = true;
+  if (discovered) item.discovery = true;
   _items.push(item);
   _nameIndex[text] = item;
   _idIndex[item.id] = item;
@@ -534,7 +540,7 @@ function recordRecipesBatch(entries) {
 function _resetStateForParity(elements, recipes) {
   _items = elements.map(([text, emoji, discovered], i) => {
     const item = { id: i, saveId: 0, text, emoji: emoji || "" };
-    if (discovered) item.discovered = true;
+    if (discovered) item.discovery = true;
     return item;
   });
   _allItems = _items;
@@ -557,6 +563,15 @@ if (typeof window === "undefined") {
   globalThis.__IC_TRAINER_PARITY__ = {
     resetState: _resetStateForParity,
     getRecipeIndex: _getRecipeIndexForParity,
+    // Raw IndexedDB-shaped rows, for host field-mapping checks that
+    // resetState (tuple → game `discovery` field) cannot express.
+    seedRawItems(items) {
+      _items = items;
+      _allItems = _items;
+      _saveId = 0;
+      rebuildIndexes();
+      recipeIndex = {};
+    },
   };
 }
 
@@ -1198,8 +1213,8 @@ async function acknowledgeTargetHit(aName, bName, resultName) {
 
 function pairTuples(pairs) {
   return pairs.map(([a, b]) => [
-    a.text, a.emoji || "", !!a.discovered,
-    b.text, b.emoji || "", !!b.discovered,
+    a.text, a.emoji || "", itemIsFirstDiscovery(a),
+    b.text, b.emoji || "", itemIsFirstDiscovery(b),
   ]);
 }
 
@@ -2244,7 +2259,7 @@ async function doImportFile() {
       item.id,
       String(item.text ?? ""),
       item.emoji || "",
-      !!(item.discovery || item.discovered),
+      itemIsFirstDiscovery(item),
     ]);
     const recipeRefs = [];
     for (const item of items) {
