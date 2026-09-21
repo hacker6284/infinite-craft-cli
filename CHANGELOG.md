@@ -1,5 +1,14 @@
 # Changelog
 
+## [3.0.3] - 2026-09-20
+
+### Fixed
+- **Browser trainer: first discoveries from the live game were unlabeled.**
+  The game stores the flag as `discovery` on IndexedDB items. `/search`,
+  `/list`, and `^` now read that field (and the legacy `discovered`
+  spelling). Trainer-crafted first discoveries are written as `discovery`
+  so the game sidebar shows them too.
+
 ## [3.0.2] - 2026-08-28
 
 ### Fixed
