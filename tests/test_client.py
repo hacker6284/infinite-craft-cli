@@ -9,7 +9,7 @@ from unittest.mock import patch, MagicMock, AsyncMock
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
 
-from infinite_craft_cli.client import InfiniteCraftClient
+from infinite_craft_cli.client import InfiniteCraftClient, NealBadPairResponse
 
 
 def run_async(coro):
@@ -23,11 +23,15 @@ def _make_mock_session(response_data=None):
     mock_session = AsyncMock()
 
     mock_resp = MagicMock()
-    mock_resp.json.return_value = response_data or {
-        "result": "Steam",
-        "emoji": "💨",
-        "isNew": False,
-    }
+    mock_resp.json.return_value = (
+        {
+            "result": "Steam",
+            "emoji": "💨",
+            "isNew": False,
+        }
+        if response_data is None
+        else response_data
+    )
     mock_resp.raise_for_status = MagicMock()
 
     mock_session.get = AsyncMock(return_value=mock_resp)
@@ -75,6 +79,27 @@ class TestPair:
                 run_async(client.__aenter__())
                 result = run_async(client.pair("Horse", "Rainbow"))
         assert result.is_first_discovery is True
+
+    def _pair_body(self, body):
+        mock_cls, _, _ = _make_mock_session(body)
+        with patch("infinite_craft_cli.client.RateLimiter") as MockRL:
+            MockRL.return_value.acquire = AsyncMock()
+            with patch("curl_cffi.requests.AsyncSession", mock_cls):
+                client = InfiniteCraftClient()
+                run_async(client.__aenter__())
+                return run_async(client.pair("Water", "Fire"))
+
+    def test_missing_result_is_not_nothing(self):
+        with pytest.raises(NealBadPairResponse):
+            self._pair_body({})
+
+    def test_empty_result_is_not_nothing(self):
+        with pytest.raises(NealBadPairResponse):
+            self._pair_body({"result": "", "emoji": ""})
+
+    def test_null_result_is_not_nothing(self):
+        with pytest.raises(NealBadPairResponse):
+            self._pair_body({"result": None})
 
     def test_raises_on_http_error(self):
         mock_cls, mock_session, mock_resp = _make_mock_session()

@@ -954,6 +954,20 @@ async function relayWarmup() {
   relaySeeded = true;
 }
 
+// Only the exact string "Nothing" is Nothing. A missing, empty, or
+// non-string result is not a pair result — callers retry and must not
+// cache or contribute it (a malformed 200 is how the hive learned a
+// false Nothing for a fertile pair).
+function parseNealPair(json) {
+  if (!json || typeof json !== "object") return undefined;
+  const raw = json.result;
+  if (raw === "Nothing") return null;
+  if (typeof raw === "string" && raw !== "") {
+    return { text: raw, emoji: json.emoji || "", discovered: !!json.isNew };
+  }
+  return undefined;
+}
+
 async function apiPair(firstName, secondName, fleet = false) {
   if (cancelled) throw new Error("Cancelled");
   const key = pairKey(firstName, secondName);
@@ -973,17 +987,20 @@ async function apiPair(firstName, secondName, fleet = false) {
   await acquireRate(fleet);
   if (cancelled) throw new Error("Cancelled");
   const url = `/api/infinite-craft/pair?first=${encodeURIComponent(firstName)}&second=${encodeURIComponent(secondName)}`;
-  let resp;
-  let json = null;
+  let parsed;
+  let got = false;
   for (let attempt = 0; ; attempt++) {
     if (cancelled) throw new Error("Cancelled");
     const guard = attemptSignal(FETCH_TIMEOUT_MS);
     try {
-      resp = await fetch(url, { signal: guard.signal });
+      const resp = await fetch(url, { signal: guard.signal });
       // 429 is an hours-long IP ban, never a retry candidate: stand down.
       if (resp.status === 429) { tripCooldown(); throw new Error("429 cooldown"); }
       // Body read shares the attempt guard so a stalled body times out too.
-      if (resp.ok) { json = await resp.json(); break; }
+      if (resp.ok) {
+        const p = parseNealPair(await resp.json());
+        if (p !== undefined) { parsed = p; got = true; break; }
+      }
     } catch (e) {
       if (String(e && e.message).includes("429 cooldown")) throw e;
       /* retry */
@@ -994,21 +1011,17 @@ async function apiPair(firstName, secondName, fleet = false) {
     await sleepCancellable(pairRetryBackoffMs(attempt));
   }
   if (cancelled) throw new Error("Cancelled");
-  if (json == null) throw new Error("API request failed");
-  let result = null;
-  if (json.result && json.result !== "Nothing") {
-    result = { text: json.result, emoji: json.emoji || "", discovered: !!json.isNew };
-  }
-  pairCache.set(key, result);
+  if (!got) throw new Error("API request failed");
+  pairCache.set(key, parsed);
   // Contribute back — but NOT for fleet (bounty) serving: the bounty path
   // contributes explicitly and awaits the count, so contributing here too
   // would double-post the same entry (review finding T2; matches Python,
   // where client.pair never contributes and the bounty path does).
   if (!fleet && relayActive()) {
     const [ka, kb] = pairKeyKernel(firstName, secondName);
-    relayContribute([[ka, kb, result ? result.text : null, result ? result.emoji : ""]]);
+    relayContribute([[ka, kb, parsed ? parsed.text : null, parsed ? parsed.emoji : ""]]);
   }
-  return result;
+  return parsed;
 }
 
 // ── Combine single pair ──────────────────────────────────────────────

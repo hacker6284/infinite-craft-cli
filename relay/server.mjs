@@ -19,8 +19,10 @@
 //                              are simply absent from the map)
 //   POST /api/contribute  → { entries: [[first, second, result|null, emoji], ...] }
 //                           → { added, dupes, total }
-//                             (result null = "Nothing"; first write wins —
-//                              entries are never overwritten, only confirmed)
+//                             (result null = "Nothing". Products are served
+//                              on first write. A Nothing is served only once
+//                              peer-reviewed. A product overrides a stored
+//                              Nothing, reviewed or not.)
 //   POST /api/beat        → { nealOk, runId?, cooledUntil? }  (x-ic-session req'd)
 //                           → { ok, work }   — THE one client timer (~1s):
 //                             liveness in, a work bit out. Sessions, their
@@ -32,9 +34,10 @@
 //                              after; assignment sticks while the assignee
 //                              beats and reports nealOk)
 //
-// Entry values are { r: result|null, e: emoji, c: confirms }. `c` counts
-// independent contributions of the same (pair, result) — the raw material
-// for peer review (bounty board, phase 3).
+// Entry values are { r: result|null, e: emoji, c: confirms, rv, ne? }.
+// `c` counts independent contributions of the same (pair, result). A
+// Nothing (`r:null`) is served only when reviewed and tagged with the
+// current NOTHING_EPOCH; a product overrides any stored Nothing.
 
 import http from "node:http";
 // The shared sudo kernel (generated JS backend, vendored under relay/_sudo
@@ -80,8 +83,11 @@ const UPSTASH_URL = envStr(process.env.UPSTASH_REDIS_REST_URL).replace(/\/+$/, "
 const UPSTASH_TOKEN = envStr(process.env.UPSTASH_REDIS_REST_TOKEN);
 const SNAP_KEY = "pairs";
 
-/** key "<a>\0<b>" → { r: string|null, e: string, c: number, rv: boolean }
-    c = independent identical claims; rv = peer-reviewed (c >= 2). */
+/** key "<a>\0<b>" → { r: string|null, e: string, c: number, rv: boolean, ne?: number }
+    c = independent identical claims; rv = peer-reviewed (c >= 2).
+    ne = NOTHING_EPOCH on Nothings written after the parser fix; older
+    snapshot Nothings lack it and are not served. */
+const NOTHING_EPOCH = 1;
 const entries = new Map();
 /** keys written since the last successful snapshot flush */
 const dirty = new Set();
@@ -378,7 +384,7 @@ export function doLookup(pairs) {
     metrics.lookupPairs++;
     const key = pairKey(a, b);
     const hit = entries.get(key);
-    if (hit) {
+    if (hit && hitServable(hit)) {
       results[key] = { r: hit.r, e: hit.e };
       metrics.lookupHits++;
     }
@@ -397,6 +403,14 @@ function markDeleted(key) {
   if (snapshot.enabled) deletedDirty.add(key);
 }
 
+// Products are served immediately. A Nothing is served only when it is
+// peer-reviewed *and* written after the parser fix (ne === NOTHING_EPOCH).
+// One unreviewed null used to suppress the pair for every hive client.
+function hitServable(hit) {
+  if (hit.r !== null) return true;
+  return !!hit.rv && hit.ne === NOTHING_EPOCH;
+}
+
 export function doContribute(list, session = "") {
   let added = 0;
   let dupes = 0;
@@ -413,6 +427,17 @@ export function doContribute(list, session = "") {
     const key = pairKey(a, b);
     const prev = entries.get(key);
     if (prev) {
+      if (prev.r === null && prev.ne !== NOTHING_EPOCH && r === null) {
+        // Pre-parser Nothing: start a fresh claim under the new epoch
+        // instead of confirming the untrusted entry.
+        entries.set(key, { r: null, e, c: 1, rv: false, by: session, ne: NOTHING_EPOCH });
+        markDirty(key);
+        if (reviewPending.size < REVIEW_PENDING_MAX) reviewPending.set(key, null);
+        bounties.delete(key);
+        metrics.contributed++;
+        added++;
+        continue;
+      }
       if (prev.r === r) {
         // A matching claim confirms — but only an INDEPENDENT one (different
         // session than the last confirmer) advances peer review. A repeat
@@ -432,6 +457,19 @@ export function doContribute(list, session = "") {
           }
           markDirty(key);
         }
+      } else if (prev.r === null && r !== null) {
+        // A real product overrides a Nothing, reviewed or not. A product
+        // cannot come from a missing body; a Nothing can. Reset review so
+        // the product still needs an independent confirmation, but serve
+        // it immediately.
+        entries.set(key, { r, e, c: 1, rv: false, by: session });
+        markDirty(key);
+        if (reviewPending.size < REVIEW_PENDING_MAX) reviewPending.set(key, null);
+        bounties.delete(key);
+        metrics.healed++;
+        metrics.contributed++;
+        added++;
+        continue;
       } else if (!prev.rv) {
         // Conflicting claim against an UNREVIEWED entry: neal is
         // deterministic, so one of the two claims is wrong — drop the
@@ -446,15 +484,21 @@ export function doContribute(list, session = "") {
         // without a live poster behind it. The next run that needs this
         // pair will miss, re-derive fresh, and re-post naturally.
       }
-      // Conflicts against a reviewed entry are ignored: 2+ independent
-      // neal sightings beat a lone dissenter.
+      // Conflicts against a reviewed product are ignored: 2+ independent
+      // neal sightings beat a lone dissenter. (A reviewed Nothing is the
+      // branch above — a product always wins that fight.)
       dupes++;
       continue;
     }
     // At capacity: skip the insert but keep scanning — confirmations for
     // already-present keys later in the batch must still land.
     if (entries.size >= MAX_ENTRIES) continue;
-    entries.set(key, { r, e, c: 1, rv: false, by: session });
+    entries.set(
+      key,
+      r === null
+        ? { r, e, c: 1, rv: false, by: session, ne: NOTHING_EPOCH }
+        : { r, e, c: 1, rv: false, by: session }
+    );
     markDirty(key);
     if (reviewPending.size < REVIEW_PENDING_MAX) reviewPending.set(key, null);
     bounties.delete(key); // a fresh result fulfills any open bounty
@@ -480,7 +524,7 @@ export function doPostBounties(pairs, now, ip = "", session = "", runId = "") {
     if (!a || !b) continue;
     const key = pairKey(a, b);
     const hit = entries.get(key);
-    if (hit) {
+    if (hit && hitServable(hit)) {
       results[key] = { r: hit.r, e: hit.e };
       continue;
     }
@@ -568,9 +612,13 @@ async function snapshotLoad() {
       try {
         const v = JSON.parse(flat[i + 1]);
         if (!entries.has(flat[i]) && entries.size < MAX_ENTRIES) {
+          // Nothings written before the parser fix are untrusted: skip.
+          if (v.r == null && v.ne !== NOTHING_EPOCH) continue;
           const c = v.c || 1;
           const rv = !!v.rv || c >= 2;
-          entries.set(flat[i], { r: v.r ?? null, e: v.e || "", c, rv, by: v.by || "" });
+          const entry = { r: v.r ?? null, e: v.e || "", c, rv, by: v.by || "" };
+          if (entry.r === null) entry.ne = NOTHING_EPOCH;
+          entries.set(flat[i], entry);
           if (!rv && reviewPending.size < REVIEW_PENDING_MAX) {
             reviewPending.set(flat[i], null);
           }
@@ -841,6 +889,21 @@ export function _resetForTests() {
 // Test hook: inspect a bounty record (lease/TTL/renewal assertions).
 export function _bountyForTests(first, second) {
   return bounties.get(pairKey(sanitizeName(first), sanitizeName(second)));
+}
+
+// Test hook: plant an existing hive entry (pre-epoch snapshot poison, etc.).
+export function _seedForTests(a, b, fields) {
+  const key = pairKey(sanitizeName(a), sanitizeName(b));
+  const entry = {
+    r: "r" in fields ? fields.r : null,
+    e: fields.e || "",
+    c: fields.c || 1,
+    rv: !!fields.rv,
+    by: fields.by || "",
+  };
+  if ("ne" in fields) entry.ne = fields.ne;
+  entries.set(key, entry);
+  return key;
 }
 
 const isMain = process.argv[1] && import.meta.url.endsWith(process.argv[1].split("/").pop());

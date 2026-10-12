@@ -18,6 +18,16 @@ class NealRateLimited(Exception):
     def __init__(self, message: str = "neal.fun rate limit hit — cooling down (see /relay status)"):
         super().__init__(message)
 
+
+class NealBadPairResponse(Exception):
+    """neal returned 200 whose body is not a pair result.
+
+    Only the exact string ``"Nothing"`` is Nothing. A missing, empty, or
+    non-string ``result`` is an error: callers retry and must not cache
+    or contribute the body (a malformed 200 is how the hive learned a
+    false Nothing for a fertile pair).
+    """
+
 _BASE_URL = "https://neal.fun"
 _PAIR_ENDPOINT = "/api/infinite-craft/pair"
 _IMPERSONATE = "chrome120"
@@ -182,13 +192,19 @@ class InfiniteCraftClient:
         if resp.status_code == 429:
             raise NealRateLimited()
         resp.raise_for_status()
-        data = resp.json()
-
-        if data.get("result") == "Nothing":
+        try:
+            data = resp.json()
+        except Exception as e:
+            raise NealBadPairResponse("neal pair response was not JSON") from e
+        if not isinstance(data, dict):
+            raise NealBadPairResponse("neal pair response was not an object")
+        raw = data.get("result")
+        if raw == "Nothing":
             return Element(name=None)
-
-        return Element(
-            name=data.get("result"),
-            emoji=data.get("emoji"),
-            is_first_discovery=data.get("isNew"),
-        )
+        if isinstance(raw, str) and raw:
+            return Element(
+                name=raw,
+                emoji=data.get("emoji"),
+                is_first_discovery=data.get("isNew"),
+            )
+        raise NealBadPairResponse("neal pair response missing result")

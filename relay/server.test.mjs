@@ -15,6 +15,7 @@ import {
   pruneBounties,
   _resetForTests,
   _bountyForTests,
+  _seedForTests,
 } from "./server.mjs";
 import { beat_lapse_ms as beatLapseMs } from "./_sudo/craft.mjs";
 
@@ -96,8 +97,51 @@ test("contribute then lookup round-trip; first write wins", () => {
   ]);
   const steam = found.results["Fire" + NUL + "Water"];
   assert.deepEqual(steam, { r: "Steam", e: "\u{1F4A8}" });
-  assert.deepEqual(found.results["Earth" + NUL + "Earth"], { r: null, e: "" });
-  assert.equal(Object.keys(found.results).length, 2);
+  // Unreviewed Nothing is a miss — a single claim is not enough to
+  // suppress the pair for the rest of the hive.
+  assert.equal(found.results["Earth" + NUL + "Earth"], undefined);
+  assert.equal(Object.keys(found.results).length, 1);
+});
+
+test("unreviewed Nothing is a miss; reviewed Nothing is a hit", () => {
+  _resetForTests();
+  const pair = ["Earth", "Earth"];
+  const key = pairKey(pair[0], pair[1]);
+  doContribute([["Earth", "Earth", null, ""]], "sA");
+  assert.equal(doLookup([pair]).results[key], undefined);
+  doContribute([["Earth", "Earth", null, ""]], "sB");
+  assert.deepEqual(doLookup([pair]).results[key], { r: null, e: "" });
+});
+
+test("pre-parser reviewed Nothing is a miss; a product overrides it", () => {
+  _resetForTests();
+  const pair = ["Best Fri-fries Island", "Brokeback Viking"];
+  const key = _seedForTests(pair[0], pair[1], {
+    r: null,
+    rv: true,
+    c: 2,
+    by: "sA",
+  });
+  assert.equal(doLookup([pair]).results[key], undefined);
+  const healed = doContribute(
+    [[pair[0], pair[1], "Brokeback Fri-fries Island", "🍟🏝️"]],
+    "sC"
+  );
+  assert.equal(healed.added, 1);
+  assert.deepEqual(doLookup([pair]).results[key], {
+    r: "Brokeback Fri-fries Island",
+    e: "🍟🏝️",
+  });
+});
+
+test("unreviewed Nothing does not fulfill a bounty post", () => {
+  _resetForTests();
+  const T = 1_000_000;
+  doBeat("poster", "1.1.1.1", { nealOk: true, runId: "r1" }, T);
+  doContribute([["A", "B", null, ""]], "sA");
+  const post = doPostBounties([["A", "B"]], T, "1.1.1.1", "poster", "r1");
+  assert.equal(post.posted, 1);
+  assert.equal(Object.keys(post.results).length, 0);
 });
 
 test("http endpoints: health, lookup, contribute, stats, cors", async () => {
