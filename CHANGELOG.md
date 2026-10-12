@@ -1,5 +1,18 @@
 # Changelog
 
+## [3.0.4] - 2026-10-11
+
+### Fixed
+- **Hive false-Nothing no longer suppresses fertile pairs.** Both clients
+  treated a 200 with a missing, empty, or non-string `result` as
+  `Nothing` and contributed it; lookup served that null on first write,
+  so every hive exhaust skipped the pair. Pair responses are now
+  `Nothing` only when `result` is the exact string `"Nothing"`; anything
+  else is an error (retry, never cache, never contribute). The hive still
+  shares reviewed Nothings. It no longer serves an unreviewed Nothing, and
+  a real product overrides a stored Nothing even after review. Existing
+  snapshot Nothings written before this parser fix are not served.
+
 ## [3.0.3] - 2026-09-20
 
 ### Fixed
