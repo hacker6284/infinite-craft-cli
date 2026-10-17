@@ -14,9 +14,10 @@
     (0, eval)(code);
   });
 
-  // Infinibrowser /api hops go through the content-script loader so Chrome
-  // can attach this profile's infinibrowser.wiki cookies (Cloudflare
-  // clearance). The page cannot read those cookies on a neal.fun fetch.
+  // Infinibrowser /api hops go through the content-script loader to the
+  // service worker so Chrome can attach this profile's infinibrowser.wiki
+  // cookies (Cloudflare clearance). The page cannot read those cookies
+  // on a neal.fun fetch.
   let ibSeq = 0;
   const pending = new Map();
   const IB_FETCH_TIMEOUT_MS = 15000;

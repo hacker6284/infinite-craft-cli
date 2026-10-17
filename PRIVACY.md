@@ -1,6 +1,6 @@
 # Privacy Policy for Infinite Craft Trainer
 
-**Last updated:** October 16, 2026
+**Last updated:** October 17, 2026
 
 ## Overview
 
@@ -37,7 +37,7 @@ The extension requires:
 The extension communicates with:
 - **hacker6284.github.io** — Hosts the trainer script the extension loads on each page visit (public, read-only download; no user data sent). The extension uses `cache: 'no-store'` so your browser does not serve a stale cached copy of the script.
 - **neal.fun** — The official Infinite Craft game server, for element combinations
-- **Infinibrowser** (infinibrowser.wiki) — Optional, only when you explicitly use `/import`, `/fill`, or `/prune` to look up recipes. The extension fetches `https://infinibrowser.wiki/api/…` from the content script so Chrome can attach this profile's infinibrowser.wiki cookies.
+- **Infinibrowser** (infinibrowser.wiki) — Optional, only when you explicitly use `/import`, `/fill`, or `/prune` to look up recipes. The extension fetches `https://infinibrowser.wiki/api/…` from the service worker so Chrome can attach this profile's infinibrowser.wiki cookies.
 
 ## Remote Script Trust Model
 
