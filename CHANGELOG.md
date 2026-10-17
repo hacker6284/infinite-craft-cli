@@ -1,5 +1,16 @@
 # Changelog
 
+## [3.2.1] - 2026-10-16
+
+### Fixed
+- **Hive Nothings must be proven.** A contribute of Nothing is stored
+  only when the client attests it came from a token-backed Neal pair
+  (5th tuple element `true`). Older clients still contribute products;
+  their unproven Nothings are ignored. `NOTHING_EPOCH` is 3, so stored
+  Nothings from epoch 2 (accepted without that proof) are not served.
+  Reload the page or restart the CLI once so in-memory pair caches
+  start empty.
+
 ## [3.2.0] - 2026-10-16
 
 ### Changed
