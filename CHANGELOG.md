@@ -1,5 +1,14 @@
 # Changelog
 
+## [3.2.2] - 2026-10-17
+
+### Fixed
+- **Chrome extension 1.6.1 fetches Infinibrowser from the service worker.**
+  `/import`, `/fill`, and `/prune` were still failing with `Failed to fetch`
+  because a content-script hop is subject to neal.fun CORS. The background
+  worker uses the extension origin, so the `infinibrowser.wiki` host
+  permission applies. This needs a Chrome Web Store upload.
+
 ## [3.2.1] - 2026-10-16
 
 ### Fixed
