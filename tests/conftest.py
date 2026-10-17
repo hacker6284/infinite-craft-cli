@@ -14,6 +14,22 @@ from unittest.mock import MagicMock, AsyncMock, patch
 import contextlib
 
 
+@pytest.fixture(autouse=True)
+def _fake_neal_credentials():
+    """Unit tests never open Chrome for a Neal session."""
+
+    async def creds():
+        return ("tok", "sess")
+
+    async def close():
+        return None
+
+    with patch("infinite_craft_cli.cli._neal_credentials", new=creds), patch(
+        "infinite_craft_cli.cli._close_neal_session", new=close
+    ):
+        yield
+
+
 class MockElement:
     """Lightweight mock for Element."""
 

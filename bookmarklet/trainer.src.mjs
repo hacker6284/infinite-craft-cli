@@ -994,14 +994,22 @@ async function apiPair(firstName, secondName, fleet = false) {
   if (cooling()) throw new Error("429 cooldown");
   await acquireRate(fleet);
   if (cancelled) throw new Error("Cancelled");
-  const url = `/api/infinite-craft/pair?first=${encodeURIComponent(firstName)}&second=${encodeURIComponent(secondName)}`;
+  const [fa, fb] = pairKeyKernel(firstName, secondName);
   let parsed;
   let got = false;
   for (let attempt = 0; ; attempt++) {
     if (cancelled) throw new Error("Cancelled");
+    const token = (typeof window !== "undefined" && window.turnstileToken) || "";
+    const session = (typeof window !== "undefined" && window.craftSessionToken) || "";
+    if (!token || !session) {
+      if (!pairShouldRetry(attempt)) break;
+      await sleepCancellable(pairRetryBackoffMs(attempt));
+      continue;
+    }
+    const url = `/api/infinite-craft/pair?first=${encodeURIComponent(fa)}&second=${encodeURIComponent(fb)}&token=${encodeURIComponent(token)}`;
     const guard = attemptSignal(FETCH_TIMEOUT_MS);
     try {
-      const resp = await fetch(url, { signal: guard.signal });
+      const resp = await fetch(url, { signal: guard.signal, headers: { "x-craft-session": session } });
       // 429 is an hours-long IP ban, never a retry candidate: stand down.
       if (resp.status === 429) { tripCooldown(); throw new Error("429 cooldown"); }
       // Body read shares the attempt guard so a stalled body times out too.

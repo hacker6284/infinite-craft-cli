@@ -10,6 +10,11 @@ if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
 
 from infinite_craft_cli.client import InfiniteCraftClient, NealBadPairResponse
+from infinite_craft_cli.neal_session import NealSessionRequired
+
+
+async def _test_creds():
+    return ("tok", "sess")
 
 
 def run_async(coro):
@@ -49,7 +54,7 @@ class TestPair:
         with patch("infinite_craft_cli.client.RateLimiter") as MockRL:
             MockRL.return_value.acquire = AsyncMock()
             with patch("curl_cffi.requests.AsyncSession", mock_cls):
-                client = InfiniteCraftClient()
+                client = InfiniteCraftClient(credentials=_test_creds)
                 run_async(client.__aenter__())
                 result = run_async(client.pair("Water", "Fire"))
         assert result.name == "Steam"
@@ -63,7 +68,7 @@ class TestPair:
         with patch("infinite_craft_cli.client.RateLimiter") as MockRL:
             MockRL.return_value.acquire = AsyncMock()
             with patch("curl_cffi.requests.AsyncSession", mock_cls):
-                client = InfiniteCraftClient()
+                client = InfiniteCraftClient(credentials=_test_creds)
                 run_async(client.__aenter__())
                 result = run_async(client.pair("Water", "Water"))
         assert result.name is None
@@ -75,7 +80,7 @@ class TestPair:
         with patch("infinite_craft_cli.client.RateLimiter") as MockRL:
             MockRL.return_value.acquire = AsyncMock()
             with patch("curl_cffi.requests.AsyncSession", mock_cls):
-                client = InfiniteCraftClient()
+                client = InfiniteCraftClient(credentials=_test_creds)
                 run_async(client.__aenter__())
                 result = run_async(client.pair("Horse", "Rainbow"))
         assert result.is_first_discovery is True
@@ -85,7 +90,7 @@ class TestPair:
         with patch("infinite_craft_cli.client.RateLimiter") as MockRL:
             MockRL.return_value.acquire = AsyncMock()
             with patch("curl_cffi.requests.AsyncSession", mock_cls):
-                client = InfiniteCraftClient()
+                client = InfiniteCraftClient(credentials=_test_creds)
                 run_async(client.__aenter__())
                 return run_async(client.pair("Water", "Fire"))
 
@@ -107,7 +112,46 @@ class TestPair:
         with patch("infinite_craft_cli.client.RateLimiter") as MockRL:
             MockRL.return_value.acquire = AsyncMock()
             with patch("curl_cffi.requests.AsyncSession", mock_cls):
-                client = InfiniteCraftClient()
+                client = InfiniteCraftClient(credentials=_test_creds)
                 run_async(client.__aenter__())
                 with pytest.raises(Exception, match="403"):
                     run_async(client.pair("Water", "Fire"))
+
+    def test_refuses_tokenless_pair(self):
+        mock_cls, mock_session, _ = _make_mock_session()
+        with patch("infinite_craft_cli.client.RateLimiter") as MockRL:
+            MockRL.return_value.acquire = AsyncMock()
+            with patch("curl_cffi.requests.AsyncSession", mock_cls):
+                client = InfiniteCraftClient()
+                run_async(client.__aenter__())
+                with pytest.raises(NealSessionRequired):
+                    run_async(client.pair("Water", "Fire"))
+        assert mock_session.get.await_count == 1
+
+    def test_empty_credentials_are_tokenless(self):
+        async def empty():
+            return ("", "")
+
+        mock_cls, mock_session, _ = _make_mock_session()
+        with patch("infinite_craft_cli.client.RateLimiter") as MockRL:
+            MockRL.return_value.acquire = AsyncMock()
+            with patch("curl_cffi.requests.AsyncSession", mock_cls):
+                client = InfiniteCraftClient(credentials=empty)
+                run_async(client.__aenter__())
+                with pytest.raises(NealSessionRequired):
+                    run_async(client.pair("Water", "Fire"))
+        assert mock_session.get.await_count == 1
+
+    def test_sends_token_session_and_sorted_names(self):
+        mock_cls, mock_session, _ = _make_mock_session()
+        with patch("infinite_craft_cli.client.RateLimiter") as MockRL:
+            MockRL.return_value.acquire = AsyncMock()
+            with patch("curl_cffi.requests.AsyncSession", mock_cls):
+                client = InfiniteCraftClient(credentials=_test_creds)
+                run_async(client.__aenter__())
+                run_async(client.pair("Water", "Fire"))
+        kwargs = mock_session.get.await_args_list[-1].kwargs
+        assert kwargs["params"]["first"] == "Fire"
+        assert kwargs["params"]["second"] == "Water"
+        assert kwargs["params"]["token"] == "tok"
+        assert kwargs["headers"]["x-craft-session"] == "sess"

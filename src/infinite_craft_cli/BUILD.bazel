@@ -21,6 +21,7 @@ py_library(
     deps = [
         ":_sudo",
         "@pip//curl_cffi",
+        "@pip//playwright",
     ],
 )
 

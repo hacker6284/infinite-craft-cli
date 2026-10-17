@@ -27,9 +27,18 @@ class TestClientIntegration:
         from infinite_craft_cli.client import InfiniteCraftClient
 
         async def _test():
-            async with InfiniteCraftClient(rate_limit=10) as client:
-                result = await client.pair("Water", "Fire")
-                assert result.name == "Steam"
-                assert result.emoji is not None
+            from infinite_craft_cli.data import get_data_dir
+            from infinite_craft_cli.neal_session import NealSession
+
+            session = NealSession(os.path.join(get_data_dir(), "neal-chrome"))
+            try:
+                async with InfiniteCraftClient(
+                    rate_limit=10, credentials=session.credentials
+                ) as client:
+                    result = await client.pair("Water", "Fire")
+                    assert result.name == "Steam"
+                    assert result.emoji is not None
+            finally:
+                await session.close()
 
         run_async(_test())

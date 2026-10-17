@@ -18,6 +18,8 @@ Originally built on [infinite-craft](https://github.com/sqdnoises/infinite-craft
 pip install infinite-craft-cli
 ```
 
+**Chrome is required** to use the Python CLI. Combining elements opens a Chrome window on [neal.fun/infinite-craft](https://neal.fun/infinite-craft/) so Neal can verify the session. If a checkbox appears, click it. Google Chrome is used when it is installed; otherwise install Playwright’s Chromium with `python3 -m playwright install chromium`.
+
 ### Browser extension
 
 Install the [Infinite Craft Trainer](https://chromewebstore.google.com/detail/infinite-craft-trainer/gaonnldioeddnfopgejohbhoajoagbnd) from the Chrome Web Store — it loads automatically on neal.fun/infinite-craft and fetches the current trainer (`trainer.min.js`) from [GitHub Pages](https://hacker6284.github.io/infinite-craft-cli/) with `cache: 'no-store'`, so feature updates ship without waiting for a Chrome Web Store release. The extension manifest version (`extension/manifest.json`) is independent of the Python CLI package version (git tags). See [PRIVACY.md](PRIVACY.md) for the remote-script trust model. Works in Edge, Brave, and other Chromium browsers.
@@ -34,7 +36,7 @@ For other install methods (console snippet, userscript), see the [web trainer pa
 infinite-craft
 ```
 
-This opens a REPL where you can combine elements, search discoveries, and more:
+This opens a REPL where you can combine elements, search discoveries, and more. **Chrome is required:** on launch (and again if the session expires) a Chrome window opens on [neal.fun/infinite-craft](https://neal.fun/infinite-craft/) so Neal can verify the session. If a checkbox appears, click it. The window stays open while you combine.
 
 ```
 === Infinite Craft CLI ===

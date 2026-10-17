@@ -40,11 +40,12 @@ from infinite_craft_cli.client import (
     fetch_json,
     ib_get,
 )
+from infinite_craft_cli.neal_session import NealSession, NealSessionRequired
 from infinite_craft_cli.ratelimit import RateLimitCancelled
 from infinite_craft_cli.storage import DiscoveryStorage
 from infinite_craft_cli import __version__
 
-from infinite_craft_cli.data import DISCOVERIES_PATH, RECIPES_PATH, EXPORT_PATH
+from infinite_craft_cli.data import DISCOVERIES_PATH, RECIPES_PATH, EXPORT_PATH, get_data_dir
 from infinite_craft_cli._sudo import craft
 
 # ---------------------------------------------------------------------------
@@ -145,7 +146,7 @@ def _reset_test_state() -> None:
         _skip_summary_shown, \
         _sigint_previous, \
         _winch_previous
-    global _tty_read_byte_hook, _test_prompt_input_hook
+    global _tty_read_byte_hook, _test_prompt_input_hook, _neal_session
     _pair_cache.clear()
     _history.clear()
     _session_input_history.clear()
@@ -189,6 +190,7 @@ def _reset_test_state() -> None:
     _ib_job_total = 0
     _last_pair = None
     _active_client = None
+    _neal_session = None
     _rate_ticker_task = None
     _target_element = ""
     _auto_approve = False
@@ -382,6 +384,34 @@ def _raise_if_cancelled() -> None:
         raise CommandCancelled()
 
 
+def _neal_status(msg: str) -> None:
+    line = f"  {msg}"
+    try:
+        _repl_print_lines(line)
+    except Exception:
+        print(line)
+
+
+async def _neal_credentials() -> tuple[str, str]:
+    """Mint or refresh Turnstile credentials from a live Chrome window."""
+    global _neal_session
+    if _neal_session is None:
+        _neal_session = NealSession(
+            os.path.join(get_data_dir(), "neal-chrome"),
+            status=_neal_status,
+        )
+    return await _neal_session.credentials()
+
+
+async def _close_neal_session() -> None:
+    global _neal_session
+    session = _neal_session
+    _neal_session = None
+    if session is not None:
+        with contextlib.suppress(Exception):
+            await session.close()
+
+
 async def _cached_pair(client, storage, a, b, *, skip_relay_lookup: bool = False):
     """Wrapper around client.pair that caches results by sorted element names.
 
@@ -419,6 +449,8 @@ async def _cached_pair(client, storage, a, b, *, skip_relay_lookup: bool = False
             break
         except RateLimitCancelled:
             raise CommandCancelled() from None
+        except NealSessionRequired:
+            raise
         except NealRateLimited:
             _trip_cooldown()
             raise
@@ -737,6 +769,7 @@ _ib_job_done: int = 0
 _ib_job_total: int = 0
 _last_pair: tuple[str, str] | None = None
 _active_client = None  # InfiniteCraftClient | None
+_neal_session: NealSession | None = None
 _rate_ticker_task: asyncio.Task | None = None
 # /target: pause batch when this element name is produced by a combination.
 # Empty string = no target (kernel is_target_hit/apply_target_state treat "" as idle).
@@ -4372,6 +4405,7 @@ async def interactive_mode():
             cancel_check=lambda: _cancelled,
             rate_limit_sleep_step=_RATE_LIMIT_SLEEP_STEP,
             _rate_limit_wait_callback=_rate_limit_wait_callback,
+            credentials=_neal_credentials,
         ) as client:
             _active_client = client
             _rate_ticker_task = asyncio.create_task(_rate_ticker_loop())
@@ -4382,6 +4416,10 @@ async def interactive_mode():
             _repl_print_lines(f"  Starting elements: {starters}")
             total = len(storage.get_all())
             _repl_print_lines(f"  Discovered: {_color(str(total), GREEN)} elements")
+            try:
+                await _neal_credentials()
+            except NealSessionRequired as e:
+                _repl_print_lines(f"  {_color(str(e), RED)}")
             _repl_print_lines(f"  Type {_color('/help', YELLOW)} for commands")
 
             while True:
@@ -4498,6 +4536,7 @@ async def interactive_mode():
                 await _t
         _relay_bg_tasks.clear()
         _active_client = None
+        await _close_neal_session()
         await _cancel_and_await_worker()
         _teardown_tty_and_chrome()
         _confirm_future = None
@@ -4551,35 +4590,46 @@ async def noninteractive_mode(args):
     else:
         # Commands that need the API client
         storage = DiscoveryStorage(DISCOVERIES_PATH)
-        async with InfiniteCraftClient(rate_limit=API_RATE_LIMIT) as client:
+        async with InfiniteCraftClient(
+            rate_limit=API_RATE_LIMIT,
+            credentials=_neal_credentials,
+        ) as client:
+            try:
+                await _neal_credentials()
+            except NealSessionRequired as e:
+                print(f"  {e}")
+                raise SystemExit(1) from None
             _relay_spawn_warmup(storage)
-            if args.command == "combine":
-                print(await do_combine(client, storage, args.first, args.second))
-            elif args.command == "exhaust":
-                await do_exhaust(client, storage, args.query)
-            elif args.command == "crawl":
-                await do_crawl(client, storage, args.first, args.second)
-            elif args.command == "permute":
-                await do_permute(client, storage, args.query)
-            elif args.command == "permutate":
-                await do_permutate(client, storage, args.query)
-            elif args.command == "cross":
-                await do_cross(client, storage, args.left, args.right)
-            elif args.command == "with":
-                await do_with(client, storage, args.element, args.query)
-            elif args.command == "lucky":
-                await do_lucky(client, storage, args.count)
-            elif args.command == "script":
-                if args.file:
-                    try:
-                        source = Path(args.file).expanduser().read_text(encoding="utf-8")
-                    except OSError as e:
-                        print(f"  Cannot read script: {e}")
-                        raise SystemExit(1) from None
-                else:
-                    source = args.source
-                if not await _run_script(client, storage, source):
-                    raise SystemExit(1)
+            try:
+                if args.command == "combine":
+                    print(await do_combine(client, storage, args.first, args.second))
+                elif args.command == "exhaust":
+                    await do_exhaust(client, storage, args.query)
+                elif args.command == "crawl":
+                    await do_crawl(client, storage, args.first, args.second)
+                elif args.command == "permute":
+                    await do_permute(client, storage, args.query)
+                elif args.command == "permutate":
+                    await do_permutate(client, storage, args.query)
+                elif args.command == "cross":
+                    await do_cross(client, storage, args.left, args.right)
+                elif args.command == "with":
+                    await do_with(client, storage, args.element, args.query)
+                elif args.command == "lucky":
+                    await do_lucky(client, storage, args.count)
+                elif args.command == "script":
+                    if args.file:
+                        try:
+                            source = Path(args.file).expanduser().read_text(encoding="utf-8")
+                        except OSError as e:
+                            print(f"  Cannot read script: {e}")
+                            raise SystemExit(1) from None
+                    else:
+                        source = args.source
+                    if not await _run_script(client, storage, source):
+                        raise SystemExit(1)
+            finally:
+                await _close_neal_session()
 
 
 # ---------------------------------------------------------------------------

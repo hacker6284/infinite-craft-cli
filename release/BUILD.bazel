@@ -27,7 +27,7 @@ py_wheel(
         "Topic :: Games/Entertainment",
         "Programming Language :: Python :: 3",
     ],
-    requires = ["curl-cffi>=0.15"],
+    requires = ["curl-cffi>=0.15", "playwright>=1.61"],
     entry_points = {"console_scripts": ["infinite-craft = infinite_craft_cli.cli:main"]},
     extra_distinfo_files = {"//:LICENSE": "LICENSE"},
     strip_path_prefixes = ["src"],

@@ -3,9 +3,10 @@
 import time
 
 from infinite_craft_cli.element import Element
-from typing import Callable
+from typing import Awaitable, Callable
 
 from infinite_craft_cli._sudo import craft
+from infinite_craft_cli.neal_session import NealSessionRequired
 from infinite_craft_cli.ratelimit import RateLimiter, RateLimitCancelled, RateLimitToken
 
 
@@ -132,11 +133,13 @@ class InfiniteCraftClient:
         *,
         rate_limit_sleep_step: float = 0.1,
         _rate_limit_wait_callback: Callable[[bool], None] | None = None,
+        credentials: Callable[[], Awaitable[tuple[str, str]]] | None = None,
     ):
         self._rate_limiter = RateLimiter(max_requests=rate_limit)
         self._cancel_check = cancel_check
         self._rate_limit_sleep_step = rate_limit_sleep_step
         self._rate_limit_wait_callback = _rate_limit_wait_callback
+        self._credentials = credentials
         self._session = None
 
     async def __aenter__(self):
@@ -160,6 +163,18 @@ class InfiniteCraftClient:
             await self._session.close()
             self._session = None
 
+    async def _pair_credentials(self) -> tuple[str, str]:
+        if self._credentials is None:
+            raise NealSessionRequired(
+                "Neal pair requires a browser session (Turnstile token and x-craft-session)."
+            )
+        token, session = await self._credentials()
+        if not token or not session:
+            raise NealSessionRequired(
+                "Neal pair requires a browser session (Turnstile token and x-craft-session)."
+            )
+        return token, session
+
     async def pair(self, first_name: str, second_name: str, *, fleet: bool = False) -> Element:
         """Combine two elements via the API. Returns the resulting Element.
 
@@ -167,22 +182,26 @@ class InfiniteCraftClient:
         ``fleet=True`` tags the consumed rate slot as hive-bounty spend
         (rendered gold in the rate bar). Raises NealRateLimited on a 429 —
         neal's 429 is an hours-long IP ban, so callers must stand down,
-        never retry.
+        never retry. Raises NealSessionRequired if there is no Turnstile
+        token / craft session — the pair hop is not sent.
         """
-        token: RateLimitToken = await self._rate_limiter.acquire(
+        turnstile, craft_session = await self._pair_credentials()
+        slot: RateLimitToken = await self._rate_limiter.acquire(
             cancel_check=self._cancel_check,
             sleep_step=self._rate_limit_sleep_step,
             _wait_callback=self._rate_limit_wait_callback,
         )
         if self._cancel_check and self._cancel_check():
-            await self._rate_limiter.release(token)
+            await self._rate_limiter.release(slot)
             raise RateLimitCancelled()
         if fleet:
-            self._rate_limiter.mark_fleet(token)
+            self._rate_limiter.mark_fleet(slot)
 
+        first, second = craft.pair_key(first_name, second_name)
         resp = await self._session.get(
             _PAIR_ENDPOINT,
-            params={"first": first_name, "second": second_name},
+            params={"first": first, "second": second, "token": turnstile},
+            headers={"x-craft-session": craft_session},
             allow_redirects=True,
             verify=True,
             impersonate=_IMPERSONATE,

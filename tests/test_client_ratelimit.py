@@ -13,6 +13,10 @@ from infinite_craft_cli.client import InfiniteCraftClient
 from infinite_craft_cli.ratelimit import RateLimitCancelled, RateLimiter
 
 
+async def _test_creds():
+    return ("tok", "sess")
+
+
 def run_async(coro):
     return asyncio.run(coro)
 
@@ -51,6 +55,7 @@ class TestPairRateLimitIntegration:
                     rate_limit=60,
                     cancel_check=cancel_check,
                     rate_limit_sleep_step=0.02,
+                    credentials=_test_creds,
                 )
                 client._rate_limiter = limiter
                 await client.__aenter__()
@@ -82,6 +87,7 @@ class TestPairRateLimitIntegration:
                     rate_limit=60,
                     cancel_check=cancel_check,
                     rate_limit_sleep_step=0.02,
+                    credentials=_test_creds,
                 )
                 client._rate_limiter = limiter
                 await client.__aenter__()
@@ -130,6 +136,7 @@ class TestPairRateLimitIntegration:
                         rate_limit=60,
                         cancel_check=lambda: state["cancel"],
                         rate_limit_sleep_step=0.02,
+                        credentials=_test_creds,
                     )
                     client._rate_limiter = limiter
                     await client.__aenter__()
