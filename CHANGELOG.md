@@ -1,5 +1,24 @@
 # Changelog
 
+## [3.0.5] - 2026-10-16
+
+### Fixed
+- **Valid Nothing is a normal hive result; invalid pair bodies still never become Nothing.**
+  A real `"Nothing"` is served on first write, same rules as a product
+  (first write wins; an unreviewed conflict drops the entry; a reviewed
+  conflict is ignored). A missing, empty, or non-string `result` is an
+  error: retry, never cache, never contribute. A hive lookup payload
+  without `r` is a miss, not Nothing.
+- **Stored hive Nothings from before this release are not served.**
+  `NOTHING_EPOCH` is 2. The next live combine replaces those entries
+  with whatever neal returns now, so a false cached Nothing cannot
+  survive the deploy. Trainer `pairCache` and CLI `_pair_cache` are
+  in-memory; reload the page or restart the CLI once so they start empty.
+
+### Tests
+- Headless-Chromium lab (`//tests/chrome:chrome_pair_test`) drives the
+  built trainer against a mocked hive and pair API.
+
 ## [3.0.4] - 2026-10-11
 
 ### Fixed
