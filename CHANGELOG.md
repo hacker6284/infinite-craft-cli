@@ -1,5 +1,15 @@
 # Changelog
 
+## [3.2.0] - 2026-10-16
+
+### Changed
+- **Chrome extension 1.6.0 fetches Infinibrowser through the content script.**
+  `/import`, `/fill`, and `/prune` use this profile's infinibrowser.wiki
+  cookies so Cloudflare clearance from a visit to that site can succeed.
+  New host permission: `https://infinibrowser.wiki/*`. This needs a
+  Chrome Web Store upload; trainer-script updates still ship via GitHub
+  Pages.
+
 ## [3.1.0] - 2026-10-16
 
 ### Changed
