@@ -1,5 +1,19 @@
 # Changelog
 
+## [3.1.0] - 2026-10-16
+
+### Changed
+- **Chrome is required for the Python CLI.** Combining elements opens a
+  headed Chrome window on neal.fun/infinite-craft so Neal can verify the
+  session (Turnstile token + `x-craft-session`). The window stays open
+  while you combine; a new session is minted if tokens expire. Pair
+  requests without those credentials are refused. Runtime dependency:
+  `playwright>=1.61`.
+- **Trainer pair requests send the same page tokens as the game.**
+  `apiPair` attaches `window.turnstileToken` and header
+  `x-craft-session`, and sorts names with `pairKeyKernel`. Missing
+  tokens retry; the hop is never sent tokenless.
+
 ## [3.0.5] - 2026-10-16
 
 ### Fixed
