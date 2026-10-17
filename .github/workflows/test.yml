@@ -18,6 +18,11 @@ jobs:
           disk-cache: ${{ github.workflow }}
           repository-cache: true
 
+      - name: Install Playwright Chromium
+        run: |
+          python3 -m pip install --user 'playwright==1.63.0'
+          python3 -m playwright install --with-deps chromium
+
       - name: Run tests
         run: bazel test //... --test_output=all --verbose_failures
 

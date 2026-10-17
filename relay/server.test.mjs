@@ -97,23 +97,20 @@ test("contribute then lookup round-trip; first write wins", () => {
   ]);
   const steam = found.results["Fire" + NUL + "Water"];
   assert.deepEqual(steam, { r: "Steam", e: "\u{1F4A8}" });
-  // Unreviewed Nothing is a miss — a single claim is not enough to
-  // suppress the pair for the rest of the hive.
-  assert.equal(found.results["Earth" + NUL + "Earth"], undefined);
-  assert.equal(Object.keys(found.results).length, 1);
+  // Valid Nothing is served on first write, same as a product.
+  assert.deepEqual(found.results["Earth" + NUL + "Earth"], { r: null, e: "" });
+  assert.equal(Object.keys(found.results).length, 2);
 });
 
-test("unreviewed Nothing is a miss; reviewed Nothing is a hit", () => {
+test("unreviewed Nothing is a hit like a product", () => {
   _resetForTests();
   const pair = ["Earth", "Earth"];
   const key = pairKey(pair[0], pair[1]);
   doContribute([["Earth", "Earth", null, ""]], "sA");
-  assert.equal(doLookup([pair]).results[key], undefined);
-  doContribute([["Earth", "Earth", null, ""]], "sB");
   assert.deepEqual(doLookup([pair]).results[key], { r: null, e: "" });
 });
 
-test("pre-parser reviewed Nothing is a miss; a product overrides it", () => {
+test("pre-parser stored Nothing is a miss; a new claim replaces it", () => {
   _resetForTests();
   const pair = ["Best Fri-fries Island", "Brokeback Viking"];
   const key = _seedForTests(pair[0], pair[1], {
@@ -134,14 +131,70 @@ test("pre-parser reviewed Nothing is a miss; a product overrides it", () => {
   });
 });
 
-test("unreviewed Nothing does not fulfill a bounty post", () => {
+test("prior-epoch Nothing is a miss; a live product replaces it", () => {
+  _resetForTests();
+  const pair = ["Brokeback Fri-fries Island", "Cowboy"];
+  const key = _seedForTests(pair[0], pair[1], {
+    r: null,
+    e: "",
+    rv: true,
+    c: 2,
+    by: "sA",
+    ne: 1,
+  });
+  assert.equal(doLookup([pair]).results[key], undefined);
+  const healed = doContribute(
+    [[pair[0], pair[1], "Brokeback Mountain", "🏔️"]],
+    "sC"
+  );
+  assert.equal(healed.added, 1);
+  assert.deepEqual(doLookup([pair]).results[key], {
+    r: "Brokeback Mountain",
+    e: "🏔️",
+  });
+});
+
+test("prior-epoch Nothing is replaced by a fresh Nothing too", () => {
+  _resetForTests();
+  const pair = ["Earth", "Earth"];
+  const key = _seedForTests(pair[0], pair[1], {
+    r: null,
+    rv: true,
+    c: 2,
+    by: "sA",
+    ne: 1,
+  });
+  assert.equal(doLookup([pair]).results[key], undefined);
+  doContribute([["Earth", "Earth", null, ""]], "sC");
+  assert.deepEqual(doLookup([pair]).results[key], { r: null, e: "" });
+});
+
+test("unreviewed Nothing fulfills a bounty post like a product", () => {
   _resetForTests();
   const T = 1_000_000;
   doBeat("poster", "1.1.1.1", { nealOk: true, runId: "r1" }, T);
   doContribute([["A", "B", null, ""]], "sA");
   const post = doPostBounties([["A", "B"]], T, "1.1.1.1", "poster", "r1");
-  assert.equal(post.posted, 1);
-  assert.equal(Object.keys(post.results).length, 0);
+  assert.equal(post.posted, 0);
+  assert.deepEqual(post.results[pairKey("A", "B")], { r: null, e: "" });
+});
+
+test("unreviewed Nothing vs product conflict heals like any mismatch", () => {
+  _resetForTests();
+  doContribute([["P", "Q", null, ""]], "sA");
+  doContribute([["P", "Q", "R2", ""]], "sB");
+  assert.equal(Object.keys(doLookup([["P", "Q"]]).results).length, 0);
+});
+
+test("reviewed Nothing vs product is ignored like any reviewed conflict", () => {
+  _resetForTests();
+  doContribute([["P", "Q", null, ""]], "sA");
+  doContribute([["P", "Q", null, ""]], "sB");
+  doContribute([["P", "Q", "R2", ""]], "sC");
+  assert.deepEqual(doLookup([["P", "Q"]]).results[pairKey("P", "Q")], {
+    r: null,
+    e: "",
+  });
 });
 
 test("http endpoints: health, lookup, contribute, stats, cors", async () => {

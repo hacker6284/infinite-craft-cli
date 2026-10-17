@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Infinite Craft lab</title>
+  <style>
+    body { font-family: sans-serif; margin: 16px; }
+    #game { border: 1px solid #333; padding: 12px; max-width: 480px; }
+    #game-result { min-height: 1.4em; }
+  </style>
+</head>
+<body>
+  <p>Lab stand-in for neal.fun/infinite-craft: IndexedDB + a game combine
+     that always hits <code>/api/infinite-craft/pair</code>.</p>
+  <div id="game">
+    <div>🍟 Brokeback Fri-fries Island</div>
+    <div>🤠 Cowboy</div>
+    <button id="game-combine" type="button">Combine in game</button>
+    <div id="game-result"></div>
+  </div>
+  <script>
+    window.IC_RELAY_URL = location.origin + "/hive";
+    window.__gameLast = null;
+
+    const FIRST = "Brokeback Fri-fries Island";
+    const SECOND = "Cowboy";
+
+    document.getElementById("game-combine").addEventListener("click", async () => {
+      const url = `/api/infinite-craft/pair?first=${encodeURIComponent(FIRST)}&second=${encodeURIComponent(SECOND)}`;
+      const json = await (await fetch(url)).json();
+      window.__gameLast = json;
+      document.getElementById("game-result").textContent = JSON.stringify(json);
+    });
+
+    function seedDB() {
+      return new Promise((resolve, reject) => {
+        const req = indexedDB.open("infinite-craft", 1);
+        req.onupgradeneeded = () => {
+          const db = req.result;
+          if (!db.objectStoreNames.contains("items")) {
+            db.createObjectStore("items", { keyPath: "id" });
+          }
+          if (!db.objectStoreNames.contains("saves")) {
+            db.createObjectStore("saves", { keyPath: "id" });
+          }
+        };
+        req.onerror = () => reject(req.error);
+        req.onsuccess = () => {
+          const db = req.result;
+          const tx = db.transaction(["items", "saves"], "readwrite");
+          const items = tx.objectStore("items");
+          items.put({ id: 1, saveId: 0, text: FIRST, emoji: "🍟" });
+          items.put({ id: 2, saveId: 0, text: SECOND, emoji: "🤠" });
+          tx.objectStore("saves").put({ id: 0, name: "Lab", updated: Date.now() });
+          tx.oncomplete = () => { db.close(); resolve(); };
+          tx.onerror = () => reject(tx.error);
+        };
+      });
+    }
+
+    seedDB().then(() => {
+      const s = document.createElement("script");
+      s.src = "/trainer.js";
+      s.onerror = () => { document.body.append("trainer.js failed to load"); };
+      document.body.appendChild(s);
+    }).catch((err) => {
+      document.body.append("IndexedDB seed failed: " + err);
+    });
+  </script>
+</body>
+</html>

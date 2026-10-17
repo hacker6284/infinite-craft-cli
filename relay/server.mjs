@@ -19,10 +19,14 @@
 //                              are simply absent from the map)
 //   POST /api/contribute  → { entries: [[first, second, result|null, emoji], ...] }
 //                           → { added, dupes, total }
-//                             (result null = "Nothing". Products are served
-//                              on first write. A Nothing is served only once
-//                              peer-reviewed. A product overrides a stored
-//                              Nothing, reviewed or not.)
+//                             (result null = "Nothing". Every valid pair
+//                              result — product or Nothing — is served on
+//                              first write. First write wins; a matching
+//                              independent session reviews the entry;
+//                              a conflict against an unreviewed entry
+//                              drops it. Pre-parser snapshot Nothings
+//                              (no ne) are not valid results and are
+//                              not served.)
 //   POST /api/beat        → { nealOk, runId?, cooledUntil? }  (x-ic-session req'd)
 //                           → { ok, work }   — THE one client timer (~1s):
 //                             liveness in, a work bit out. Sessions, their
@@ -35,9 +39,11 @@
 //                              beats and reports nealOk)
 //
 // Entry values are { r: result|null, e: emoji, c: confirms, rv, ne? }.
-// `c` counts independent contributions of the same (pair, result). A
-// Nothing (`r:null`) is served only when reviewed and tagged with the
-// current NOTHING_EPOCH; a product overrides any stored Nothing.
+// `c` counts independent contributions of the same (pair, result).
+// `r:null` is a valid Nothing, served like a product once tagged with
+// the current NOTHING_EPOCH. Older Nothings (missing ne, or a prior
+// epoch) are skipped and replaced by the next live claim — that is how
+// a deploy drops cached false Nothings without a manual purge.
 
 import http from "node:http";
 // The shared sudo kernel (generated JS backend, vendored under relay/_sudo
@@ -87,7 +93,12 @@ const SNAP_KEY = "pairs";
     c = independent identical claims; rv = peer-reviewed (c >= 2).
     ne = NOTHING_EPOCH on Nothings written after the parser fix; older
     snapshot Nothings lack it and are not served. */
-const NOTHING_EPOCH = 1;
+// Bump when stored Nothings are untrusted (invalid 200s used to become
+// null). Lookup skips any Nothing whose ne does not match; the next
+// contribute replaces it with a fresh claim. 2 = this release: serve
+// Nothing like a product, and drop every Nothing written under epoch 1
+// so a false cached null cannot survive the deploy.
+const NOTHING_EPOCH = 2;
 const entries = new Map();
 /** keys written since the last successful snapshot flush */
 const dirty = new Set();
@@ -403,12 +414,11 @@ function markDeleted(key) {
   if (snapshot.enabled) deletedDirty.add(key);
 }
 
-// Products are served immediately. A Nothing is served only when it is
-// peer-reviewed *and* written after the parser fix (ne === NOTHING_EPOCH).
-// One unreviewed null used to suppress the pair for every hive client.
+// A valid pair result is served on first write, product or Nothing.
+// Pre-parser snapshot Nothings (no NOTHING_EPOCH) are not pair results.
 function hitServable(hit) {
   if (hit.r !== null) return true;
-  return !!hit.rv && hit.ne === NOTHING_EPOCH;
+  return hit.ne === NOTHING_EPOCH;
 }
 
 export function doContribute(list, session = "") {
@@ -427,10 +437,15 @@ export function doContribute(list, session = "") {
     const key = pairKey(a, b);
     const prev = entries.get(key);
     if (prev) {
-      if (prev.r === null && prev.ne !== NOTHING_EPOCH && r === null) {
-        // Pre-parser Nothing: start a fresh claim under the new epoch
-        // instead of confirming the untrusted entry.
-        entries.set(key, { r: null, e, c: 1, rv: false, by: session, ne: NOTHING_EPOCH });
+      if (prev.r === null && prev.ne !== NOTHING_EPOCH) {
+        // Invalid-era stored Nothing: not a pair result. Replace with
+        // this claim the same way a missing key would.
+        entries.set(
+          key,
+          r === null
+            ? { r: null, e, c: 1, rv: false, by: session, ne: NOTHING_EPOCH }
+            : { r, e, c: 1, rv: false, by: session }
+        );
         markDirty(key);
         if (reviewPending.size < REVIEW_PENDING_MAX) reviewPending.set(key, null);
         bounties.delete(key);
@@ -457,19 +472,6 @@ export function doContribute(list, session = "") {
           }
           markDirty(key);
         }
-      } else if (prev.r === null && r !== null) {
-        // A real product overrides a Nothing, reviewed or not. A product
-        // cannot come from a missing body; a Nothing can. Reset review so
-        // the product still needs an independent confirmation, but serve
-        // it immediately.
-        entries.set(key, { r, e, c: 1, rv: false, by: session });
-        markDirty(key);
-        if (reviewPending.size < REVIEW_PENDING_MAX) reviewPending.set(key, null);
-        bounties.delete(key);
-        metrics.healed++;
-        metrics.contributed++;
-        added++;
-        continue;
       } else if (!prev.rv) {
         // Conflicting claim against an UNREVIEWED entry: neal is
         // deterministic, so one of the two claims is wrong — drop the
@@ -484,9 +486,9 @@ export function doContribute(list, session = "") {
         // without a live poster behind it. The next run that needs this
         // pair will miss, re-derive fresh, and re-post naturally.
       }
-      // Conflicts against a reviewed product are ignored: 2+ independent
-      // neal sightings beat a lone dissenter. (A reviewed Nothing is the
-      // branch above — a product always wins that fight.)
+      // Conflicts against a reviewed entry are ignored: 2+ independent
+      // neal sightings beat a lone dissenter. Same rule for Nothing and
+      // for a product.
       dupes++;
       continue;
     }

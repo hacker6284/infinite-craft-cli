@@ -806,9 +806,15 @@ async function relayLookup(pairs) {
   return data.results || {};
 }
 
-/** Relay {r, e} value → trainer pairCache value (null = Nothing). */
+/** Relay {r, e} value → trainer pairCache value.
+    null = valid Nothing; undefined = not a pair result (treat as a miss). */
 function relayResultToCache(v) {
-  return v.r === null ? null : { text: v.r, emoji: v.e || "", discovered: false };
+  if (!v || typeof v !== "object") return undefined;
+  if (v.r === null) return null;
+  if (typeof v.r === "string" && v.r !== "") {
+    return { text: v.r, emoji: v.e || "", discovered: false };
+  }
+  return undefined;
 }
 
 /** Fire-and-forget: share fresh neal results with the hive. */
@@ -978,9 +984,11 @@ async function apiPair(firstName, secondName, fleet = false) {
     const found = await relayLookup([[firstName, secondName]]);
     if (found && found[key] !== undefined) {
       const result = relayResultToCache(found[key]);
-      pairCache.set(key, result);
-      relayHits++;
-      return result;
+      if (result !== undefined) {
+        pairCache.set(key, result);
+        relayHits++;
+        return result;
+      }
     }
   }
   if (cooling()) throw new Error("429 cooldown");
@@ -1262,6 +1270,7 @@ async function hiveSweep(pairs) {
     const v = found[key];
     if (v === undefined || pairCache.has(key)) continue;
     const cached = relayResultToCache(v);
+    if (cached === undefined) continue;
     pairCache.set(key, cached);
     // Host parity: the Python _merge_hive_results records the recipe at
     // sweep time, so a swept-then-never-processed pair (e.g. cancelled run)
@@ -1282,6 +1291,7 @@ function mergeHiveResults(results) {
   for (const [key, v] of Object.entries(results || {})) {
     if (!pairCache.has(key)) {
       const cached = relayResultToCache(v);
+      if (cached === undefined) continue;
       pairCache.set(key, cached);
       const sep = key.indexOf("\0");
       if (cached && sep >= 0) recordRecipe(cached.text, key.slice(0, sep), key.slice(sep + 1));

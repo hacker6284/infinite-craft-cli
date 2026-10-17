@@ -5,6 +5,7 @@ import sys
 import pytest
 from unittest.mock import patch, MagicMock
 
+from infinite_craft_cli.relay import lookup_hit
 from tests.conftest import MockElement, make_mock_storage, make_mock_client
 
 # Run with pytest when invoked directly by Bazel
@@ -841,3 +842,20 @@ class TestStressRegressions:
             run_async(cli._combine_pairs(client, storage, pairs))
         assert seen.get("run_id_at_sweep")  # non-empty during pre-processing
         assert cli._run_id == ""  # and cleared after
+
+
+class TestLookupHit:
+    def test_null_r_is_nothing(self):
+        assert lookup_hit({"r": None, "e": ""}) == (None, "")
+
+    def test_product(self):
+        assert lookup_hit({"r": "Steam", "e": "💨"}) == ("Steam", "💨")
+
+    def test_missing_r_is_not_nothing(self):
+        assert lookup_hit({}) is None
+        assert lookup_hit({"e": ""}) is None
+
+    def test_empty_or_non_string_r_is_not_nothing(self):
+        assert lookup_hit({"r": ""}) is None
+        assert lookup_hit({"r": 1}) is None
+        assert lookup_hit(None) is None

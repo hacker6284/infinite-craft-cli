@@ -79,6 +79,24 @@ def ping() -> dict | None:
         return None
 
 
+def lookup_hit(v: object) -> tuple[str | None, str] | None:
+    """Parse one hive lookup value.
+
+    A valid Nothing is JSON ``r: null``. A missing, empty, or non-string
+    ``r`` is not a pair result — callers treat it as a miss, never as
+    Nothing.
+    """
+    if not isinstance(v, dict) or "r" not in v:
+        return None
+    raw = v["r"]
+    emoji = v["e"] if isinstance(v.get("e"), str) else ""
+    if raw is None:
+        return (None, emoji)
+    if isinstance(raw, str) and raw != "":
+        return (raw, emoji)
+    return None
+
+
 def lookup(pairs: list[tuple[str, str]]) -> dict[str, tuple[str | None, str]] | None:
     """Batch lookup. pairs: [(first, second), ...] in any order.
 
@@ -91,7 +109,9 @@ def lookup(pairs: list[tuple[str, str]]) -> dict[str, tuple[str | None, str]] | 
             chunk = [[a, b] for a, b in pairs[i : i + LOOKUP_BATCH]]
             data = _post_json("/api/lookup", {"pairs": chunk}, LOOKUP_TIMEOUT)
             for key, v in (data.get("results") or {}).items():
-                out[key] = (v.get("r"), v.get("e") or "")
+                hit = lookup_hit(v)
+                if hit is not None:
+                    out[key] = hit
     except Exception:
         return None
     return out
