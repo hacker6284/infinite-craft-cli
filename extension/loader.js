@@ -8,8 +8,68 @@ const MAX_RETRIES = 3;
 const RETRY_BASE_MS = 1000;
 const TRAINER_SENTINEL = "__ICTrainer";
 const TRAINER_READY_EVENT = "ict-trainer-ready";
+const IB_API_HOST = "infinibrowser.wiki";
 
 let loaderState = null;
+
+function isIbApiUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return (
+      parsed.protocol === "https:" &&
+      parsed.hostname === IB_API_HOST &&
+      parsed.pathname.startsWith("/api/")
+    );
+  } catch {
+    return false;
+  }
+}
+
+function replyIbFetch(id, payload) {
+  window.postMessage(
+    { source: "ict-loader", type: "ib-fetch-result", id, ...payload },
+    "*",
+  );
+}
+
+async function handleIbFetch(data) {
+  if (!isIbApiUrl(data.url)) {
+    replyIbFetch(data.id, { error: "Infinibrowser fetch URL is not allowed." });
+    return;
+  }
+  try {
+    const resp = await fetch(data.url, {
+      credentials: "include",
+      cache: "no-store",
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
+    const body = await resp.text();
+    const headers = {};
+    const contentType = resp.headers.get("content-type");
+    if (contentType) {
+      headers["content-type"] = contentType;
+    }
+    replyIbFetch(data.id, {
+      status: resp.status,
+      statusText: resp.statusText,
+      body,
+      headers,
+    });
+  } catch (error) {
+    replyIbFetch(data.id, {
+      error: error && error.message ? error.message : "Failed to fetch",
+    });
+  }
+}
+
+window.addEventListener("message", (event) => {
+  if (event.source !== window) return;
+  const data = event.data;
+  if (!data || data.source !== "ict-page" || data.type !== "ib-fetch") {
+    return;
+  }
+  void handleIbFetch(data);
+});
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));

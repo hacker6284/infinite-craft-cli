@@ -12,6 +12,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 EXTENSION = ROOT / "extension"
 LOADER = EXTENSION / "loader.js"
+BRIDGE = EXTENSION / "page-bridge.js"
 MANIFEST = EXTENSION / "manifest.json"
 TRAINER_URL = "https://hacker6284.github.io/infinite-craft-cli/trainer.min.js"
 
@@ -31,6 +32,17 @@ def test_loader_js_syntax() -> None:
     assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.skipif(shutil.which("node") is None, reason="node required")
+def test_page_bridge_js_syntax() -> None:
+    result = subprocess.run(
+        ["node", "--check", str(BRIDGE)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_extension_does_not_bundle_trainer() -> None:
     assert not (EXTENSION / "trainer.js").exists()
 
@@ -39,6 +51,7 @@ def test_manifest_fetches_hosted_trainer() -> None:
     manifest = json.loads(_read(MANIFEST))
     host_permissions = manifest.get("host_permissions", [])
     assert "https://hacker6284.github.io/*" in host_permissions
+    assert "https://infinibrowser.wiki/*" in host_permissions
     web_accessible = manifest.get("web_accessible_resources", [])
     assert any(
         "page-bridge.js" in entry.get("resources", []) for entry in web_accessible
@@ -47,6 +60,15 @@ def test_manifest_fetches_hosted_trainer() -> None:
     assert content_script["js"] == ["loader.js"]
     assert content_script["matches"] == ["https://neal.fun/infinite-craft/*"]
     assert content_script["run_at"] == "document_idle"
+
+
+def test_loader_only_bridges_infinibrowser_api_paths() -> None:
+    """Content-script IB fetch is an allowlisted https://infinibrowser.wiki/api/ hop."""
+    loader = _read(LOADER)
+    assert 'pathname.startsWith("/api/")' in loader
+    assert 'hostname === IB_API_HOST' in loader
+    bridge = _read(BRIDGE)
+    assert "window.__ICTIbFetch" in bridge
 
 
 def test_loader_fetches_hosted_url() -> None:

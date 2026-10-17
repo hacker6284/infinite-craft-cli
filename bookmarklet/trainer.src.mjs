@@ -2212,6 +2212,26 @@ async function doCombineWithQuery(name, query) {
   await confirmAndRunPairs(pairs);
 }
 
+function ibGet(url, signal) {
+  // Extension / userscript installs window.__ICTIbFetch so Chrome can send
+  // infinibrowser.wiki cookies (Cloudflare clearance). Bookmarklet has no
+  // privileged hop and uses page fetch.
+  if (typeof window.__ICTIbFetch === "function") {
+    return window.__ICTIbFetch(url);
+  }
+  return fetch(url, { signal });
+}
+
+function rejectIbChallenge(resp) {
+  const contentType = (resp.headers.get("content-type") || "").toLowerCase();
+  if (contentType.includes("text/html")) {
+    throw new Error(
+      "Infinibrowser is asking Chrome to verify. Open infinibrowser.wiki, click the checkbox if it appears, then retry.",
+    );
+  }
+  return resp;
+}
+
 // Fetch with retry + backoff for 429s
 async function fetchRetry(url) {
   // Attempt count, retryable statuses, and backoff all come from the kernel
@@ -2222,10 +2242,11 @@ async function fetchRetry(url) {
     let resp = null;
     let err = null;
     try {
-      resp = await fetch(url, { signal: guard.signal });
+      resp = rejectIbChallenge(await ibGet(url, guard.signal));
     } catch (e) {
       // User Stop propagates; a timeout/network failure retries with backoff.
       if (cancelled || (activeAbort && activeAbort.signal.aborted)) throw e;
+      if (e && String(e.message).includes("asking Chrome to verify")) throw e;
       err = e;
     } finally {
       guard.done();
@@ -2339,7 +2360,7 @@ async function doImport(name) {
     rebuildRecipeIndex();
     print(`  Imported ${green(String(recipeBatch.length))} recipe steps for ${bold(esc(name))}.`);
   } catch (e) {
-    if (!cancelled) print("  " + red(`Import failed: ${esc(e.message)}. CORS may be blocked — try the Python CLI instead.`));
+    if (!cancelled) print("  " + red(`Import failed: ${esc(e.message)}`));
   } finally {
     endRun();
   }

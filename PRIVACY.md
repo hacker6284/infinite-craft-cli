@@ -1,6 +1,6 @@
 # Privacy Policy for Infinite Craft Trainer
 
-**Last updated:** June 17, 2026
+**Last updated:** October 16, 2026
 
 ## Overview
 
@@ -30,13 +30,14 @@ The extension requires:
 
 - **`neal.fun/infinite-craft/*`** — Read your discovered elements from the game's local database, call the game's API to combine elements (the same API the game itself uses), and display the CLI overlay on the game page.
 - **`hacker6284.github.io/*`** — Read-only access to download the public trainer script from GitHub Pages. No user data is sent in this request.
+- **`infinibrowser.wiki/*`** — Optional. Used only when you run `/import`, `/fill`, or `/prune`, to look up a recipe on Infinibrowser. The request is the element name in the query string. Chrome may send cookies already stored for infinibrowser.wiki (Cloudflare clearance from a visit to that site).
 
 ## Third-Party Services
 
 The extension communicates with:
 - **hacker6284.github.io** — Hosts the trainer script the extension loads on each page visit (public, read-only download; no user data sent). The extension uses `cache: 'no-store'` so your browser does not serve a stale cached copy of the script.
 - **neal.fun** — The official Infinite Craft game server, for element combinations
-- **Infinibrowser** (infinibrowser.com) — Optional, only when you explicitly use the `/import` or `/fill` commands to look up recipes
+- **Infinibrowser** (infinibrowser.wiki) — Optional, only when you explicitly use `/import`, `/fill`, or `/prune` to look up recipes. The extension fetches `https://infinibrowser.wiki/api/…` from the content script so Chrome can attach this profile's infinibrowser.wiki cookies.
 
 ## Remote Script Trust Model
 

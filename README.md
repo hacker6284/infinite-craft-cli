@@ -22,7 +22,7 @@ pip install infinite-craft-cli
 
 ### Browser extension
 
-Install the [Infinite Craft Trainer](https://chromewebstore.google.com/detail/infinite-craft-trainer/gaonnldioeddnfopgejohbhoajoagbnd) from the Chrome Web Store — it loads automatically on neal.fun/infinite-craft and fetches the current trainer (`trainer.min.js`) from [GitHub Pages](https://hacker6284.github.io/infinite-craft-cli/) with `cache: 'no-store'`, so feature updates ship without waiting for a Chrome Web Store release. The extension manifest version (`extension/manifest.json`) is independent of the Python CLI package version (git tags). See [PRIVACY.md](PRIVACY.md) for the remote-script trust model. Works in Edge, Brave, and other Chromium browsers.
+Install the [Infinite Craft Trainer](https://chromewebstore.google.com/detail/infinite-craft-trainer/gaonnldioeddnfopgejohbhoajoagbnd) from the Chrome Web Store — it loads automatically on neal.fun/infinite-craft and fetches the current trainer (`trainer.min.js`) from [GitHub Pages](https://hacker6284.github.io/infinite-craft-cli/) with `cache: 'no-store'`, so trainer-script updates ship without waiting for a Chrome Web Store release. New host permissions (such as Infinibrowser for `/import` and `/fill`) still need a Web Store upload. The extension manifest version (`extension/manifest.json`) is independent of the Python CLI package version (git tags). See [PRIVACY.md](PRIVACY.md) for the remote-script trust model. Works in Edge, Brave, and other Chromium browsers.
 
 **Manual QA (extension):** After changes to `extension/loader.js`, load the unpacked extension on live [neal.fun/infinite-craft](https://neal.fun/infinite-craft) and confirm the trainer UI appears and IndexedDB-backed commands work (e.g. `/list`).
 
