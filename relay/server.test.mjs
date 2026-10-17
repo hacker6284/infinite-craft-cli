@@ -77,7 +77,7 @@ test("contribute then lookup round-trip; first write wins", () => {
   const r1 = doContribute([
     ["Fire", "Water", "Steam", "\u{1F4A8}"],
     ["Water", "Fire", "Steam", ""], // same pair reversed → same-session dupe
-    ["Earth", "Earth", null, ""], // Nothing result
+    ["Earth", "Earth", null, "", true], // attested Nothing
     ["Bad", "", "X", ""], // empty name → dropped
   ], "sA");
   assert.equal(r1.added, 2);
@@ -106,7 +106,7 @@ test("unreviewed Nothing is a hit like a product", () => {
   _resetForTests();
   const pair = ["Earth", "Earth"];
   const key = pairKey(pair[0], pair[1]);
-  doContribute([["Earth", "Earth", null, ""]], "sA");
+  doContribute([["Earth", "Earth", null, "", true]], "sA");
   assert.deepEqual(doLookup([pair]).results[key], { r: null, e: "" });
 });
 
@@ -165,7 +165,7 @@ test("prior-epoch Nothing is replaced by a fresh Nothing too", () => {
     ne: 1,
   });
   assert.equal(doLookup([pair]).results[key], undefined);
-  doContribute([["Earth", "Earth", null, ""]], "sC");
+  doContribute([["Earth", "Earth", null, "", true]], "sC");
   assert.deepEqual(doLookup([pair]).results[key], { r: null, e: "" });
 });
 
@@ -173,7 +173,7 @@ test("unreviewed Nothing fulfills a bounty post like a product", () => {
   _resetForTests();
   const T = 1_000_000;
   doBeat("poster", "1.1.1.1", { nealOk: true, runId: "r1" }, T);
-  doContribute([["A", "B", null, ""]], "sA");
+  doContribute([["A", "B", null, "", true]], "sA");
   const post = doPostBounties([["A", "B"]], T, "1.1.1.1", "poster", "r1");
   assert.equal(post.posted, 0);
   assert.deepEqual(post.results[pairKey("A", "B")], { r: null, e: "" });
@@ -181,20 +181,103 @@ test("unreviewed Nothing fulfills a bounty post like a product", () => {
 
 test("unreviewed Nothing vs product conflict heals like any mismatch", () => {
   _resetForTests();
-  doContribute([["P", "Q", null, ""]], "sA");
+  doContribute([["P", "Q", null, "", true]], "sA");
   doContribute([["P", "Q", "R2", ""]], "sB");
   assert.equal(Object.keys(doLookup([["P", "Q"]]).results).length, 0);
 });
 
 test("reviewed Nothing vs product is ignored like any reviewed conflict", () => {
   _resetForTests();
-  doContribute([["P", "Q", null, ""]], "sA");
-  doContribute([["P", "Q", null, ""]], "sB");
+  doContribute([["P", "Q", null, "", true]], "sA");
+  doContribute([["P", "Q", null, "", true]], "sB");
   doContribute([["P", "Q", "R2", ""]], "sC");
   assert.deepEqual(doLookup([["P", "Q"]]).results[pairKey("P", "Q")], {
     r: null,
     e: "",
   });
+});
+
+test("unattested Nothing is dropped", () => {
+  _resetForTests();
+  const r = doContribute([["Earth", "Earth", null, ""]], "sA");
+  assert.equal(r.added, 0);
+  assert.equal(Object.keys(doLookup([["Earth", "Earth"]]).results).length, 0);
+});
+
+test("unattested Nothing with explicit false is dropped", () => {
+  _resetForTests();
+  doContribute([["Earth", "Earth", null, "", false]], "sA");
+  assert.equal(Object.keys(doLookup([["Earth", "Earth"]]).results).length, 0);
+});
+
+test("truthy junk is not an attestation", () => {
+  _resetForTests();
+  doContribute([["Earth", "Earth", null, "", 1]], "sA");
+  doContribute([["Earth", "Earth", null, "", "true"]], "sB");
+  assert.equal(Object.keys(doLookup([["Earth", "Earth"]]).results).length, 0);
+});
+
+test("unattested product is still accepted", () => {
+  _resetForTests();
+  const r = doContribute([["Fire", "Water", "Steam", ""]], "sA");
+  assert.equal(r.added, 1);
+  assert.deepEqual(doLookup([["Fire", "Water"]]).results[pairKey("Fire", "Water")], {
+    r: "Steam",
+    e: "",
+  });
+});
+
+test("epoch-2 stored Nothing is a miss", () => {
+  _resetForTests();
+  const pair = ["Earth", "Earth"];
+  const key = _seedForTests(pair[0], pair[1], {
+    r: null,
+    rv: true,
+    c: 2,
+    by: "sA",
+    ne: 2,
+  });
+  assert.equal(doLookup([pair]).results[key], undefined);
+});
+
+test("unattested Nothing does not replace a prior-epoch Nothing", () => {
+  _resetForTests();
+  const pair = ["Earth", "Earth"];
+  const key = _seedForTests(pair[0], pair[1], {
+    r: null,
+    rv: true,
+    c: 2,
+    by: "sA",
+    ne: 2,
+  });
+  assert.equal(doLookup([pair]).results[key], undefined);
+  const r = doContribute([["Earth", "Earth", null, ""]], "sC");
+  assert.equal(r.added, 0);
+  assert.equal(doLookup([pair]).results[key], undefined);
+});
+
+test("attested Nothing replaces a prior-epoch Nothing", () => {
+  _resetForTests();
+  const pair = ["Earth", "Earth"];
+  const key = _seedForTests(pair[0], pair[1], {
+    r: null,
+    rv: true,
+    c: 2,
+    by: "sA",
+    ne: 2,
+  });
+  const r = doContribute([["Earth", "Earth", null, "", true]], "sC");
+  assert.equal(r.added, 1);
+  assert.deepEqual(doLookup([pair]).results[key], { r: null, e: "" });
+});
+
+test("unattested Nothing does not review an attested Nothing", () => {
+  _resetForTests();
+  doContribute([["P", "Q", null, "", true]], "sA");
+  doContribute([["P", "Q", null, ""]], "sB");
+  // Still unreviewed: a product conflict heals it.
+  doContribute([["P", "Q", "R2", ""]], "sC");
+  assert.equal(Object.keys(doLookup([["P", "Q"]]).results).length, 0);
 });
 
 test("http endpoints: health, lookup, contribute, stats, cors", async () => {
@@ -237,6 +320,38 @@ test("http endpoints: health, lookup, contribute, stats, cors", async () => {
 
     const missing = await fetch(`${base}/nope`);
     assert.equal(missing.status, 404);
+  } finally {
+    server.close();
+  }
+});
+
+test("http contribute stores attested Nothing and drops unattested", async () => {
+  _resetForTests();
+  const server = makeServer();
+  await new Promise((resolve) => server.listen(0, resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const dropped = await fetch(`${base}/api/contribute`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ entries: [["Earth", "Earth", null, ""]] }),
+    });
+    assert.equal((await dropped.json()).added, 0);
+
+    const kept = await fetch(`${base}/api/contribute`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ entries: [["Earth", "Earth", null, "", true]] }),
+    });
+    assert.equal((await kept.json()).added, 1);
+
+    const look = await fetch(`${base}/api/lookup`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pairs: [["Earth", "Earth"]] }),
+    });
+    const body = await look.json();
+    assert.deepEqual(body.results["Earth" + NUL + "Earth"], { r: null, e: "" });
   } finally {
     server.close();
   }

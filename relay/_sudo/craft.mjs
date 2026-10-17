@@ -215,6 +215,17 @@ export function relay_reseed_entries(elements, recipes) {
     return _r.map((_v) => [_rt.text_str(_v[0]), _rt.text_str(_v[1]), _rt.text_str(_v[2]), _rt.text_str(_v[3])]);
 }
 
+export function hive_nothing_epoch() {
+    const _r = _impl.hive_nothing_epoch();
+    return _rt.int_out(_r);
+}
+
+export function hive_contribute_keep_nothing(attested) {
+    attested = _rt.host_bool(attested);
+    const _r = _impl.hive_contribute_keep_nothing(attested);
+    return _r;
+}
+
 export function bulk_confirm_required(n, threshold, auto_approve) {
     n = _rt.host_int(n);
     threshold = _rt.host_int(threshold);

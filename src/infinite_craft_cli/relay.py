@@ -117,8 +117,14 @@ def lookup(pairs: list[tuple[str, str]]) -> dict[str, tuple[str | None, str]] | 
     return out
 
 
-def contribute(entries: list[tuple[str, str, str | None, str]]) -> int | None:
-    """Contribute results. entries: [(first, second, result|None, emoji), ...].
+def contribute(entries: list) -> int | None:
+    """Contribute results.
+
+    Each entry is ``(first, second, result|None, emoji)`` plus an optional
+    fifth attested flag. A Nothing (``result is None``) is stored only
+    when that flag is ``True`` — the client's proof the pair came from a
+    token-backed Neal hop. The 5th field is forwarded as-is so the relay
+    can enforce that.
 
     Returns the number of entries the relay hadn't seen, or None when
     unreachable.
@@ -126,7 +132,7 @@ def contribute(entries: list[tuple[str, str, str | None, str]]) -> int | None:
     added = 0
     try:
         for i in range(0, len(entries), CONTRIBUTE_BATCH):
-            chunk = [[a, b, r, e] for a, b, r, e in entries[i : i + CONTRIBUTE_BATCH]]
+            chunk = [list(item) for item in entries[i : i + CONTRIBUTE_BATCH]]
             data = _post_json("/api/contribute", {"entries": chunk}, CONTRIBUTE_TIMEOUT)
             added += int(data.get("added") or 0)
     except Exception:

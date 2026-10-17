@@ -1164,6 +1164,14 @@ export function relay_reseed_entries(elements, recipes) {
     return _rt.dup(out);
 }
 
+export function hive_nothing_epoch() {
+    return 3n;
+}
+
+export function hive_contribute_keep_nothing(attested) {
+    return attested;
+}
+
 export function bulk_confirm_required(n, threshold, auto_approve) {
     if (auto_approve) {
         return false;
@@ -3586,7 +3594,7 @@ export function seg_concat(segs) {
         let t;
         let hl;
         [t, hl] = seg;
-        _rt.sudo_assert_eq(hl, hl, 2780);
+        _rt.sudo_assert_eq(hl, hl, 2794);
         out = _rt.dup(out.concat(t));
     }
     return _rt.dup(out);
@@ -3624,7 +3632,7 @@ export function has_spaced_pipe_payload(rest) {
         let pfirst;
         let psecond;
         [pfirst, psecond] = _rt.unwrap(parsed);
-        _rt.sudo_assert_eq(pfirst, pfirst, 2809);
+        _rt.sudo_assert_eq(pfirst, pfirst, 2823);
         if (globalThis.BigInt(psecond.length) > 0n && _rt.at(psecond, 0n) === 124n) {
             return true;
         }
@@ -3808,7 +3816,7 @@ export function validate_command_line_segments(line) {
         let with_elem;
         let query;
         [with_elem, query] = _rt.unwrap(parsed);
-        _rt.sudo_assert_eq(with_elem, with_elem, 2949);
+        _rt.sudo_assert_eq(with_elem, with_elem, 2963);
         return query_err_segments(validate_query_at_enqueue(query));
     }
     if (_rt.eq(kind, _rt.txt("cross"))) {

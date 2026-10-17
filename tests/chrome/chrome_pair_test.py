@@ -437,3 +437,72 @@ def test_invalid_pair_body_is_not_nothing(playwright_chromium, body):
         for entry in entries:
             if isinstance(entry, list) and len(entry) >= 3:
                 assert entry[2] is not None, rec
+
+
+def _pair_contribute_entries(state: LabState, first: str, second: str) -> list:
+    ka, kb = craft.pair_key(first, second)
+    found = []
+    with state.lock:
+        recs = list(state.hive_requests)
+    for r in recs:
+        if r["path"] != "/hive/api/contribute" or not isinstance(r.get("body"), dict):
+            continue
+        for entry in r["body"].get("entries") or []:
+            if (
+                isinstance(entry, list)
+                and len(entry) >= 2
+                and entry[0] == ka
+                and entry[1] == kb
+            ):
+                found.append(entry)
+    return found
+
+
+@pytest.mark.parametrize(
+    "pair_body, expected_result",
+    [
+        (
+            {"result": PRODUCT, "emoji": PRODUCT_EMOJI, "isNew": False},
+            PRODUCT,
+        ),
+        (
+            {"result": "Nothing", "emoji": "", "isNew": False},
+            None,
+        ),
+    ],
+)
+def test_trainer_contributes_attested_neal_result(
+    playwright_chromium, pair_body, expected_result
+):
+    """A token-backed pair is contributed with attested=true, product or Nothing."""
+    state = LabState(pair_body=pair_body)
+    server, origin = _start_server(state)
+    try:
+        page = playwright_chromium.new_page()
+        try:
+            _boot(page, state, origin)
+            page.fill("#ict-input", COMBINE_LINE)
+            page.press("#ict-input", "Enter")
+            page.wait_for_function(
+                """() => {
+                  const t = document.getElementById("ict-output")?.textContent || "";
+                  return / = /.test(t) && t.includes("Cowboy");
+                }""",
+                timeout=15_000,
+            )
+            _wait_until(
+                lambda: _pair_contribute_entries(state, FIRST, SECOND),
+                5.0,
+                "trainer never contributed the pair",
+            )
+        finally:
+            page.close()
+    finally:
+        server.shutdown()
+
+    entries = _pair_contribute_entries(state, FIRST, SECOND)
+    assert entries, "expected a contribute for the lab pair"
+    for entry in entries:
+        assert len(entry) >= 5, entry
+        assert entry[2] == expected_result, entry
+        assert entry[4] is True, entry

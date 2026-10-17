@@ -817,6 +817,16 @@ function relayResultToCache(v) {
   return undefined;
 }
 
+/** Pack a token-backed pair result for hive contribute.
+
+    The 5th `true` is the attestation: this came from `apiPair`
+    (Turnstile token + x-craft-session). The relay drops Nothings that
+    omit it. */
+function hivePairEntry(firstName, secondName, parsed) {
+  const [ka, kb] = pairKeyKernel(firstName, secondName);
+  return [ka, kb, parsed ? parsed.text : null, parsed ? parsed.emoji : "", true];
+}
+
 /** Fire-and-forget: share fresh neal results with the hive. */
 function relayContribute(entries) {
   relayFetch("/api/contribute", { entries }, 8000).then((d) => {
@@ -909,10 +919,9 @@ async function serveHive() {
       pairCache.set(key, res);
       // Record the recipe locally too (host parity with the Python worker).
       if (res) recordRecipe(res.text, aName, bName);
-      const [ka, kb] = pairKeyKernel(aName, bName);
       const added = await relayFetch(
         "/api/contribute",
-        { entries: [[ka, kb, res ? res.text : null, res ? res.emoji : ""]] },
+        { entries: [hivePairEntry(aName, bName, res)] },
         8000
       );
       if (added == null) { relayMarkUnreachable(); status = "unreachable"; break; }
@@ -1034,8 +1043,7 @@ async function apiPair(firstName, secondName, fleet = false) {
   // would double-post the same entry (review finding T2; matches Python,
   // where client.pair never contributes and the bounty path does).
   if (!fleet && relayActive()) {
-    const [ka, kb] = pairKeyKernel(firstName, secondName);
-    relayContribute([[ka, kb, parsed ? parsed.text : null, parsed ? parsed.emoji : ""]]);
+    relayContribute([hivePairEntry(firstName, secondName, parsed)]);
   }
   return parsed;
 }
