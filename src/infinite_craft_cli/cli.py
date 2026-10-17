@@ -1096,12 +1096,22 @@ def _relay_spawn_bg(coro) -> None:
     task.add_done_callback(_relay_bg_tasks.discard)
 
 
+def _hive_pair_entry(a_name: str, b_name: str, result) -> tuple:
+    """Pack a token-backed pair result for hive contribute.
+
+    The 5th ``True`` is the attestation: this came from ``client.pair``
+    (Turnstile token + x-craft-session). The relay drops Nothings that
+    omit it.
+    """
+    ka, kb = craft.pair_key(a_name, b_name)
+    return (ka, kb, result.name, result.emoji or "", True)
+
+
 def _relay_contribute_bg(a_name: str, b_name: str, result) -> None:
     """Fire-and-forget: share a fresh neal.fun result with the hive."""
     if not _relay_active():
         return
-    ka, kb = craft.pair_key(a_name, b_name)
-    entry = (ka, kb, result.name, result.emoji or "")
+    entry = _hive_pair_entry(a_name, b_name, result)
 
     async def run():
         global _relay_contributed
@@ -1183,7 +1193,7 @@ async def _serve_hive(client, storage) -> str:
             _pair_cache[key] = res
             if res.name is not None:
                 _record_recipes_batch([(res.name, a_name, b_name)])
-            entry = (key[0], key[1], res.name, res.emoji or "")
+            entry = _hive_pair_entry(a_name, b_name, res)
             added = await asyncio.to_thread(relay_client.contribute, [entry])
             if added is None:
                 _relay_mark_unreachable()

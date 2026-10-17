@@ -1018,6 +1018,20 @@ export func relay_reseed_entries(elements: List<(text, text, bool)>, recipes: Ma
             out.append((ka, kb, name, emojis.get(name).get_or("")))
     return out
 
+// Hive Nothing epoch. Lookup serves a stored Nothing only when its `ne`
+// matches this value; a mismatch is a miss and the next attested claim
+// replaces it. Bump when stored Nothings are untrusted. 3 = this
+// release: drop every Nothing written without a token-backed attestation
+// (epoch 2 accepted those on first write).
+export func hive_nothing_epoch() -> int
+    return 3
+
+// A Nothing contribute is kept only when the client attests it came from
+// a token-backed Neal pair (Turnstile token + x-craft-session). Old
+// 4-tuples omit the flag and must not land in the hive.
+export func hive_contribute_keep_nothing(attested: bool) -> bool
+    return attested
+
 // Bulk confirm gate with session auto-approve folded in.
 export func bulk_confirm_required(n: int, threshold: int, auto_approve: bool) -> bool
     if auto_approve
@@ -4595,6 +4609,11 @@ test "relay_reseed_entries canonical deduped deterministic"
     sa, sb, sr, se = out2[1]
     assert sr == "Steam"
     assert se == "\u{1F4A8}"
+
+test "hive Nothing attestation"
+    assert hive_nothing_epoch() == 3
+    assert hive_contribute_keep_nothing(true)
+    assert not hive_contribute_keep_nothing(false)
 
 test "relay_toggle_outcome mirrors auto grammar"
     k1, s1 = relay_toggle_outcome(false, "")

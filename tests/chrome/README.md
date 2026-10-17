@@ -31,4 +31,5 @@ as `//tests/parity:parity_test` needing system `node`.
 
 Valid Nothing is a first-write hive hit, same as a product. An invalid
 pair body (`{}` / `result: null` / `result: ""`) must error and must not
-be contributed as Nothing.
+be contributed as Nothing. A token-backed pair (product or Nothing) is
+contributed with a 5th `true` so the relay can refuse unproven Nothings.

@@ -17,16 +17,20 @@
 //                           → { results: { "<a>\0<b>": { r, e } } }
 //                             (key is the canonical NUL-joined pair; misses
 //                              are simply absent from the map)
-//   POST /api/contribute  → { entries: [[first, second, result|null, emoji], ...] }
+//   POST /api/contribute  → { entries: [[first, second, result|null, emoji, attested?], ...] }
 //                           → { added, dupes, total }
-//                             (result null = "Nothing". Every valid pair
-//                              result — product or Nothing — is served on
-//                              first write. First write wins; a matching
+//                             (result null = "Nothing". A Nothing is
+//                              stored only when the 5th element is JSON
+//                              true — the client's attestation that the
+//                              pair came from a token-backed Neal hop.
+//                              Unattested Nothings (old 4-tuples) are
+//                              dropped. Products still land from 4-tuples.
+//                              Every stored valid pair result is served
+//                              on first write. First write wins; a matching
 //                              independent session reviews the entry;
 //                              a conflict against an unreviewed entry
-//                              drops it. Pre-parser snapshot Nothings
-//                              (no ne) are not valid results and are
-//                              not served.)
+//                              drops it. Prior-epoch Nothings are not
+//                              valid results and are not served.)
 //   POST /api/beat        → { nealOk, runId?, cooledUntil? }  (x-ic-session req'd)
 //                           → { ok, work }   — THE one client timer (~1s):
 //                             liveness in, a work bit out. Sessions, their
@@ -42,8 +46,8 @@
 // `c` counts independent contributions of the same (pair, result).
 // `r:null` is a valid Nothing, served like a product once tagged with
 // the current NOTHING_EPOCH. Older Nothings (missing ne, or a prior
-// epoch) are skipped and replaced by the next live claim — that is how
-// a deploy drops cached false Nothings without a manual purge.
+// epoch) are skipped and replaced by the next attested claim — that is
+// how a deploy drops cached false Nothings without a manual purge.
 
 import http from "node:http";
 // The shared sudo kernel (generated JS backend, vendored under relay/_sudo
@@ -56,6 +60,8 @@ import {
   sanitize_element_name as sanitizeKernel,
   cooldown_duration_ms as cooldownDurationMs,
   beat_lapse_ms as beatLapseMs,
+  hive_nothing_epoch as hiveNothingEpoch,
+  hive_contribute_keep_nothing as hiveContributeKeepNothing,
 } from "./_sudo/craft.mjs";
 
 // The longest cooldown the kernel will ever mint (3rd strike = 8h). Used to
@@ -91,14 +97,12 @@ const SNAP_KEY = "pairs";
 
 /** key "<a>\0<b>" → { r: string|null, e: string, c: number, rv: boolean, ne?: number }
     c = independent identical claims; rv = peer-reviewed (c >= 2).
-    ne = NOTHING_EPOCH on Nothings written after the parser fix; older
-    snapshot Nothings lack it and are not served. */
-// Bump when stored Nothings are untrusted (invalid 200s used to become
-// null). Lookup skips any Nothing whose ne does not match; the next
-// contribute replaces it with a fresh claim. 2 = this release: serve
-// Nothing like a product, and drop every Nothing written under epoch 1
-// so a false cached null cannot survive the deploy.
-const NOTHING_EPOCH = 2;
+    ne = NOTHING_EPOCH on attested Nothings; older snapshot Nothings
+    lack it (or carry a prior epoch) and are not served. */
+// Kernel-owned. Lookup skips any Nothing whose ne does not match; the
+// next attested contribute replaces it. 3 = drop epoch-2 Nothings that
+// landed without a token-backed attestation.
+const NOTHING_EPOCH = Number(hiveNothingEpoch());
 const entries = new Map();
 /** keys written since the last successful snapshot flush */
 const dirty = new Set();
@@ -414,8 +418,8 @@ function markDeleted(key) {
   if (snapshot.enabled) deletedDirty.add(key);
 }
 
-// A valid pair result is served on first write, product or Nothing.
-// Pre-parser snapshot Nothings (no NOTHING_EPOCH) are not pair results.
+// A valid pair result is served on first write, product or attested Nothing.
+// Prior-epoch snapshot Nothings are not pair results.
 function hitServable(hit) {
   if (hit.r !== null) return true;
   return hit.ne === NOTHING_EPOCH;
@@ -434,6 +438,10 @@ export function doContribute(list, session = "") {
     const r = item[2] === null ? null : sanitizeName(item[2]);
     if (r === "") continue; // non-null but sanitized away → junk
     const e = sanitizeEmoji(item.length > 3 ? item[3] : "");
+    // 5th element JSON true = "this Nothing came from a token-backed
+    // Neal pair". Anything else (omitted, false, a string) is unproven.
+    const attested = item.length > 4 && item[4] === true;
+    if (r === null && !hiveContributeKeepNothing(attested)) continue;
     const key = pairKey(a, b);
     const prev = entries.get(key);
     if (prev) {
@@ -614,7 +622,7 @@ async function snapshotLoad() {
       try {
         const v = JSON.parse(flat[i + 1]);
         if (!entries.has(flat[i]) && entries.size < MAX_ENTRIES) {
-          // Nothings written before the parser fix are untrusted: skip.
+          // Nothings from a prior epoch are untrusted: skip.
           if (v.r == null && v.ne !== NOTHING_EPOCH) continue;
           const c = v.c || 1;
           const rv = !!v.rv || c >= 2;
@@ -821,7 +829,7 @@ export function makeServer() {
         const body = JSON.parse(await readBody(req));
         if (!body || !Array.isArray(body.entries)) {
           send(res, 400, {
-            error: "expected { entries: [[first, second, result|null, emoji], ...] }",
+            error: "expected { entries: [[first, second, result|null, emoji, attested?], ...] }",
           });
           return;
         }

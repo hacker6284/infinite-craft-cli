@@ -102,6 +102,33 @@ class TestCachedPairRelayTier:
         assert result.name == "Steam"
         client.pair.assert_awaited_once()
         assert contrib.called
+        entry = contrib.call_args[0][0][0]
+        assert entry[2] == "Steam"
+        assert entry[4] is True
+
+    def test_nothing_contribute_is_attested(self):
+        import infinite_craft_cli.cli as cli
+
+        _relay_on(cli)
+        client = make_mock_client()
+        storage = make_mock_storage()
+        client.pair.return_value = MockElement(None, "")
+        with patch.object(cli.relay_client, "lookup", return_value={}), patch.object(
+            cli.relay_client, "contribute", return_value=1
+        ) as contrib:
+            async def scenario():
+                result = await cli._cached_pair(
+                    client, storage, MockElement("Earth"), MockElement("Earth")
+                )
+                for t in list(cli._relay_bg_tasks):
+                    await t
+                return result
+
+            result = run_async(scenario())
+        assert result.name is None
+        entry = contrib.call_args[0][0][0]
+        assert entry[2] is None
+        assert entry[4] is True
 
     def test_relay_unreachable_fails_open(self):
         import infinite_craft_cli.cli as cli
@@ -383,6 +410,7 @@ class TestServeHive:
             run_async(cli._serve_hive(client, storage))
         client.pair.assert_awaited_once()
         assert contributed[0][2] == "Real"
+        assert contributed[0][4] is True
 
     def test_noop_when_preempted(self):
         import infinite_craft_cli.cli as cli
@@ -842,6 +870,28 @@ class TestStressRegressions:
             run_async(cli._combine_pairs(client, storage, pairs))
         assert seen.get("run_id_at_sweep")  # non-empty during pre-processing
         assert cli._run_id == ""  # and cleared after
+
+
+class TestContributePayload:
+    def test_forwards_attestation_flag(self):
+        from infinite_craft_cli import relay as rc
+
+        posted = []
+        with patch.object(
+            rc, "_post_json", side_effect=lambda *a, **_k: posted.append(a) or {"added": 1}
+        ):
+            rc.contribute([("Fire", "Water", None, "", True)])
+        assert posted[0][1]["entries"][0] == ["Fire", "Water", None, "", True]
+
+    def test_four_tuple_product_still_forwards(self):
+        from infinite_craft_cli import relay as rc
+
+        posted = []
+        with patch.object(
+            rc, "_post_json", side_effect=lambda *a, **_k: posted.append(a) or {"added": 1}
+        ):
+            rc.contribute([("Fire", "Water", "Steam", "")])
+        assert posted[0][1]["entries"][0] == ["Fire", "Water", "Steam", ""]
 
 
 class TestLookupHit:

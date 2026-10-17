@@ -202,6 +202,11 @@ a cached answer, and is never handed to the session that authored the
 sighting). A conflicting claim against an unreviewed entry drops it, so the
 network self-heals around a bad result rather than trusting last-writer.
 
+**Proven Nothings.** A hive Nothing is stored only when the client attests
+the pair came from a token-backed Neal hop (Turnstile token +
+`x-craft-session`). Older clients still contribute products; their unproven
+Nothings are ignored. Stored Nothings from before this proof are dropped.
+
 **Same-IP fairness.** The relay sees each client's public IP and tells everyone
 how many sessions on that IP are actively spending neal budget; each client
 divides its per-IP window by that count. Two laptops on one home Wi-Fi each
