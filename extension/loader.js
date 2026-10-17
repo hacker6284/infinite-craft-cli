@@ -32,34 +32,20 @@ function replyIbFetch(id, payload) {
   );
 }
 
-async function handleIbFetch(data) {
+function handleIbFetch(data) {
   if (!isIbApiUrl(data.url)) {
     replyIbFetch(data.id, { error: "Infinibrowser fetch URL is not allowed." });
     return;
   }
-  try {
-    const resp = await fetch(data.url, {
-      credentials: "include",
-      cache: "no-store",
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-    });
-    const body = await resp.text();
-    const headers = {};
-    const contentType = resp.headers.get("content-type");
-    if (contentType) {
-      headers["content-type"] = contentType;
+  chrome.runtime.sendMessage({ type: "ib-fetch", url: data.url }, (payload) => {
+    if (chrome.runtime.lastError) {
+      replyIbFetch(data.id, {
+        error: chrome.runtime.lastError.message || "Failed to fetch",
+      });
+      return;
     }
-    replyIbFetch(data.id, {
-      status: resp.status,
-      statusText: resp.statusText,
-      body,
-      headers,
-    });
-  } catch (error) {
-    replyIbFetch(data.id, {
-      error: error && error.message ? error.message : "Failed to fetch",
-    });
-  }
+    replyIbFetch(data.id, payload || { error: "Failed to fetch" });
+  });
 }
 
 window.addEventListener("message", (event) => {
